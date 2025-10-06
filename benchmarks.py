@@ -7,7 +7,8 @@ import sys
 from contextlib import contextmanager
 
 from functions import (
-    SigmoidCELossFunction, sigmoid_cross_entropy_loss
+    SigmoidCELossFunction, sigmoid_cross_entropy_loss,
+    MultiClassSigmoidCELossFunction, multiclass_sigmoid_cross_entropy_loss
 )
 
 @contextmanager
@@ -193,5 +194,27 @@ def test_sigmoid_ce_loss():
     
     tester.run()
 
+def test_mc_sigmoid_ce_loss():
+    """Test the CUDA implementation of sigmoid cross-entropy loss"""
+    B, C, K, H, W = 16, 256, 16, 64, 64
+    H_t, W_t = 512, 512
+    
+    input_creators = {
+        "logits": lambda device, dtype: torch.randn(B, C, H, W, device=device, dtype=dtype),
+        "targets": lambda device, dtype: torch.randint(0, K-1, (B, H_t, W_t), device=device, dtype=torch.uint8),
+        "class_mapping": lambda device, dtype: torch.randint(0, C-1, (K,), device=device, dtype=torch.long),
+    }
+    
+    arg_order = ["logits", "targets", "class_mapping"]
+    
+    tester = CUDAKernelTester(
+        cuda_function=MultiClassSigmoidCELossFunction.apply,
+        python_function=multiclass_sigmoid_cross_entropy_loss,
+        input_creators=input_creators,
+        arg_order=arg_order
+    )
+    
+    tester.run()
+
 if __name__ == "__main__":
-    test_sigmoid_ce_loss()
+    test_mc_sigmoid_ce_loss()
