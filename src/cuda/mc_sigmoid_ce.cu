@@ -1,4 +1,3 @@
-#include <ATen/ATen.h>
 #include <ATen/native/cuda/KernelUtils.cuh>
 #include <c10/util/Half.h>
 #include <torch/extension.h>
@@ -9,184 +8,182 @@
 
 #include "utils.h"
 
-const int THREADS_PER_BLOCK = 256;
+// Process regions of 16x16, perfect for logits of shape
+// 64x64 and ground truth of shape 1024x1024.
+const int THREADS_PER_BLOCK = 16*16;
 
-template <typename T, int N_POSITIVES, int C, int H, int W>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) multiclass_sigmoid_cross_entropy_forward_kernel(
+template <int C, int H, int W, int H_t, int W_t>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_forward_kernel(
     const float* __restrict__ logits,
-    const T* __restrict__ targets,
+    const uint8_t* __restrict__ targets,
     const int64_t* __restrict__ class_mapping,
     double* __restrict__ total_loss_sum,
     const int B
 ) {
-    extern __shared__ double s_block_loss[];
-    const int tid = threadIdx.x;
-    s_block_loss[tid] = 0.0;
+    // Each CUDA block processes one (b, i, j) low-res block
+    // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = B (batch)
+    // Shared memory is partitioned for class counts, loss sums, and class mapping
+    extern __shared__ char sh_mem[];
+    int* sh_counts = reinterpret_cast<int*>(sh_mem);
+    double* s_block_loss = reinterpret_cast<double*>(sh_mem + C * sizeof(int));
+    int64_t* sh_class_mapping = reinterpret_cast<int64_t*>(sh_mem + C * sizeof(int) + THREADS_PER_BLOCK * sizeof(double));
 
-    const int total_elements = B * C * H * W;
+    int j = blockIdx.x;  // low-res x (0..W-1)
+    int i = blockIdx.y;  // low-res y (0..H-1)
+    int b = blockIdx.z;  // batch index
 
-    for (int idx = blockIdx.x * blockDim.x + tid; idx < total_elements; idx += gridDim.x * blockDim.x) {
-        const int w = idx % W;
-        const int h = (idx / W) % H;
-        const int c = (idx / (W * H)) % C;
-        const int b = idx / (C * W * H);
+    int tid = threadIdx.x;
+    const int s = H_t / H; // Stride
+    const int s2 = s * s;
 
-        const int target_idx = b * H * W + h * W + w;
-        const T packed_targets = targets[target_idx];
+    // Initialize shared counts to zero
+    for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
+        sh_counts[ci] = 0;
+    }
+    
+    // Collaboratively load class_mapping into shared memory.
+    // Since THREADS_PER_BLOCK is 256, each thread loads exactly one value.
+    if (tid < 256) {
+        sh_class_mapping[tid] = class_mapping[tid];
+    }
+    __syncthreads(); // Ensure all shared memory is initialized before use
 
-        float target_multi_hot = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < N_POSITIVES; ++i) {
-            const int shift = i * 8;
-            const T mask = 0xFF << shift;
-            const int64_t extracted_idx = (packed_targets & mask) >> shift;
-            const int64_t mapped_class = class_mapping[extracted_idx];
-            if (mapped_class == c) {
-                target_multi_hot = 1.0f;
-                break;
+    // Each thread block covers an s x s region of the high-resolution target tensor.
+    // Top-left corner of the high-res block:
+    int base_y = i * s;
+    int base_x = j * s;
+
+    // Each thread loops over several pixels if necessary
+    for (int idx = tid; idx < s2; idx += THREADS_PER_BLOCK) {
+        int dy = idx / s;
+        int dx = idx % s;
+        int yy = base_y + dy;
+        int xx = base_x + dx;
+        if (yy < H_t && xx < W_t) {
+            // targets layout: (B, H_t, W_t)
+            uint8_t raw_lab = targets[(b * H_t + yy) * W_t + xx];
+            int64_t lab = sh_class_mapping[raw_lab]; // Read from shared memory
+            if (lab >= 0 && lab < C) {
+                // Atomically accumulate counts in shared memory
+                atomicAdd(&sh_counts[(int)lab], 1);
             }
         }
-
-        const float logit = logits[idx];
-        s_block_loss[tid] += fmaxf(logit, 0.0f) - logit * target_multi_hot + log1pf(expf(-fabsf(logit)));
     }
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) s_block_loss[tid] += s_block_loss[tid + s];
-        __syncthreads();
+    // Each thread computes the loss for a subset of classes and accumulates into a local variable
+    double thread_loss_sum = 0.0;
+    for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
+        // logits layout: (B, C, H, W)
+        float L = logits[((b * C + ci) * H + i) * W + j];
+        float n = (float) sh_counts[ci];
+        float N2 = (float)s2;
+
+        // Stable BCE-with-logits sum over the block:
+        // loss_block = N2*max(L,0) - L*n + N2*log1p(exp(-|L|))
+        float maxL = L > 0.0f ? L : 0.0f;
+        float absL = fabsf(L);
+        float logexp = log1pf(expf(-absL));
+        thread_loss_sum += static_cast<double>(N2 * maxL - L * n + N2 * logexp);
     }
 
-    if (tid == 0) atomicAdd(total_loss_sum, s_block_loss[0]);
-}
-
-template <typename T, int N_POSITIVES>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) multiclass_sigmoid_cross_entropy_forward_dynamic_kernel(
-    const float* __restrict__ logits,
-    const T* __restrict__ targets,
-    const int64_t* __restrict__ class_mapping,
-    double* __restrict__ total_loss_sum,
-    const int B, const int C, const int H, const int W
-) {
-    extern __shared__ double s_block_loss[];
-    const int tid = threadIdx.x;
-    s_block_loss[tid] = 0.0;
-
-    const int total_elements = B * C * H * W;
-
-    for (int idx = blockIdx.x * blockDim.x + tid; idx < total_elements; idx += gridDim.x * blockDim.x) {
-        const int w = idx % W;
-        const int h = (idx / W) % H;
-        const int c = (idx / (W * H)) % C;
-        const int b = idx / (C * W * H);
-
-        const int target_idx = b * H * W + h * W + w;
-        const T packed_targets = targets[target_idx];
-
-        float target_multi_hot = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < N_POSITIVES; ++i) {
-            const int shift = i * 8;
-            const T mask = 0xFF << shift;
-            const int64_t extracted_idx = (packed_targets & mask) >> shift;
-            const int64_t mapped_class = class_mapping[extracted_idx];
-            if (mapped_class == c) {
-                target_multi_hot = 1.0f;
-                break;
-            }
-        }
-
-        const float logit = logits[idx];
-        s_block_loss[tid] += fmaxf(logit, 0.0f) - logit * target_multi_hot + log1pf(expf(-fabsf(logit)));
-    }
+    // Store each thread's accumulated loss into shared memory
+    s_block_loss[tid] = thread_loss_sum;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) s_block_loss[tid] += s_block_loss[tid + s];
+    // Perform the block-level reduction
+    for (int s_reduce = THREADS_PER_BLOCK / 2; s_reduce > 0; s_reduce >>= 1) {
+        if (tid < s_reduce) {
+            s_block_loss[tid] += s_block_loss[tid + s_reduce];
+        }
         __syncthreads();
     }
 
-    if (tid == 0) atomicAdd(total_loss_sum, s_block_loss[0]);
+    // Only the first thread of the block atomically adds the block's total loss to the global sum
+    if (tid == 0) {
+        atomicAdd(total_loss_sum, s_block_loss[0]);
+    }
 }
 
-template <typename T, int N_POSITIVES, int C, int H, int W>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) multiclass_sigmoid_cross_entropy_backward_kernel(
+template <int C, int H, int W, int H_t, int W_t>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_backward_kernel(
     const float* __restrict__ logits,
-    const T* __restrict__ targets,
+    const uint8_t* __restrict__ targets,
     const int64_t* __restrict__ class_mapping,
     const float grad_out_scalar,
     float* __restrict__ grad_logits,
     const int B
 ) {
-    const int total_elements = B * C * H * W;
+    // Grid: dim.x = W (low-res x), dim.y = H (low-res y), dim.z = B
+    int j = blockIdx.x;
+    int i = blockIdx.y;
+    int b = blockIdx.z;
 
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements; idx += gridDim.x * blockDim.x) {
-        const int w = idx % W;
-        const int h = (idx / W) % H;
-        const int c = (idx / (W * H)) % C;
-        const int b = idx / (C * W * H);
+    int tid = threadIdx.x;
 
-        const int target_idx = b * H * W + h * W + w;
-        const T packed_targets = targets[target_idx];
+    const int s = H_t / H;
+    const float N2 = (float)(s * s);
 
-        float target_multi_hot = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < N_POSITIVES; ++i) {
-            const int shift = i * 8;
-            const T mask = 0xFF << shift;
-            const int64_t extracted_idx = (packed_targets & mask) >> shift;
-            const int64_t mapped_class = class_mapping[extracted_idx];
-            if (mapped_class == c) {
-                target_multi_hot = 1.0f;
-                break;
+    // Partition shared memory for counts, logits, and the class mapping
+    extern __shared__ char sh_mem[];
+    int* sh_counts = reinterpret_cast<int*>(sh_mem);
+    float* sh_logits = reinterpret_cast<float*>(sh_mem + C * sizeof(int32_t));
+    int64_t* sh_class_mapping = reinterpret_cast<int64_t*>(sh_mem + C * sizeof(int32_t) + C * sizeof(float));
+
+    // Initialize shared counts to zero
+    for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
+        sh_counts[ci] = 0;
+    }
+
+    // Collaboratively load class_mapping into shared memory.
+    if (tid < 256) {
+        sh_class_mapping[tid] = class_mapping[tid];
+    }
+    __syncthreads(); // Ensure sh_class_mapping is loaded before use
+
+    // Re-compute counts for the current block.
+    int base_y = i * s;
+    int base_x = j * s;
+    for (int idx = tid; idx < N2; idx += THREADS_PER_BLOCK) {
+        int dy = idx / s;
+        int dx = idx % s;
+        int yy = base_y + dy;
+        int xx = base_x + dx;
+        if (yy < H_t && xx < W_t) {
+            uint8_t raw_lab = targets[(b * H_t + yy) * W_t + xx];
+            int64_t lab = sh_class_mapping[raw_lab]; // Read from shared memory
+            if (lab >= 0 && lab < C) {
+                atomicAdd(&sh_counts[(int)lab], 1);
             }
         }
+    }
 
-        const float logit = logits[idx];
-        const float sigmoid_logit = 1.0f / (1.0f + expf(-logit));
-        grad_logits[idx] = (sigmoid_logit - target_multi_hot) * grad_out_scalar / (float)total_elements;
+    // Base index for the current block in the logits/grad_logits tensors
+    int idx_base = ((b * C) * H + i) * W + j;
+
+    // Load logits for all C channels into shared memory to avoid uncoalesced global reads in the loop.
+    for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
+        sh_logits[ci] = logits[idx_base + ci * H * W];
+    }
+    __syncthreads(); // Ensure counts and logits are ready
+
+    // Each thread computes the gradient for a subset of classes
+    float scale = grad_out_scalar / (B * C * H * W);
+    for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
+        float L = sh_logits[ci]; // Fast read from shared memory
+        int32_t n = sh_counts[ci];
+
+        // Use a faster, mathematically equivalent implementation of the sigmoid function
+        float sigma = 0.5f * tanhf(0.5f * L) + 0.5f;
+        
+        // Derivative: dLoss/dL = N2 * sigma - n
+        float g = N2 * sigma - (float)n;
+        
+        // Apply scaling. The write to global memory is still uncoalesced,
+        // but modern GPU caches can help mitigate the performance impact.
+        grad_logits[idx_base + ci * H * W] = g * scale;
     }
 }
-
-template <typename T, int N_POSITIVES>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) multiclass_sigmoid_cross_entropy_backward_dynamic_kernel(
-    const float* __restrict__ logits,
-    const T* __restrict__ targets,
-    const int64_t* __restrict__ class_mapping,
-    const float grad_out_scalar,
-    float* __restrict__ grad_logits,
-    const int B, const int C, const int H, const int W
-) {
-    const int total_elements = B * C * H * W;
-
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements; idx += gridDim.x * blockDim.x) {
-        const int w = idx % W;
-        const int h = (idx / W) % H;
-        const int c = (idx / (W * H)) % C;
-        const int b = idx / (C * W * H);
-
-        const int target_idx = b * H * W + h * W + w;
-        const T packed_targets = targets[target_idx];
-
-        float target_multi_hot = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < N_POSITIVES; ++i) {
-            const int shift = i * 8;
-            const T mask = 0xFF << shift;
-            const int64_t extracted_idx = (packed_targets & mask) >> shift;
-            const int64_t mapped_class = class_mapping[extracted_idx];
-            if (mapped_class == c) {
-                target_multi_hot = 1.0f;
-                break;
-            }
-        }
-
-        const float logit = logits[idx];
-        const float sigmoid_logit = 1.0f / (1.0f + expf(-logit));
-        grad_logits[idx] = (sigmoid_logit - target_multi_hot) * grad_out_scalar / (float)total_elements;
-    }
-}
-
 
 torch::Tensor mc_sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,
@@ -201,46 +198,40 @@ torch::Tensor mc_sigmoid_cross_entropy_forward(
     const int C = logits.size(1);
     const int H = logits.size(2);
     const int W = logits.size(3);
+    const int H_t = targets.size(1);
+    const int W_t = targets.size(2);
 
-    const int total_elements = B * C * H * W;
+    const int total_elements = B * C * H_t * W_t;
     if (total_elements == 0) return torch::tensor(0.0, logits.options());
 
     auto total_loss_sum_tensor = torch::zeros({1}, logits.options().dtype(torch::kFloat64));
 
-    const int blocks = std::min((total_elements + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, 4096);
-    const size_t shared_mem_size = THREADS_PER_BLOCK * sizeof(double);
+    // Set grid dimensions based on the low-resolution output
+    dim3 grid(W, H, B);
 
-    AT_DISPATCH_INTEGRAL_TYPES(targets.scalar_type(), "mc_sigmoid_ce_forward", [&] {        
-        auto launcher = [&](auto n_positives_const) {
-            constexpr int N_POSITIVES = decltype(n_positives_const)::value;
+    // Update shared memory size to accommodate counts, loss sums, and class mapping
+    const size_t shared_mem_size = C * sizeof(int32_t) + THREADS_PER_BLOCK * sizeof(double) + 256 * sizeof(int64_t);
 
-            auto static_launcher = [&](auto... Dims) {
-                multiclass_sigmoid_cross_entropy_forward_kernel<scalar_t, N_POSITIVES, decltype(Dims)::value...><<<blocks, THREADS_PER_BLOCK, shared_mem_size>>>(
-                    logits.data_ptr<float>(), targets.data_ptr<scalar_t>(), class_mapping.data_ptr<int64_t>(),
-                    total_loss_sum_tensor.data_ptr<double>(), B);
-            };
+    auto static_launcher = [&](auto... Dims) {
+        sigmoid_cross_entropy_forward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
+            logits.data_ptr<float>(), 
+            targets.data_ptr<uint8_t>(), 
+            class_mapping.data_ptr<int64_t>(),
+            total_loss_sum_tensor.data_ptr<double>(), 
+            B
+        );
+    };
 
-            auto dynamic_launcher = [&]() {
-                multiclass_sigmoid_cross_entropy_forward_dynamic_kernel<scalar_t, N_POSITIVES><<<blocks, THREADS_PER_BLOCK, shared_mem_size>>>(
-                    logits.data_ptr<float>(), targets.data_ptr<scalar_t>(), class_mapping.data_ptr<int64_t>(),
-                    total_loss_sum_tensor.data_ptr<double>(), B, C, H, W);
-            };
-            
-            const auto supported_dims = std::make_tuple(
-                std::make_tuple(std::integral_constant<int, 80>{}, std::integral_constant<int, 256>{}),
-                std::make_tuple(std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{}),
-                std::make_tuple(std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{})
-            );
-            const auto runtime_dims = std::make_tuple(C, H, W);
+    const auto supported_dims = std::make_tuple(
+        std::make_tuple(std::integral_constant<int, 256>{}), // C
+        std::make_tuple(std::integral_constant<int, 64>{}),  // H
+        std::make_tuple(std::integral_constant<int, 64>{}),  // W
+        std::make_tuple(std::integral_constant<int, 512>{}), // H_t
+        std::make_tuple(std::integral_constant<int, 512>{})  // W_t
+    );
+    const auto runtime_dims = std::make_tuple(C, H, W, H_t, W_t);
 
-            dispatch_kernel_with_fallback(static_launcher, dynamic_launcher, runtime_dims, supported_dims);
-        };
-
-        if (targets.scalar_type() == torch::kByte) launcher(std::integral_constant<int, 1>{});
-        else if (targets.scalar_type() == torch::kShort) launcher(std::integral_constant<int, 2>{});
-        else if (targets.scalar_type() == torch::kInt) launcher(std::integral_constant<int, 4>{});
-        else if (targets.scalar_type() == torch::kLong) launcher(std::integral_constant<int, 8>{});
-    });
+    dispatch_kernel(static_launcher, runtime_dims, supported_dims);
 
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
@@ -249,11 +240,12 @@ torch::Tensor mc_sigmoid_cross_entropy_forward(
 }
 
 torch::Tensor mc_sigmoid_cross_entropy_backward(
-    const torch::Tensor& grad_out,
-    const torch::Tensor& logits,
+    const torch::Tensor& grad_out, 
+    const torch::Tensor& logits, 
     const torch::Tensor& targets,
     const torch::Tensor& class_mapping
 ) {
+    
     CHECK_INPUT(grad_out);
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -263,45 +255,40 @@ torch::Tensor mc_sigmoid_cross_entropy_backward(
     const int C = logits.size(1);
     const int H = logits.size(2);
     const int W = logits.size(3);
+    const int H_t = targets.size(1);
+    const int W_t = targets.size(2);
 
     auto grad_logits = torch::empty_like(logits);
     const int total_elements = B * C * H * W;
     if (total_elements == 0) return grad_logits;
 
     const float grad_out_scalar = grad_out.item<float>();
-    const int blocks = std::min((total_elements + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, 4096);
+    
+    dim3 grid(W, H, B);
+    // Update shared memory size for counts, logits, and the class mapping
+    const size_t shared_mem_size = C * sizeof(int32_t) + C * sizeof(float) + 256 * sizeof(int64_t);
 
-    AT_DISPATCH_INTEGRAL_TYPES(targets.scalar_type(), "mc_sigmoid_ce_backward", [&] {
-        auto launcher = [&](auto n_positives_const) {
-            constexpr int N_POSITIVES = decltype(n_positives_const)::value;
+    auto static_launcher = [&](auto... Dims) {
+        sigmoid_cross_entropy_backward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
+            logits.data_ptr<float>(), 
+            targets.data_ptr<uint8_t>(),
+            class_mapping.data_ptr<int64_t>(),
+            grad_out_scalar, 
+            grad_logits.data_ptr<float>(), 
+            B
+        );
+    };
+    
+    const auto supported_dims = std::make_tuple(
+        std::make_tuple(std::integral_constant<int, 256>{}), // C
+        std::make_tuple(std::integral_constant<int, 64>{}),  // H
+        std::make_tuple(std::integral_constant<int, 64>{}),  // W
+        std::make_tuple(std::integral_constant<int, 512>{}), // H_t
+        std::make_tuple(std::integral_constant<int, 512>{})  // W_t
+    );
+    const auto runtime_dims = std::make_tuple(C, H, W, H_t, W_t);
 
-            auto static_launcher = [&](auto... Dims) {
-                multiclass_sigmoid_cross_entropy_backward_kernel<scalar_t, N_POSITIVES, decltype(Dims)::value...><<<blocks, THREADS_PER_BLOCK>>>(
-                    logits.data_ptr<float>(), targets.data_ptr<scalar_t>(), class_mapping.data_ptr<int64_t>(),
-                    grad_out_scalar, grad_logits.data_ptr<float>(), B);
-            };
-            
-            auto dynamic_launcher = [&]() {
-                multiclass_sigmoid_cross_entropy_backward_dynamic_kernel<scalar_t, N_POSITIVES><<<blocks, THREADS_PER_BLOCK>>>(
-                    logits.data_ptr<float>(), targets.data_ptr<scalar_t>(), class_mapping.data_ptr<int64_t>(),
-                    grad_out_scalar, grad_logits.data_ptr<float>(), B, C, H, W);
-            };
-
-            const auto supported_dims = std::make_tuple(
-                std::make_tuple(std::integral_constant<int, 80>{}, std::integral_constant<int, 256>{}),
-                std::make_tuple(std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{}),
-                std::make_tuple(std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{})
-            );
-            const auto runtime_dims = std::make_tuple(C, H, W);
-
-            dispatch_kernel_with_fallback(static_launcher, dynamic_launcher, runtime_dims, supported_dims);
-        };
-
-        if (targets.scalar_type() == torch::kByte) launcher(std::integral_constant<int, 1>{});
-        else if (targets.scalar_type() == torch::kShort) launcher(std::integral_constant<int, 2>{});
-        else if (targets.scalar_type() == torch::kInt) launcher(std::integral_constant<int, 4>{});
-        else if (targets.scalar_type() == torch::kLong) launcher(std::integral_constant<int, 8>{});
-    });
+    dispatch_kernel(static_launcher, runtime_dims, supported_dims);
 
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after backward kernel: ", cudaGetErrorString(err));

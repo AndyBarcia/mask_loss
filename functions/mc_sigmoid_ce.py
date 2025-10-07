@@ -16,8 +16,8 @@ class MultiClassSigmoidCELossFunction(Function):
     @staticmethod
     def forward(ctx, logits, targets, class_mapping):
         logits = logits.contiguous().float()
-        targets = targets.contiguous()
-        class_mapping = class_mapping.contiguous()
+        targets = targets.contiguous().to(torch.uint8)
+        class_mapping = class_mapping.contiguous().long()
         ctx.save_for_backward(logits, targets, class_mapping)
         output = mask_loss.forward_mc_sigmoid_ce_loss(logits, targets, class_mapping)
         return output
@@ -31,75 +31,40 @@ class MultiClassSigmoidCELossFunction(Function):
 
 def multiclass_sigmoid_cross_entropy_loss(logits, targets, class_mapping):
     """
-    Computes the sigmoid cross-entropy loss for multi-class classification,
-    where the ground truth can have multiple positive examples per pixel. The
-    maximum possible number of unique ground truths in the image is 256, though 
-    there can be many more detections.
-
-    Args:
-        logits (torch.Tensor): A tensor of shape (B, C, H, W) representing the
-                               per-query logits.
-        targets (torch.Tensor): A tensor of shape (B, H, W) with ground truth values.
-                                The dtype of this tensor determines the number of
-                                positive examples per pixel:
-                                - int8 or uint8: 1 positive example
-                                - int16: 2 positive examples
-                                - int32: 4 positive examples
-                                - int64: 8 positive examples
-        class_mapping (torch.Tensor): A 1D tensor of shape (256,) that maps the
-                                      encoded values in `targets` to class indices.
-
+    Naive approach: upsample logits (nearest) to high-res, build per-class one-hot targets,
+    and compute BCEWithLogits per pixel then mean.
+    logits: (B, C, h, w)
+    targets: (B, H_t, W_t) integer labels in [0, 255], of type uint8
+    class_mapping: (256,) a 1D tensor that maps the encoded values in
+        targets to class indices from logits.
+    
     Returns:
         torch.Tensor: A scalar tensor representing the mean loss.
-    
-    NOTE: targets is not implemented for uint16, uint32 and uint64 because they are
-    not yet supported on pytorch.
     """
-    B, C, H, W = logits.shape
-    dtype_to_n_positives = {
-        torch.uint8: 1,
-        torch.int8: 1,
-        torch.int16: 2,
-        torch.int32: 4,
-        torch.int64: 8,
-    }
-    
-    n_positives = dtype_to_n_positives[targets.dtype]
-    
-    # Create the multi-hot encoded target tensor
-    target_multi_hot = torch.zeros_like(logits)
-    
-    # Unpack the ground truth values
-    for i in range(n_positives):
-        # Extract the i-th positive example for each pixel
-        shift = i * 8
-        mask = 0xFF << shift
-        indices = (targets.long() & mask) >> shift
-        
-        # Map the extracted indices to class indices
-        mapped_indices = class_mapping[indices.long()]
-        
-        # Create a one-hot tensor for the current positive example
-        target_one_hot = F.one_hot(mapped_indices.long(), num_classes=C)
-        target_one_hot = target_one_hot.permute(0, 3, 1, 2)
-        
-        # Ensure that the spatial dimensions of targets match logits
-        if target_one_hot.shape[2:] != logits.shape[2:]:
-            target_one_hot = F.interpolate(
-                target_one_hot.float(),
-                size=(H, W),
-                mode='bilinear',
-                align_corners=False
-            )
+    B, C, h, w = logits.shape
+    B_t, H_t, W_t = targets.shape
+    assert B == B_t, "Batch size mismatch between logits and targets"
 
-        # Accumulate the one-hot tensors to create the multi-hot target
-        target_multi_hot += target_one_hot
+    # Upsample logits to the spatial resolution of the targets
+    logits_up = F.interpolate(logits, size=(H_t, W_t), mode='nearest')
 
-    # Compute the binary cross-entropy loss with logits
-    loss = F.binary_cross_entropy_with_logits(
-        logits,
-        target_multi_hot,
-        reduction='mean'
-    )
+    device = logits.device
+    targets_long = targets.long().to(device)
+
+    # Map the target labels to the correct class indices
+    mapped_targets = class_mapping[targets_long]
+
+    # Create one-hot encoded targets from the mapped labels
+    onehot = F.one_hot(mapped_targets, num_classes=C).permute(0, 3, 1, 2).to(dtype=logits.dtype)
+
+    # Manually compute the binary cross-entropy with logits loss
+    L = logits_up
+    y = onehot
+    maxL = torch.clamp(L, min=0.0)
+    logexp = torch.log1p(torch.exp(-torch.abs(L)))
+    bce_elem = maxL - L * y + logexp
     
+    # Compute the mean loss over all elements
+    loss = bce_elem.mean()
+
     return loss
