@@ -1,2 +1,3 @@
 from .sigmoid_ce import SigmoidCELossFunction, sigmoid_cross_entropy_loss
 from .mc_sigmoid_ce import MultiClassSigmoidCELossFunction, multiclass_sigmoid_cross_entropy_loss
+from .dice import DiceLossFunction, dice_loss
