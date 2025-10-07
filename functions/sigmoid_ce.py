@@ -30,40 +30,65 @@ class SigmoidCELossFunction(Function):
 
 def sigmoid_cross_entropy_loss(logits, targets):
     """
-    Computes sigmoid cross entropy loss for multi-class classification.
-    
-    Args:
-        logits: Tensor of shape (B, C, H, W) - per-query logits
-        targets: Tensor of shape (B, H_t, W_t) - ground truth with values [0, C-1]
-                 Can have different spatial dimensions than logits
-    
-    Returns:
-        loss: Scalar tensor representing the mean loss
+    Naive approach: upsample logits (nearest) to high-res, build per-class one-hot targets,
+    and compute BCEWithLogits per pixel then mean.
+    logits: (B, C, h, w)
+    targets: (B, H_t, W_t) integer labels in [0, C-1]
     """
-    B, C, H, W = logits.shape
+    B, C, h, w = logits.shape
     B_t, H_t, W_t = targets.shape
-    
-    # Convert targets to one-hot encoding: (B, H_t, W_t) -> (B, C, H_t, W_t)
-    targets_one_hot = F.one_hot(targets, num_classes=C)  # (B, H_t, W_t, C)
-    targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()  # (B, C, H_t, W_t)
-    
-    # Interpolate targets to match logits spatial dimensions if needed
-    if (H_t, W_t) != (H, W):
-        targets_one_hot = F.interpolate(
-            targets_one_hot,
-            size=(H, W),
-            mode='bilinear',
-            align_corners=False
-        )  # (B, C, H, W)
-    
-    # Compute sigmoid cross entropy loss
-    # BCE loss formula: -[y*log(σ(x)) + (1-y)*log(1-σ(x))]
-    # Using log-sum-exp trick for numerical stability:
-    # BCE = max(x,0) - x*y + log(1 + exp(-|x|))
-    loss = F.binary_cross_entropy_with_logits(
-        logits, 
-        targets_one_hot, 
-        reduction='mean'
-    )
-    
+    assert B == B_t, "Batch size mismatch"
+    logits_up = F.interpolate(logits, size=(H_t, W_t), mode='nearest')
+    device = logits.device
+    targets_long = targets.long().to(device)
+    onehot = F.one_hot(targets_long, num_classes=C).permute(0, 3, 1, 2).to(dtype=logits.dtype)
+
+    L = logits_up
+    y = onehot
+    maxL = torch.clamp(L, min=0.0)
+    logexp = torch.log1p(torch.exp(-torch.abs(L)))
+    bce_elem = maxL - L * y + logexp
+
+    loss = bce_elem.sum() / (B * C * H_t * W_t)
+    return loss
+
+def sigmoid_cross_entropy_loss_efficient(logits, targets):
+    """
+    Efficient count-based BCE-with-logits for non-mutually-exclusive multi-class case.
+    logits: (B, C, h, w)
+    targets: (B, H_t, W_t) integer labels in [0, C-1] (interpreted as one-hot per-class)
+             H_t and W_t must be integer multiples of h and w respectively.
+    Returns: scalar tensor (mean over all elements: B*C*H_t*W_t)
+    """
+    B, C, h, w = logits.shape
+    B_t, H_t, W_t = targets.shape
+    assert B == B_t, "Batch size mismatch"
+    assert H_t % h == 0 and W_t % w == 0, "High-res dims must be integer multiples of low-res dims"
+    sH = H_t // h
+    sW = W_t // w
+    if sH != sW:
+        raise ValueError("This implementation assumes equal scale factor for height and width (square blocks)")
+    s = sH
+    N2 = s * s
+
+    device = logits.device
+    targets_long = targets.long().to(device)
+
+    # One-hot encode targets.
+    onehot = F.one_hot(targets_long, num_classes=C).permute(0, 3, 1, 2).to(dtype=logits.dtype)  # (B,C,H_t,W_t)
+
+    # Reshape for unfolding into high-res blocks. This will allows us
+    # to count the number of ground truth classes in each block.
+    Bc = onehot.reshape(B * C, 1, H_t, W_t)
+    unf = F.unfold(Bc, kernel_size=(s, s), stride=(s, s))  # (B*C, s*s, h*w)
+    unf = unf.reshape(B, C, s * s, h * w)
+    n_k = unf.sum(dim=2)  # (B, C, h*w)
+
+    # Stable BCE-with-logits summed across block
+    L = logits.reshape(B, C, h * w)
+    maxL = torch.clamp(L, min=0.0)
+    logexp = torch.log1p(torch.exp(-torch.abs(L)))
+    loss_block = N2 * maxL - L * n_k + N2 * logexp  # (B, C, h*w)
+
+    loss = loss_block.sum() / (B * C * H_t * W_t)
     return loss

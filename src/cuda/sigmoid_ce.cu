@@ -10,167 +10,136 @@
 
 const int THREADS_PER_BLOCK = 256;
 
-template <int C, int H, int W>
+template <int C, int H, int W, int H_t, int W_t>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_forward_kernel(
     const float* __restrict__ logits,
     const int64_t* __restrict__ targets,
     double* __restrict__ total_loss_sum,
-    const int B, 
-    const int H_t, 
-    const int W_t
+    const int B
 ) {
-    
-    extern __shared__ double s_block_loss[];
-    const int tid = threadIdx.x;
-    s_block_loss[tid] = 0.0;
+    // Each CUDA block processes one (b, i, j) low-res block
+    // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = B (batch)
+    // threadIdx.x loops over s*s pixels
+    extern __shared__ int sh_counts[]; // Shared memory for per-class counts, size C
 
-    const int total_elements = B * C * H * W;
+    int j = blockIdx.x;  // low-res x (0..W-1)
+    int i = blockIdx.y;  // low-res y (0..H-1)
+    int b = blockIdx.z;  // batch index
 
-    for (int idx = blockIdx.x * blockDim.x + tid; idx < total_elements; idx += gridDim.x * blockDim.x) {
-        const int w = idx % W;
-        const int h = (idx / W) % H;
-        const int c = (idx / (W * H)) % C;
-        const int b = idx / (C * W * H);
+    int tid = threadIdx.x;
+    const int s = H_t / H; // Stride
+    const int s2 = s * s;
 
-        const float h_t_float = ((float)h + 0.5f) * (float)H_t / (float)H - 0.5f;
-        const float w_t_float = ((float)w + 0.5f) * (float)W_t / (float)W - 0.5f;
-
-        const int h_t_low = floorf(h_t_float);
-        const int w_t_low = floorf(w_t_float);
-
-        const float h_weight = h_t_float - (float)h_t_low;
-        const float w_weight = w_t_float - (float)w_t_low;
-
-        float interpolated_target = 0.0f;
-        for (int i = 0; i <= 1; ++i) {
-            for (int j = 0; j <= 1; ++j) {
-                const int current_h = fminf(fmaxf(h_t_low + i, 0), H_t - 1);
-                const int current_w = fminf(fmaxf(w_t_low + j, 0), W_t - 1);
-                const int64_t target_val = targets[b * H_t * W_t + current_h * W_t + current_w];
-                const float one_hot = (target_val == c) ? 1.0f : 0.0f;
-                const float weight_h = (i == 0) ? 1.0f - h_weight : h_weight;
-                const float weight_w = (j == 0) ? 1.0f - w_weight : w_weight;
-                interpolated_target += one_hot * weight_h * weight_w;
-            }
-        }
-        
-        const float logit = logits[idx];
-        s_block_loss[tid] += fmaxf(logit, 0.0f) - logit * interpolated_target + log1pf(expf(-fabsf(logit)));
+    // Initialize shared counts to zero
+    for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
+        sh_counts[ci] = 0;
     }
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) s_block_loss[tid] += s_block_loss[tid + s];
-        __syncthreads();
-    }
+    // Each thread block covers an s x s region of the high-resolution target tensor.
+    // Top-left corner of the high-res block:
+    int base_y = i * s;
+    int base_x = j * s;
 
-    if (tid == 0) atomicAdd(total_loss_sum, s_block_loss[0]);
-}
-
-
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_forward_dynamic_kernel(
-    const float* __restrict__ logits,
-    const int64_t* __restrict__ targets,
-    double* __restrict__ total_loss_sum,
-    const int B, 
-    const int C, 
-    const int H, 
-    const int W,
-    const int H_t, const int W_t
-) {
-
-    extern __shared__ double s_block_loss[];
-    const int tid = threadIdx.x;
-    s_block_loss[tid] = 0.0;
-
-    const int total_elements = B * C * H * W;
-
-    for (int idx = blockIdx.x * blockDim.x + tid; idx < total_elements; idx += gridDim.x * blockDim.x) {
-        const int w = idx % W;
-        const int h = (idx / W) % H;
-        const int c = (idx / (W * H)) % C;
-        const int b = idx / (C * W * H);
-
-        const float h_t_float = ((float)h + 0.5f) * (float)H_t / (float)H - 0.5f;
-        const float w_t_float = ((float)w + 0.5f) * (float)W_t / (float)W - 0.5f;
-
-        const int h_t_low = floorf(h_t_float);
-        const int w_t_low = floorf(w_t_float);
-
-        const float h_weight = h_t_float - (float)h_t_low;
-        const float w_weight = w_t_float - (float)w_t_low;
-
-        float interpolated_target = 0.0f;
-        for (int i = 0; i <= 1; ++i) {
-            for (int j = 0; j <= 1; ++j) {
-                const int current_h = fminf(fmaxf(h_t_low + i, 0), H_t - 1);
-                const int current_w = fminf(fmaxf(w_t_low + j, 0), W_t - 1);
-                const int64_t target_val = targets[b * H_t * W_t + current_h * W_t + current_w];
-                const float one_hot = (target_val == c) ? 1.0f : 0.0f;
-                const float weight_h = (i == 0) ? 1.0f - h_weight : h_weight;
-                const float weight_w = (j == 0) ? 1.0f - w_weight : w_weight;
-                interpolated_target += one_hot * weight_h * weight_w;
+    // Each thread loops over several pixels if necessary
+    for (int idx = tid; idx < s2; idx += THREADS_PER_BLOCK) {
+        int dy = idx / s;
+        int dx = idx % s;
+        int yy = base_y + dy;
+        int xx = base_x + dx;
+        if (yy < H_t && xx < W_t) {
+            // targets layout: (B, H_t, W_t)
+            int64_t lab = targets[(b * H_t + yy) * W_t + xx];
+            if (lab >= 0 && lab < C) {
+                // Atomically accumulate counts in shared memory
+                atomicAdd(&sh_counts[(int)lab], 1);
             }
         }
-        
-        const float logit = logits[idx];
-        s_block_loss[tid] += fmaxf(logit, 0.0f) - logit * interpolated_target + log1pf(expf(-fabsf(logit)));
     }
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) s_block_loss[tid] += s_block_loss[tid + s];
-        __syncthreads();
+    // Each thread computes the loss for a subset of classes
+    for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
+        // logits layout: (B, C, H, W)
+        float L = logits[((b * C + ci) * H + i) * W + j];
+        float n = (float) sh_counts[ci];
+        float N2 = (float)s2;
+
+        // Stable BCE-with-logits sum over the block:
+        // loss_block = N2*max(L,0) - L*n + N2*log1p(exp(-|L|))
+        float maxL = L > 0.0f ? L : 0.0f;
+        float absL = fabsf(L);
+        float logexp = log1pf(expf(-absL));
+        double loss_block = static_cast<double>(N2 * maxL - L * n + N2 * logexp);
+
+        // Atomically add the block's loss to the total sum
+        atomicAdd(total_loss_sum, loss_block);
     }
-    
-    if (tid == 0) atomicAdd(total_loss_sum, s_block_loss[0]);
 }
 
-
-template <int C, int H, int W>
+template <int C, int H, int W, int H_t, int W_t>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_backward_kernel(
     const float* __restrict__ logits,
     const int64_t* __restrict__ targets,
     const float grad_out_scalar,
     float* __restrict__ grad_logits,
-    const int B, 
-    const int H_t, 
-    const int W_t
+    const int B
 ) {
+    // Grid: dim.x = W (low-res x), dim.y = H (low-res y), dim.z = B
+    int j = blockIdx.x;
+    int i = blockIdx.y;
+    int b = blockIdx.z;
 
-    const int total_elements = B * C * H * W;
+    // Parallelize across classes in threads
+    int tid = threadIdx.x;
 
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total_elements; idx += gridDim.x * blockDim.x) {
-        const int w = idx % W;
-        const int h = (idx / W) % H;
-        const int c = (idx / (W * H)) % C;
-        const int b = idx / (C * W * H);
+    const int s = H_t / H; // Stride
+    const float N2 = (float)(s * s);
 
-        const float h_t_float = ((float)h + 0.5f) * (float)H_t / (float)H - 0.5f;
-        const float w_t_float = ((float)w + 0.5f) * (float)W_t / (float)W - 0.5f;
+    // To calculate the gradient, we need to re-compute the counts for each block.
+    // This is a trade-off to avoid storing the counts tensor from the forward pass.
+    // Shared memory is used for efficient recounting.
+    extern __shared__ int sh_counts[]; // Shared memory for per-class counts, size C
 
-        const int h_t_low = floorf(h_t_float);
-        const int w_t_low = floorf(w_t_float);
+    // Initialize shared counts to zero
+    for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
+        sh_counts[ci] = 0;
+    }
+    __syncthreads();
 
-        const float h_weight = h_t_float - (float)h_t_low;
-        const float w_weight = w_t_float - (float)w_t_low;
-
-        float interpolated_target = 0.0f;
-        for (int i = 0; i <= 1; ++i) {
-            for (int j = 0; j <= 1; ++j) {
-                const int current_h = fminf(fmaxf(h_t_low + i, 0), H_t - 1);
-                const int current_w = fminf(fmaxf(w_t_low + j, 0), W_t - 1);
-                const int64_t target_val = targets[b * H_t * W_t + current_h * W_t + current_w];
-                const float one_hot = (target_val == c) ? 1.0f : 0.0f;
-                const float weight_h = (i == 0) ? 1.0f - h_weight : h_weight;
-                const float weight_w = (j == 0) ? 1.0f - w_weight : w_weight;
-                interpolated_target += one_hot * weight_h * weight_w;
+    // Re-compute counts for the current block
+    int base_y = i * s;
+    int base_x = j * s;
+    for (int idx = tid; idx < N2; idx += THREADS_PER_BLOCK) {
+        int dy = idx / s;
+        int dx = idx % s;
+        int yy = base_y + dy;
+        int xx = base_x + dx;
+        if (yy < H_t && xx < W_t) {
+            int64_t lab = targets[(b * H_t + yy) * W_t + xx];
+            if (lab >= 0 && lab < C) {
+                atomicAdd(&sh_counts[(int)lab], 1);
             }
         }
+    }
+    __syncthreads();
+    
+    // Base index for the current block
+    int idx_base = ((b * C) * H + i) * W + j;
+    float scale = grad_out_scalar / (B * C * H * W);
+
+    // Each thread computes the gradient for a subset of classes
+    for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
+        float L = logits[idx_base + ci * H * W];
+        int32_t n = sh_counts[ci];
+
+        // sigma = 1 / (1 + exp(-L))
+        float sigma = 1.0f / (1.0f + expf(-L));
+        // derivative: dLoss/dL = N2 * sigma - n
+        float g = N2 * sigma - (float)n;
         
-        const float logit = logits[idx];
-        const float sigmoid_logit = 1.0f / (1.0f + expf(-logit));
-        grad_logits[idx] = (sigmoid_logit - interpolated_target) * grad_out_scalar / (float)total_elements;
+        // Apply scaling
+        grad_logits[idx_base + ci * H * W] = g * scale;
     }
 }
 
@@ -188,37 +157,32 @@ torch::Tensor sigmoid_cross_entropy_forward(
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
     
-    const int total_elements = B * C * H * W;
+    const int total_elements = B * C * H_t * W_t;
     if (total_elements == 0) return torch::tensor(0.0, logits.options());
 
     auto total_loss_sum_tensor = torch::zeros({1}, logits.options().dtype(torch::kFloat64));
     
-    const int blocks = std::min((total_elements + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, 4096);
-    const size_t shared_mem_size = THREADS_PER_BLOCK * sizeof(double);
+    // Set grid dimensions based on the low-resolution output
+    dim3 grid(W, H, B);
+    
+    // Shared memory size is C * sizeof(int32) for the counts
+    const size_t shared_mem_size = C * sizeof(int32_t);
 
     auto static_launcher = [&](auto... Dims) {
-        sigmoid_cross_entropy_forward_kernel<decltype(Dims)::value...><<<blocks, THREADS_PER_BLOCK, shared_mem_size>>>(
-            logits.data_ptr<float>(), targets.data_ptr<int64_t>(), total_loss_sum_tensor.data_ptr<double>(),
-            B, H_t, W_t);
-    };
-
-    auto dynamic_launcher = [&]() {
-        sigmoid_cross_entropy_forward_dynamic_kernel<<<blocks, THREADS_PER_BLOCK, shared_mem_size>>>(
-            logits.data_ptr<float>(), targets.data_ptr<int64_t>(), total_loss_sum_tensor.data_ptr<double>(),
-            B, C, H, W, H_t, W_t);
+        sigmoid_cross_entropy_forward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
+            logits.data_ptr<float>(), targets.data_ptr<int64_t>(), total_loss_sum_tensor.data_ptr<double>(), B);
     };
 
     const auto supported_dims = std::make_tuple(
-        // Supported C
-        std::make_tuple(std::integral_constant<int, 80>{}, std::integral_constant<int, 256>{}),
-        // Supported H
-        std::make_tuple(std::integral_constant<int, 32>{}, std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{}),
-        // Supported W
-        std::make_tuple(std::integral_constant<int, 32>{}, std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{})
+        std::make_tuple(std::integral_constant<int, 256>{}), // C
+        std::make_tuple(std::integral_constant<int, 64>{}),  // H
+        std::make_tuple(std::integral_constant<int, 64>{}),  // W
+        std::make_tuple(std::integral_constant<int, 512>{}), // H_t
+        std::make_tuple(std::integral_constant<int, 512>{})  // W_t
     );
-    const auto runtime_dims = std::make_tuple(C, H, W);
+    const auto runtime_dims = std::make_tuple(C, H, W, H_t, W_t);
 
-    dispatch_kernel_with_fallback(static_launcher, dynamic_launcher, runtime_dims, supported_dims);
+    dispatch_kernel(static_launcher, runtime_dims, supported_dims);
 
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
@@ -248,20 +212,24 @@ torch::Tensor sigmoid_cross_entropy_backward(
     if (total_elements == 0) return grad_logits;
 
     const float grad_out_scalar = grad_out.item<float>();
-    const int blocks = std::min((total_elements + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, 4096);
+    
+    // Set grid dimensions based on the low-resolution output
+    dim3 grid(W, H, B);
+    const size_t shared_mem_size = C * sizeof(int32_t);
 
     auto static_launcher = [&](auto... Dims) {
-        sigmoid_cross_entropy_backward_kernel<decltype(Dims)::value...><<<blocks, THREADS_PER_BLOCK>>>(
-            logits.data_ptr<float>(), targets.data_ptr<int64_t>(), grad_out_scalar, grad_logits.data_ptr<float>(),
-            B, H_t, W_t);
+        sigmoid_cross_entropy_backward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
+            logits.data_ptr<float>(), targets.data_ptr<int64_t>(), grad_out_scalar, grad_logits.data_ptr<float>(), B);
     };
     
     const auto supported_dims = std::make_tuple(
-        std::make_tuple(std::integral_constant<int, 80>{}, std::integral_constant<int, 256>{}),
-        std::make_tuple(std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{}),
-        std::make_tuple(std::integral_constant<int, 64>{}, std::integral_constant<int, 128>{},std::integral_constant<int, 512>{})
+        std::make_tuple(std::integral_constant<int, 256>{}), // C
+        std::make_tuple(std::integral_constant<int, 64>{}),  // H
+        std::make_tuple(std::integral_constant<int, 64>{}),  // W
+        std::make_tuple(std::integral_constant<int, 512>{}), // H_t
+        std::make_tuple(std::integral_constant<int, 512>{})  // W_t
     );
-    const auto runtime_dims = std::make_tuple(C, H, W);
+    const auto runtime_dims = std::make_tuple(C, H, W, H_t, W_t);
 
     dispatch_kernel(static_launcher, runtime_dims, supported_dims);
 
