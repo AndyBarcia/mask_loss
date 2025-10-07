@@ -8,7 +8,9 @@
 
 #include "utils.h"
 
-const int THREADS_PER_BLOCK = 256;
+// Process regions of 16x16, perfect for logits of shape
+// 64x64 and ground truth of shape 1024x1024.
+const int THREADS_PER_BLOCK = 16*16;
 
 template <int C, int H, int W, int H_t, int W_t>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_forward_kernel(
@@ -19,8 +21,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
 ) {
     // Each CUDA block processes one (b, i, j) low-res block
     // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = B (batch)
-    // threadIdx.x loops over s*s pixels
-    extern __shared__ int sh_counts[]; // Shared memory for per-class counts, size C
+    // Shared memory is partitioned for per-class counts and per-thread partial loss sums
+    extern __shared__ char sh_mem[];
+    int* sh_counts = reinterpret_cast<int*>(sh_mem);
+    double* s_block_loss = reinterpret_cast<double*>(sh_mem + C * sizeof(int));
 
     int j = blockIdx.x;  // low-res x (0..W-1)
     int i = blockIdx.y;  // low-res y (0..H-1)
@@ -58,7 +62,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     }
     __syncthreads();
 
-    // Each thread computes the loss for a subset of classes
+    // Each thread computes the loss for a subset of classes and accumulates into a local variable
+    double thread_loss_sum = 0.0;
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
         // logits layout: (B, C, H, W)
         float L = logits[((b * C + ci) * H + i) * W + j];
@@ -70,10 +75,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
         float maxL = L > 0.0f ? L : 0.0f;
         float absL = fabsf(L);
         float logexp = log1pf(expf(-absL));
-        double loss_block = static_cast<double>(N2 * maxL - L * n + N2 * logexp);
+        thread_loss_sum += static_cast<double>(N2 * maxL - L * n + N2 * logexp);
+    }
 
-        // Atomically add the block's loss to the total sum
-        atomicAdd(total_loss_sum, loss_block);
+    // Store each thread's accumulated loss into shared memory
+    s_block_loss[tid] = thread_loss_sum;
+    __syncthreads();
+
+    // Perform the block-level reduction
+    for (int s_reduce = THREADS_PER_BLOCK / 2; s_reduce > 0; s_reduce >>= 1) {
+        if (tid < s_reduce) {
+            s_block_loss[tid] += s_block_loss[tid + s_reduce];
+        }
+        __syncthreads();
+    }
+
+    // Only the first thread of the block atomically adds the block's total loss to the global sum
+    if (tid == 0) {
+        atomicAdd(total_loss_sum, s_block_loss[0]);
     }
 }
 
@@ -90,16 +109,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     int i = blockIdx.y;
     int b = blockIdx.z;
 
-    // Parallelize across classes in threads
     int tid = threadIdx.x;
 
-    const int s = H_t / H; // Stride
+    const int s = H_t / H;
     const float N2 = (float)(s * s);
 
-    // To calculate the gradient, we need to re-compute the counts for each block.
-    // This is a trade-off to avoid storing the counts tensor from the forward pass.
-    // Shared memory is used for efficient recounting.
-    extern __shared__ int sh_counts[]; // Shared memory for per-class counts, size C
+    // Partition shared memory for counts and for caching logits
+    extern __shared__ char sh_mem[];
+    int* sh_counts = reinterpret_cast<int*>(sh_mem);
+    float* sh_logits = reinterpret_cast<float*>(sh_mem + C * sizeof(int32_t));
 
     // Initialize shared counts to zero
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
@@ -107,7 +125,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     }
     __syncthreads();
 
-    // Re-compute counts for the current block
+    // Re-compute counts for the current block.
     int base_y = i * s;
     int base_x = j * s;
     for (int idx = tid; idx < N2; idx += THREADS_PER_BLOCK) {
@@ -122,29 +140,36 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
             }
         }
     }
-    __syncthreads();
-    
-    // Base index for the current block
+
+    // Base index for the current block in the logits/grad_logits tensors
     int idx_base = ((b * C) * H + i) * W + j;
-    float scale = grad_out_scalar / (B * C * H * W);
+
+    // Load logits for all C channels into shared memory to avoid uncoalesced global reads in the loop.
+    for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
+        sh_logits[ci] = logits[idx_base + ci * H * W];
+    }
+    __syncthreads();
 
     // Each thread computes the gradient for a subset of classes
+    float scale = grad_out_scalar / (B * C * H * W);
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
-        float L = logits[idx_base + ci * H * W];
+        float L = sh_logits[ci]; // Fast read from shared memory
         int32_t n = sh_counts[ci];
 
-        // sigma = 1 / (1 + exp(-L))
-        float sigma = 1.0f / (1.0f + expf(-L));
-        // derivative: dLoss/dL = N2 * sigma - n
+        // Use a faster, mathematically equivalent implementation of the sigmoid function
+        float sigma = 0.5f * tanhf(0.5f * L) + 0.5f;
+        
+        // Derivative: dLoss/dL = N2 * sigma - n
         float g = N2 * sigma - (float)n;
         
-        // Apply scaling
+        // Apply scaling. The write to global memory is still uncoalesced,
+        // but modern GPU caches can help mitigate the performance impact.
         grad_logits[idx_base + ci * H * W] = g * scale;
     }
 }
 
 torch::Tensor sigmoid_cross_entropy_forward(
-    const torch::Tensor& logits, 
+    const torch::Tensor& logits,
     const torch::Tensor& targets
 ) {
     CHECK_INPUT(logits);
@@ -156,17 +181,17 @@ torch::Tensor sigmoid_cross_entropy_forward(
     const int W = logits.size(3);
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
-    
+
     const int total_elements = B * C * H_t * W_t;
     if (total_elements == 0) return torch::tensor(0.0, logits.options());
 
     auto total_loss_sum_tensor = torch::zeros({1}, logits.options().dtype(torch::kFloat64));
-    
+
     // Set grid dimensions based on the low-resolution output
     dim3 grid(W, H, B);
-    
-    // Shared memory size is C * sizeof(int32) for the counts
-    const size_t shared_mem_size = C * sizeof(int32_t);
+
+    // Update shared memory size to accommodate both counts and the per-thread loss sums
+    const size_t shared_mem_size = C * sizeof(int32_t) + THREADS_PER_BLOCK * sizeof(double);
 
     auto static_launcher = [&](auto... Dims) {
         sigmoid_cross_entropy_forward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
@@ -186,7 +211,7 @@ torch::Tensor sigmoid_cross_entropy_forward(
 
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
-    
+
     return (total_loss_sum_tensor.to(torch::kFloat32) / total_elements).squeeze();
 }
 
@@ -213,9 +238,9 @@ torch::Tensor sigmoid_cross_entropy_backward(
 
     const float grad_out_scalar = grad_out.item<float>();
     
-    // Set grid dimensions based on the low-resolution output
     dim3 grid(W, H, B);
-    const size_t shared_mem_size = C * sizeof(int32_t);
+    // Increase shared memory to hold both counts and logits
+    const size_t shared_mem_size = C * sizeof(int32_t) + C * sizeof(float);
 
     auto static_launcher = [&](auto... Dims) {
         sigmoid_cross_entropy_backward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
