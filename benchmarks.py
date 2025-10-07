@@ -6,10 +6,7 @@ import os
 import sys
 from contextlib import contextmanager
 
-from functions import (
-    SigmoidCELossFunction, sigmoid_cross_entropy_loss,
-    MultiClassSigmoidCELossFunction, multiclass_sigmoid_cross_entropy_loss
-)
+from functions import *
 
 @contextmanager
 def _suppress_stdout_stderr():
@@ -87,7 +84,7 @@ class CUDAKernelTester:
             print("-" * 40)
         return are_close
 
-    def run(self, fwd_atol=1e-5, fwd_rtol=1e-4, bwd_atol=1e-4, bwd_rtol=1e-3, **kwargs):
+    def run(self, fwd_atol=1e-6, fwd_rtol=1e-6, bwd_atol=1e-4, bwd_rtol=1e-3, **kwargs):
         """
         Executes the full testing pipeline: performance, memory, and correctness.
         """
@@ -216,5 +213,48 @@ def test_mc_sigmoid_ce_loss():
     
     tester.run()
 
+def test_dice_loss():
+    """Test the CUDA implementation of sigmoid dice loss"""
+    B, C, H, W = 16, 256, 64, 64
+    H_t, W_t = 512, 512
+    
+    input_creators = {
+        "logits": lambda device, dtype: torch.randn(B, C, H, W, device=device, dtype=dtype),
+        "targets": lambda device, dtype: torch.randint(0, C, (B, H_t, W_t), device=device, dtype=torch.long),
+    }
+    
+    arg_order = ["logits", "targets"]
+    
+    tester = CUDAKernelTester(
+        cuda_function=DiceLossFunction.apply,
+        python_function=dice_loss,
+        input_creators=input_creators,
+        arg_order=arg_order
+    )
+    
+    tester.run()
+
+def test_mc_dice_loss():
+    """Test the CUDA implementation of sigmoid dice loss"""
+    B, C, K, H, W = 16, 256, 16, 64, 64
+    H_t, W_t = 512, 512
+    
+    input_creators = {
+        "logits": lambda device, dtype: torch.randn(B, C, H, W, device=device, dtype=dtype),
+        "targets": lambda device, dtype: torch.randint(0, K-1, (B, H_t, W_t), device=device, dtype=torch.uint8),
+        "class_mapping": lambda device, dtype: torch.randint(0, C-1, (K,), device=device, dtype=torch.long),
+    }
+    
+    arg_order = ["logits", "targets", "class_mapping"]
+    
+    tester = CUDAKernelTester(
+        cuda_function=MultiClassDiceLossFunction.apply,
+        python_function=multiclass_dice_loss,
+        input_creators=input_creators,
+        arg_order=arg_order
+    )
+    
+    tester.run()
+
 if __name__ == "__main__":
-    test_mc_sigmoid_ce_loss()
+    test_mc_dice_loss()

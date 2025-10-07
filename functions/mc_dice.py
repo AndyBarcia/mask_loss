@@ -12,32 +12,34 @@ except ImportError:
     print("CUDA extension pos_mlp_bias not found. Please compile it first.")
     print("Run: pip3 install --no-build-isolation .")
 
-class DiceLossFunction(Function):
+class MultiClassDiceLossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, smooth=1.0):
+    def forward(ctx, logits, targets, class_mapping, smooth=1.0):
         logits = logits.contiguous().float()
-        targets = targets.contiguous().long()
+        targets = targets.contiguous().to(torch.uint8)
+        class_mapping = class_mapping.contiguous().long()
         ctx.smooth = smooth
-        output, int_sum, p_sum, t_sum = mask_loss.forward_dice_loss(logits, targets, smooth)
-        ctx.save_for_backward(logits, targets, int_sum, p_sum, t_sum)
+        output, int_sum, p_sum, t_sum = mask_loss.forward_mc_dice_loss(logits, targets, class_mapping, smooth)
+        ctx.save_for_backward(logits, targets, class_mapping, int_sum, p_sum, t_sum)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        logits, targets, int_sum, p_sum, t_sum = ctx.saved_tensors
+        logits, targets, class_mapping, int_sum, p_sum, t_sum = ctx.saved_tensors
         grad_output = grad_output.contiguous()
-        grad_weights = mask_loss.backward_dice_loss(
+        grad_weights = mask_loss.backward_mc_dice_loss(
             grad_output, 
             logits, 
-            targets, 
+            targets,
+            class_mapping, 
             int_sum,
             p_sum,
             t_sum,
             ctx.smooth
         )
-        return grad_weights, None
+        return grad_weights, None, None
 
-def dice_loss(logits, targets, smooth=1e-6):
+def multiclass_dice_loss(logits, targets, class_mapping, smooth=1e-6):
     """
     Naive approach: upsample logits (nearest) to high-res, build per-class one-hot targets,
     compute sigmoid probabilities, compute Dice per (B,C) across the whole high-res map,
@@ -57,8 +59,11 @@ def dice_loss(logits, targets, smooth=1e-6):
     device = logits.device
     targets_long = targets.long().to(device)
 
+    # Map the target labels to the correct class indices
+    mapped_targets = class_mapping[targets_long]
+
     # one-hot targets: (B, C, H_t, W_t)
-    onehot = F.one_hot(targets_long, num_classes=C).permute(0, 3, 1, 2).to(dtype=logits.dtype)
+    onehot = F.one_hot(mapped_targets, num_classes=C).permute(0, 3, 1, 2).to(dtype=logits.dtype)
 
     # predicted probabilities per-pixel per-class
     probs = torch.sigmoid(logits_up)  # (B, C, H_t, W_t)
@@ -72,8 +77,7 @@ def dice_loss(logits, targets, smooth=1e-6):
     loss = 1.0 - dice
     return loss.mean()  # scalar
 
-
-def dice_loss_efficient(logits, targets, smooth=1e-6):
+def multiclass_dice_loss_efficient(logits, targets, class_mapping, smooth=1e-6):
     """
     Efficient count-based Dice loss consistent with nearest upsampling behavior.
     Assumes H_t and W_t are integer multiples of h and w respectively and that
@@ -100,8 +104,11 @@ def dice_loss_efficient(logits, targets, smooth=1e-6):
     device = logits.device
     targets_long = targets.long().to(device)
 
+    # Map the target labels to the correct class indices
+    mapped_targets = class_mapping[targets_long]
+
     # One-hot encode targets at high resolution (B, C, H_t, W_t)
-    onehot = F.one_hot(targets_long, num_classes=C).permute(0, 3, 1, 2).to(dtype=logits.dtype)
+    onehot = F.one_hot(mapped_targets, num_classes=C).permute(0, 3, 1, 2).to(dtype=logits.dtype)
 
     # Unfold the one-hot high-res maps into sxs blocks to count positives per block.
     # Reshape to (B*C, 1, H_t, W_t) to use F.unfold conveniently.
