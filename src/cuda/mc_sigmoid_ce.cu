@@ -24,9 +24,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = B (batch)
     // Shared memory is partitioned for class counts, loss sums, and class mapping
     extern __shared__ char sh_mem[];
-    int* sh_counts = reinterpret_cast<int*>(sh_mem);
-    double* s_block_loss = reinterpret_cast<double*>(sh_mem + C * sizeof(int));
-    int64_t* sh_class_mapping = reinterpret_cast<int64_t*>(sh_mem + C * sizeof(int) + THREADS_PER_BLOCK * sizeof(double));
+    int* sh_counts = reinterpret_cast<int32_t*>(sh_mem);
+    double* s_block_loss = reinterpret_cast<double*>(sh_mem + C * sizeof(int32_t));
+    int64_t* sh_class_mapping = reinterpret_cast<int64_t*>(sh_mem + C * sizeof(int32_t) + THREADS_PER_BLOCK * sizeof(double));
 
     int j = blockIdx.x;  // low-res x (0..W-1)
     int i = blockIdx.y;  // low-res y (0..H-1)
@@ -44,7 +44,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     // Collaboratively load class_mapping into shared memory.
     // Since THREADS_PER_BLOCK is 256, each thread loads exactly one value.
     if (tid < 256) {
-        sh_class_mapping[tid] = class_mapping[tid];
+        sh_class_mapping[tid] = class_mapping[b*256 + tid];
     }
     __syncthreads(); // Ensure all shared memory is initialized before use
 
@@ -126,9 +126,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
 
     // Partition shared memory for counts, logits, and the class mapping
     extern __shared__ char sh_mem[];
-    int* sh_counts = reinterpret_cast<int*>(sh_mem);
+    int* sh_counts = reinterpret_cast<int32_t*>(sh_mem);
     float* sh_logits = reinterpret_cast<float*>(sh_mem + C * sizeof(int32_t));
-    int64_t* sh_class_mapping = reinterpret_cast<int64_t*>(sh_mem + C * sizeof(int32_t) + C * sizeof(float));
+    int64_t* sh_class_mapping = reinterpret_cast<int64_t*>(sh_mem + C * sizeof(int32_t) + THREADS_PER_BLOCK * sizeof(double));
 
     // Initialize shared counts to zero
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
@@ -137,7 +137,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
 
     // Collaboratively load class_mapping into shared memory.
     if (tid < 256) {
-        sh_class_mapping[tid] = class_mapping[tid];
+        sh_class_mapping[tid] = class_mapping[b*256 + tid];
     }
     __syncthreads(); // Ensure sh_class_mapping is loaded before use
 
@@ -168,7 +168,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     __syncthreads(); // Ensure counts and logits are ready
 
     // Each thread computes the gradient for a subset of classes
-    float scale = grad_out_scalar / (B * C * H * W);
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
         float L = sh_logits[ci]; // Fast read from shared memory
         int32_t n = sh_counts[ci];
@@ -181,7 +180,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
         
         // Apply scaling. The write to global memory is still uncoalesced,
         // but modern GPU caches can help mitigate the performance impact.
-        grad_logits[idx_base + ci * H * W] = g * scale;
+        grad_logits[idx_base + ci * H * W] = g * grad_out_scalar;
     }
 }
 
@@ -224,7 +223,7 @@ torch::Tensor mc_sigmoid_cross_entropy_forward(
     };
 
     const auto supported_dims = std::make_tuple(
-        std::make_tuple(std::integral_constant<int, 256>{}), // C
+        std::make_tuple(std::integral_constant<int, 8>{}, std::integral_constant<int, 256>{}), // C
         std::make_tuple(std::integral_constant<int, 64>{}),  // H
         std::make_tuple(std::integral_constant<int, 64>{}),  // W
         std::make_tuple(std::integral_constant<int, 512>{}), // H_t
@@ -237,14 +236,15 @@ torch::Tensor mc_sigmoid_cross_entropy_forward(
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
 
-    return (total_loss_sum_tensor.to(torch::kFloat32) / (num_masks*H_t * W_t)).squeeze();
+    return (total_loss_sum_tensor.to(torch::kFloat32) / (num_masks * H_t * W_t)).squeeze();
 }
 
 torch::Tensor mc_sigmoid_cross_entropy_backward(
     const torch::Tensor& grad_out, 
     const torch::Tensor& logits, 
     const torch::Tensor& targets,
-    const torch::Tensor& class_mapping
+    const torch::Tensor& class_mapping,
+    const int num_masks
 ) {
     
     CHECK_INPUT(grad_out);
@@ -263,11 +263,11 @@ torch::Tensor mc_sigmoid_cross_entropy_backward(
     const int total_elements = B * C * H * W;
     if (total_elements == 0) return grad_logits;
 
-    const float grad_out_scalar = grad_out.item<float>();
+    const float grad_out_scalar = grad_out.item<float>() / (num_masks * H_t * W_t);
     
     dim3 grid(W, H, B);
     // Update shared memory size for counts, logits, and the class mapping
-    const size_t shared_mem_size = C * sizeof(int32_t) + C * sizeof(float) + 256 * sizeof(int64_t);
+    const size_t shared_mem_size = C * sizeof(int32_t) + THREADS_PER_BLOCK * sizeof(double) + 256 * sizeof(int64_t);
 
     auto static_launcher = [&](auto... Dims) {
         sigmoid_cross_entropy_backward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
@@ -281,7 +281,7 @@ torch::Tensor mc_sigmoid_cross_entropy_backward(
     };
     
     const auto supported_dims = std::make_tuple(
-        std::make_tuple(std::integral_constant<int, 256>{}), // C
+        std::make_tuple(std::integral_constant<int, 8>{}, std::integral_constant<int, 256>{}), // C
         std::make_tuple(std::integral_constant<int, 64>{}),  // H
         std::make_tuple(std::integral_constant<int, 64>{}),  // W
         std::make_tuple(std::integral_constant<int, 512>{}), // H_t

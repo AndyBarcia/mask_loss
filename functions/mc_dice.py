@@ -15,10 +15,16 @@ except ImportError:
 class MultiClassDiceLossFunction(Function):
     @staticmethod
     def forward(ctx, logits, targets, class_mapping, smooth=1.0, num_masks=None):
+        B, C, h, w = logits.shape
+        B_t, H_t, W_t = targets.shape
+        assert B == B_t, "Batch size mismatch between logits and targets"
+        assert class_mapping.shape[-1] == 256, "Class mapping must have shape 256"
+    
         ctx.received_num_masks = num_masks is not None
         if num_masks is None:
             B, C = logits.shape[:2]
             num_masks = B*C
+        ctx.num_masks = num_masks
 
         logits = logits.contiguous().float()
         targets = targets.contiguous().to(torch.uint8)
@@ -46,7 +52,8 @@ class MultiClassDiceLossFunction(Function):
             int_sum,
             p_sum,
             t_sum,
-            ctx.smooth
+            ctx.smooth,
+            ctx.num_masks
         )
         if ctx.received_num_masks:
             return grad_weights, None, None, None
@@ -60,12 +67,16 @@ def multiclass_dice_loss_py(logits, targets, class_mapping, smooth=1e-6, num_mas
     and return mean(1 - Dice) over B and C.
 
     logits: (B, C, h, w)
-    targets: (B, H_t, W_t) integer labels in [0, C-1]
+    targets: (B, H_t, W_t) integer labels in [0, 255], of type uint8
+    class_mapping: (B,256,) a tensor that maps the encoded values in
+        targets to class indices from logits. If the encoded value is mapped
+        to a value <0 or >=C, then it is treated as background.
     smooth: small float to avoid division by zero
     """
     B, C, h, w = logits.shape
     B_t, H_t, W_t = targets.shape
     assert B == B_t, "Batch size mismatch"
+    assert class_mapping.shape[-1] == 256, "Class mapping must have shape 256"
 
     # Upsample logits to high-res (nearest)
     logits_up = F.interpolate(logits, size=(H_t, W_t), mode='nearest')  # (B, C, H_t, W_t)
@@ -74,10 +85,26 @@ def multiclass_dice_loss_py(logits, targets, class_mapping, smooth=1e-6, num_mas
     targets_long = targets.long().to(device)
 
     # Map the target labels to the correct class indices
-    mapped_targets = class_mapping[targets_long]
+    batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, H_t, W_t)
+    mapped_targets = class_mapping[batch_idx, targets_long]
 
     # one-hot targets: (B, C, H_t, W_t)
-    onehot = F.one_hot(mapped_targets, num_classes=C).permute(0, 3, 1, 2).to(dtype=logits.dtype)
+    onehot = torch.zeros((B,C,H_t,W_t), device=logits.device, dtype=logits.dtype)
+    
+    # Create a mask for valid foreground pixels
+    valid_mask = (mapped_targets >= 0) & (mapped_targets < C)
+
+    # For the foreground pixels, we need to place a '1' at the correct class channel.
+    # We use scatter_ for an efficient update.
+    # First, clamp the mapped_targets to avoid out-of-bounds errors for the index.
+    # The invalid values won't be used anyway because of how we construct the 'src' tensor.
+    index = mapped_targets.clamp(0, C - 1).unsqueeze(1)
+    
+    # The source tensor for scatter should be 1.0 only where the mask is valid.
+    src = valid_mask.unsqueeze(1).to(onehot.dtype)
+    
+    # Place 1.0 in the channel corresponding to the class index for valid pixels.
+    onehot.scatter_(1, index, src)
 
     # predicted probabilities per-pixel per-class
     probs = torch.sigmoid(logits_up)  # (B, C, H_t, W_t)
@@ -101,6 +128,9 @@ def multiclass_dice_loss_efficient_py(logits, targets, class_mapping, smooth=1e-
 
     logits: (B, C, h, w)
     targets: (B, H_t, W_t) integer labels in [0, C-1]
+    class_mapping: (B,256,) a tensor that maps the encoded values in
+        targets to class indices from logits. If the encoded value is mapped
+        to a value <0 or >=C, then it is treated as background.
     smooth: small float to avoid division by zero
 
     Returns: scalar tensor (mean Dice loss over B and C)
@@ -109,6 +139,7 @@ def multiclass_dice_loss_efficient_py(logits, targets, class_mapping, smooth=1e-
     B_t, H_t, W_t = targets.shape
     assert B == B_t, "Batch size mismatch"
     assert H_t % h == 0 and W_t % w == 0, "High-res dims must be integer multiples of low-res dims"
+    assert class_mapping.shape[-1] == 256, "Class mapping must have shape 256"
 
     sH = H_t // h
     sW = W_t // w
@@ -121,10 +152,26 @@ def multiclass_dice_loss_efficient_py(logits, targets, class_mapping, smooth=1e-
     targets_long = targets.long().to(device)
 
     # Map the target labels to the correct class indices
-    mapped_targets = class_mapping[targets_long]
+    batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, H_t, W_t)
+    mapped_targets = class_mapping[batch_idx, targets_long]
 
-    # One-hot encode targets at high resolution (B, C, H_t, W_t)
-    onehot = F.one_hot(mapped_targets, num_classes=C).permute(0, 3, 1, 2).to(dtype=logits.dtype)
+    # one-hot targets: (B, C, H_t, W_t)
+    onehot = torch.zeros((B,C,H_t,W_t), device=logits.device, dtype=logits.dtype)
+    
+    # Create a mask for valid foreground pixels
+    valid_mask = (mapped_targets >= 0) & (mapped_targets < C)
+
+    # For the foreground pixels, we need to place a '1' at the correct class channel.
+    # We use scatter_ for an efficient update.
+    # First, clamp the mapped_targets to avoid out-of-bounds errors for the index.
+    # The invalid values won't be used anyway because of how we construct the 'src' tensor.
+    index = mapped_targets.clamp(0, C - 1).unsqueeze(1)
+    
+    # The source tensor for scatter should be 1.0 only where the mask is valid.
+    src = valid_mask.unsqueeze(1).to(onehot.dtype)
+    
+    # Place 1.0 in the channel corresponding to the class index for valid pixels.
+    onehot.scatter_(1, index, src)
 
     # Unfold the one-hot high-res maps into sxs blocks to count positives per block.
     # Reshape to (B*C, 1, H_t, W_t) to use F.unfold conveniently.

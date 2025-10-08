@@ -25,8 +25,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_forward_kernel
     // Each CUDA block processes one (b, i, j) low-res block
     // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = B (batch)
     extern __shared__ char sh_mem[];
-    int* sh_counts = reinterpret_cast<int*>(sh_mem);
-    int64_t* sh_class_mapping = reinterpret_cast<int64_t*>(sh_mem + C * sizeof(int));
+    int* sh_counts = reinterpret_cast<int32_t*>(sh_mem);
+    int64_t* sh_class_mapping = reinterpret_cast<int64_t*>(sh_mem + C * sizeof(int32_t) + THREADS_PER_BLOCK * sizeof(double));
 
     int j = blockIdx.x; // low-res x (0..W-1)
     int i = blockIdx.y; // low-res y (0..H-1)
@@ -43,7 +43,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_forward_kernel
     // Collaboratively load class_mapping into shared memory.
     // Since THREADS_PER_BLOCK is 256, each thread loads exactly one value.
     if (tid < 256) {
-        sh_class_mapping[tid] = class_mapping[tid];
+        sh_class_mapping[tid] = class_mapping[b*256 + tid];
     }
     __syncthreads();
 
@@ -113,7 +113,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
 
     extern __shared__ char sh_mem[];
     int* sh_counts = reinterpret_cast<int*>(sh_mem);
-    int64_t* sh_class_mapping = reinterpret_cast<int64_t*>(sh_mem + C * sizeof(int));
+    int64_t* sh_class_mapping = reinterpret_cast<int64_t*>(sh_mem + C * sizeof(int32_t) + THREADS_PER_BLOCK * sizeof(double));
 
     // Initialize shared counts to zero
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
@@ -122,7 +122,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
     // Collaboratively load class_mapping into shared memory.
     // Since THREADS_PER_BLOCK is 256, each thread loads exactly one value.
     if (tid < 256) {
-        sh_class_mapping[tid] = class_mapping[tid];
+        sh_class_mapping[tid] = class_mapping[b*256 + tid];
     }
     __syncthreads();
 
@@ -146,7 +146,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
     __syncthreads();
 
     // Each thread computes the gradient for a subset of classes
-    float scale = -grad_out_scalar / (B * C);
+    float scale = -grad_out_scalar;
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
         float L = logits[((b * C + ci) * H + i) * W + j];
         float p = 1.0f / (1.0f + expf(-L));
@@ -240,7 +240,8 @@ torch::Tensor mc_dice_loss_backward(
     const torch::Tensor& total_intersection_sum,
     const torch::Tensor& total_p_sum,
     const torch::Tensor& total_t_sum,
-    const float smooth
+    const float smooth,
+    const int num_masks
 ) {
     CHECK_INPUT(grad_out);
     CHECK_INPUT(logits);
@@ -259,7 +260,7 @@ torch::Tensor mc_dice_loss_backward(
     auto grad_logits = torch::empty_like(logits);
     if (logits.numel() == 0) return grad_logits;
 
-    const float grad_out_scalar = grad_out.item<float>();
+    const float grad_out_scalar = grad_out.item<float>() / num_masks;
 
     dim3 grid(W, H, B);
     const size_t shared_mem_size = 2 * C * sizeof(int32_t);

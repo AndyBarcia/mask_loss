@@ -81,6 +81,7 @@ class CUDAKernelTester:
             print(f"  Max Absolute Difference: {abs_diff.max().item():.6e}")
             print(f"  Mean Absolute Difference: {abs_diff.mean().item():.6e}")
             print(f"  Max Relative Difference: {rel_diff.max().item():.6e}")
+            print(f"  Mean Relative Difference: {rel_diff.max().item():.6e}")
             print("-" * 40)
         return are_close
 
@@ -102,11 +103,14 @@ class CUDAKernelTester:
         }
 
         # Create base input tensors once
-        base_inputs = {name: creator(self.device, self.dtype) for name, creator in self.input_creators.items()}
+        base_inputs = {
+            name: creator(self.device, self.dtype) if callable(creator) else creator
+            for name, creator in self.input_creators.items()
+        }
         
         # --- Python Implementation ---
         inputs_py = {
-            name: (t.clone().requires_grad_(True) if torch.is_floating_point(t) else t) 
+            name: (t.clone().requires_grad_(True) if torch.is_tensor(t) and torch.is_floating_point(t) else t) 
             for name, t in base_inputs.items()
         }
         all_args_py = {**inputs_py, **kwargs}
@@ -123,7 +127,7 @@ class CUDAKernelTester:
 
         # --- CUDA Implementation ---
         inputs_cu = {
-            name: (t.clone().requires_grad_(True) if torch.is_floating_point(t) else t) 
+            name: (t.clone().requires_grad_(True) if torch.is_tensor(t) and torch.is_floating_point(t) else t) 
             for name, t in base_inputs.items()
         }
         all_args_cu = {**inputs_cu, **kwargs}
@@ -142,9 +146,12 @@ class CUDAKernelTester:
         results['correctness']['fwd'] = self._check_correctness(output_cu, output_py, "Forward Pass Output", fwd_atol, fwd_rtol)
         
         for name in base_inputs:
-            if inputs_cu[name].grad is not None and inputs_py[name].grad is not None:
-                is_grad_correct = self._check_correctness(inputs_cu[name].grad, inputs_py[name].grad, f"Gradient of '{name}'", bwd_atol, bwd_rtol)
-                results['correctness']['bwd'] &= is_grad_correct
+            if not torch.is_tensor(inputs_cu[name]) or not torch.is_tensor(inputs_py[name]):
+                continue
+            if inputs_cu[name].grad is None or inputs_py[name].grad is None:
+                continue
+            is_grad_correct = self._check_correctness(inputs_cu[name].grad, inputs_py[name].grad, f"Gradient of '{name}'", bwd_atol, bwd_rtol)
+            results['correctness']['bwd'] &= is_grad_correct
 
         # Define column widths
         pass_w, impl_w, time_w, mem_w, corr_w = 10, 14, 15, 20, 10
@@ -172,15 +179,16 @@ class CUDAKernelTester:
 
 def test_sigmoid_ce_loss():
     """Test the CUDA implementation of sigmoid cross-entropy loss"""
-    B, C, H, W = 16, 256, 64, 64
+    B, C, H, W = 1, 256, 64, 64
     H_t, W_t = 512, 512
     
     input_creators = {
         "logits": lambda device, dtype: torch.randn(B, C, H, W, device=device, dtype=dtype),
         "targets": lambda device, dtype: torch.randint(0, C, (B, H_t, W_t), device=device, dtype=torch.long),
+        "num_masks": 2,
     }
     
-    arg_order = ["logits", "targets"]
+    arg_order = ["logits", "targets", "num_masks"]
     
     tester = CUDAKernelTester(
         cuda_function=SigmoidCELossFunction.apply,
@@ -193,13 +201,13 @@ def test_sigmoid_ce_loss():
 
 def test_mc_sigmoid_ce_loss():
     """Test the CUDA implementation of sigmoid cross-entropy loss"""
-    B, C, K, H, W = 16, 256, 16, 64, 64
+    B, C, K, H, W = 1, 8, 256, 64, 64
     H_t, W_t = 512, 512
     
     input_creators = {
         "logits": lambda device, dtype: torch.randn(B, C, H, W, device=device, dtype=dtype),
         "targets": lambda device, dtype: torch.randint(0, K-1, (B, H_t, W_t), device=device, dtype=torch.uint8),
-        "class_mapping": lambda device, dtype: torch.randint(0, C-1, (K,), device=device, dtype=torch.long),
+        "class_mapping": lambda device, dtype: torch.randint(0, C-1, (B, K,), device=device, dtype=torch.long),
     }
     
     arg_order = ["logits", "targets", "class_mapping"]

@@ -23,8 +23,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = B (batch)
     // Shared memory is partitioned for per-class counts and per-thread partial loss sums
     extern __shared__ char sh_mem[];
-    int* sh_counts = reinterpret_cast<int*>(sh_mem);
-    double* s_block_loss = reinterpret_cast<double*>(sh_mem + C * sizeof(int));
+    int* sh_counts = reinterpret_cast<int32_t*>(sh_mem);
+    double* s_block_loss = reinterpret_cast<double*>(sh_mem + C * sizeof(int32_t));
 
     int j = blockIdx.x;  // low-res x (0..W-1)
     int i = blockIdx.y;  // low-res y (0..H-1)
@@ -116,7 +116,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
 
     // Partition shared memory for counts and for caching logits
     extern __shared__ char sh_mem[];
-    int* sh_counts = reinterpret_cast<int*>(sh_mem);
+    int* sh_counts = reinterpret_cast<int32_t*>(sh_mem);
     float* sh_logits = reinterpret_cast<float*>(sh_mem + C * sizeof(int32_t));
 
     // Initialize shared counts to zero
@@ -151,7 +151,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     __syncthreads();
 
     // Each thread computes the gradient for a subset of classes
-    float scale = grad_out_scalar / (B * C * H * W);
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
         float L = sh_logits[ci]; // Fast read from shared memory
         int32_t n = sh_counts[ci];
@@ -164,7 +163,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
         
         // Apply scaling. The write to global memory is still uncoalesced,
         // but modern GPU caches can help mitigate the performance impact.
-        grad_logits[idx_base + ci * H * W] = g * scale;
+        grad_logits[idx_base + ci * H * W] = g * grad_out_scalar;
     }
 }
 
@@ -219,7 +218,8 @@ torch::Tensor sigmoid_cross_entropy_forward(
 torch::Tensor sigmoid_cross_entropy_backward(
     const torch::Tensor& grad_out, 
     const torch::Tensor& logits, 
-    const torch::Tensor& targets
+    const torch::Tensor& targets,
+    const int num_masks
 ) {
     
     CHECK_INPUT(grad_out);
@@ -237,7 +237,7 @@ torch::Tensor sigmoid_cross_entropy_backward(
     const int total_elements = B * C * H * W;
     if (total_elements == 0) return grad_logits;
 
-    const float grad_out_scalar = grad_out.item<float>();
+    const float grad_out_scalar = grad_out.item<float>() / (num_masks * H_t * W_t);
     
     dim3 grid(W, H, B);
     // Increase shared memory to hold both counts and logits

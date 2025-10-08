@@ -15,11 +15,16 @@ except ImportError:
 class DiceLossFunction(Function):
     @staticmethod
     def forward(ctx, logits, targets, smooth=1.0, num_masks=None):
+        B, C, h, w = logits.shape
+        B_t, H_t, W_t = targets.shape
+        assert B == B_t, "Batch size mismatch between logits and targets"
+    
         ctx.received_num_masks = num_masks is not None
         if num_masks is None:
             B, C = logits.shape[:2]
             num_masks = B*C
-        
+        ctx.num_masks = num_masks
+
         logits = logits.contiguous().float()
         targets = targets.contiguous().long()
         ctx.smooth = smooth
@@ -38,7 +43,8 @@ class DiceLossFunction(Function):
             int_sum,
             p_sum,
             t_sum,
-            ctx.smooth
+            ctx.smooth,
+            ctx.num_masks
         )
         if ctx.received_num_masks:
             return grad_weights, None, None

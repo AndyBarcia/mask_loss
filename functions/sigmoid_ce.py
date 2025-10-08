@@ -15,10 +15,15 @@ except ImportError:
 class SigmoidCELossFunction(Function):
     @staticmethod
     def forward(ctx, logits, targets, num_masks=None):
+        B, C, h, w = logits.shape
+        B_t, H_t, W_t = targets.shape
+        assert B == B_t, "Batch size mismatch between logits and targets"
+        
         ctx.received_num_masks = num_masks is not None
         if num_masks is None:
             B, C = logits.shape[:2]
             num_masks = B*C
+        ctx.num_masks = num_masks
 
         logits = logits.contiguous().float()
         targets = targets.contiguous()
@@ -30,7 +35,7 @@ class SigmoidCELossFunction(Function):
     def backward(ctx, grad_output):
         logits, targets = ctx.saved_tensors
         grad_output = grad_output.contiguous()
-        grad_weights = mask_loss.backward_sigmoid_ce_loss(grad_output, logits, targets)
+        grad_weights = mask_loss.backward_sigmoid_ce_loss(grad_output, logits, targets, ctx.num_masks)
         if ctx.received_num_masks:
             return grad_weights, None, None
         else:
