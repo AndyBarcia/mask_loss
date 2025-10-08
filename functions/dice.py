@@ -15,6 +15,7 @@ except ImportError:
 class DiceLossFunction(Function):
     @staticmethod
     def forward(ctx, logits, targets, smooth=1.0, num_masks=None):
+        ctx.received_num_masks = num_masks is not None
         if num_masks is None:
             B, C = logits.shape[:2]
             num_masks = B*C
@@ -39,7 +40,10 @@ class DiceLossFunction(Function):
             t_sum,
             ctx.smooth
         )
-        return grad_weights, None
+        if ctx.received_num_masks:
+            return grad_weights, None, None
+        else:
+            return grad_weights, None
 
 def dice_loss_py(logits, targets, smooth=1e-6, num_masks=None):
     """

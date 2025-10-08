@@ -15,6 +15,7 @@ except ImportError:
 class MultiClassSigmoidCELossFunction(Function):
     @staticmethod
     def forward(ctx, logits, targets, class_mapping, num_masks=None):
+        ctx.received_num_masks = num_masks is not None
         if num_masks is None:
             B, C = logits.shape[:2]
             num_masks = B*C
@@ -31,7 +32,10 @@ class MultiClassSigmoidCELossFunction(Function):
         logits, targets, class_mapping = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_weights = mask_loss.backward_mc_sigmoid_ce_loss(grad_output, logits, targets, class_mapping)
-        return grad_weights, None, None
+        if ctx.received_num_masks:
+            return grad_weights, None, None, None
+        else:
+            return grad_weights, None, None
 
 def multiclass_sigmoid_cross_entropy_loss_py(logits, targets, class_mapping, num_masks=None):
     """
@@ -39,7 +43,7 @@ def multiclass_sigmoid_cross_entropy_loss_py(logits, targets, class_mapping, num
     and compute BCEWithLogits per pixel then mean.
     logits: (B, C, h, w)
     targets: (B, H_t, W_t) integer labels in [0, 255], of type uint8
-    class_mapping: (256,) a 1D tensor that maps the encoded values in
+    class_mapping: (256,) a tensor that maps the encoded values in
         targets to class indices from logits.
     
     Returns:
@@ -56,7 +60,8 @@ def multiclass_sigmoid_cross_entropy_loss_py(logits, targets, class_mapping, num
     targets_long = targets.long().to(device)
 
     # Map the target labels to the correct class indices
-    mapped_targets = class_mapping[targets_long]
+    batch_idx = torch.arange(B, device=device).view(B,1,1).expand(B,H_t,W_t)
+    mapped_targets = class_mapping[batch_idx, targets_long]
 
     # Create one-hot encoded targets from the mapped labels
     onehot = F.one_hot(mapped_targets, num_classes=C).permute(0, 3, 1, 2).to(dtype=logits.dtype)

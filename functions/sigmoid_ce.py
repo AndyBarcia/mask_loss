@@ -15,6 +15,7 @@ except ImportError:
 class SigmoidCELossFunction(Function):
     @staticmethod
     def forward(ctx, logits, targets, num_masks=None):
+        ctx.received_num_masks = num_masks is not None
         if num_masks is None:
             B, C = logits.shape[:2]
             num_masks = B*C
@@ -30,7 +31,10 @@ class SigmoidCELossFunction(Function):
         logits, targets = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_weights = mask_loss.backward_sigmoid_ce_loss(grad_output, logits, targets)
-        return grad_weights, None
+        if ctx.received_num_masks:
+            return grad_weights, None, None
+        else:
+            return grad_weights, None
 
 def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None):
     """

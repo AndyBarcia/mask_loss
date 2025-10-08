@@ -15,6 +15,7 @@ except ImportError:
 class MultiClassDiceLossFunction(Function):
     @staticmethod
     def forward(ctx, logits, targets, class_mapping, smooth=1.0, num_masks=None):
+        ctx.received_num_masks = num_masks is not None
         if num_masks is None:
             B, C = logits.shape[:2]
             num_masks = B*C
@@ -47,7 +48,10 @@ class MultiClassDiceLossFunction(Function):
             t_sum,
             ctx.smooth
         )
-        return grad_weights, None, None
+        if ctx.received_num_masks:
+            return grad_weights, None, None, None
+        else:
+            return grad_weights, None, None
 
 def multiclass_dice_loss_py(logits, targets, class_mapping, smooth=1e-6, num_masks=None):
     """
