@@ -212,7 +212,7 @@ torch::Tensor sigmoid_cross_entropy_forward(
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
 
-    return (total_loss_sum_tensor.to(torch::kFloat32) / (num_masks*H_t * W_t)).squeeze();
+    return (total_loss_sum_tensor.to(torch::kFloat32) / (num_masks *H_t * W_t)).squeeze();
 }
 
 torch::Tensor sigmoid_cross_entropy_backward(
