@@ -171,7 +171,8 @@ std::vector<torch::Tensor> mc_dice_loss_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
     const torch::Tensor& class_mapping,
-    const float smooth
+    const float smooth,
+    const int num_masks
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -226,7 +227,7 @@ std::vector<torch::Tensor> mc_dice_loss_forward(
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
 
     auto dice = (2.0 * total_intersection_sum + smooth) / (total_p_sum + total_t_sum + smooth);
-    auto loss = (1.0 - dice).mean();
+    auto loss = (1.0 - dice).sum() / num_masks;
 
     return {loss, total_intersection_sum, total_p_sum, total_t_sum};
 }

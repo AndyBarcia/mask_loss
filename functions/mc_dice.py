@@ -14,12 +14,22 @@ except ImportError:
 
 class MultiClassDiceLossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, class_mapping, smooth=1.0):
+    def forward(ctx, logits, targets, class_mapping, smooth=1.0, num_masks=None):
+        if num_masks is None:
+            B, C = logits.shape[:2]
+            num_masks = B*C
+
         logits = logits.contiguous().float()
         targets = targets.contiguous().to(torch.uint8)
         class_mapping = class_mapping.contiguous().long()
         ctx.smooth = smooth
-        output, int_sum, p_sum, t_sum = mask_loss.forward_mc_dice_loss(logits, targets, class_mapping, smooth)
+        output, int_sum, p_sum, t_sum = mask_loss.forward_mc_dice_loss(
+            logits, 
+            targets, 
+            class_mapping, 
+            smooth,
+            num_masks
+        )
         ctx.save_for_backward(logits, targets, class_mapping, int_sum, p_sum, t_sum)
         return output
 
@@ -39,7 +49,7 @@ class MultiClassDiceLossFunction(Function):
         )
         return grad_weights, None, None
 
-def multiclass_dice_loss(logits, targets, class_mapping, smooth=1e-6):
+def multiclass_dice_loss_py(logits, targets, class_mapping, smooth=1e-6, num_masks=None):
     """
     Naive approach: upsample logits (nearest) to high-res, build per-class one-hot targets,
     compute sigmoid probabilities, compute Dice per (B,C) across the whole high-res map,
@@ -75,9 +85,11 @@ def multiclass_dice_loss(logits, targets, class_mapping, smooth=1e-6):
 
     dice = (2.0 * intersection + smooth) / (p_sum + t_sum + smooth)  # (B, C)
     loss = 1.0 - dice
-    return loss.mean()  # scalar
+    loss = loss.mean() if num_masks is None else loss.sum()/num_masks
 
-def multiclass_dice_loss_efficient(logits, targets, class_mapping, smooth=1e-6):
+    return loss
+
+def multiclass_dice_loss_efficient_py(logits, targets, class_mapping, smooth=1e-6, num_masks=None):
     """
     Efficient count-based Dice loss consistent with nearest upsampling behavior.
     Assumes H_t and W_t are integer multiples of h and w respectively and that
@@ -140,4 +152,6 @@ def multiclass_dice_loss_efficient(logits, targets, class_mapping, smooth=1e-6):
 
     dice = (2.0 * intersection_total + smooth) / (p_sum_total + t_sum_total + smooth)  # (B, C)
     loss = 1.0 - dice
-    return loss.mean()  # scalar
+    loss = loss.mean() if num_masks is None else loss.sum()/num_masks
+
+    return loss

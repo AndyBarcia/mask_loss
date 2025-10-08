@@ -14,12 +14,16 @@ except ImportError:
 
 class MultiClassSigmoidCELossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, class_mapping):
+    def forward(ctx, logits, targets, class_mapping, num_masks=None):
+        if num_masks is None:
+            B, C = logits.shape[:2]
+            num_masks = B*C
+        
         logits = logits.contiguous().float()
         targets = targets.contiguous().to(torch.uint8)
         class_mapping = class_mapping.contiguous().long()
         ctx.save_for_backward(logits, targets, class_mapping)
-        output = mask_loss.forward_mc_sigmoid_ce_loss(logits, targets, class_mapping)
+        output = mask_loss.forward_mc_sigmoid_ce_loss(logits, targets, class_mapping, num_masks)
         return output
 
     @staticmethod
@@ -29,7 +33,7 @@ class MultiClassSigmoidCELossFunction(Function):
         grad_weights = mask_loss.backward_mc_sigmoid_ce_loss(grad_output, logits, targets, class_mapping)
         return grad_weights, None, None
 
-def multiclass_sigmoid_cross_entropy_loss(logits, targets, class_mapping):
+def multiclass_sigmoid_cross_entropy_loss_py(logits, targets, class_mapping, num_masks=None):
     """
     Naive approach: upsample logits (nearest) to high-res, build per-class one-hot targets,
     and compute BCEWithLogits per pixel then mean.
@@ -65,6 +69,9 @@ def multiclass_sigmoid_cross_entropy_loss(logits, targets, class_mapping):
     bce_elem = maxL - L * y + logexp
     
     # Compute the mean loss over all elements
-    loss = bce_elem.mean()
+    if num_masks is None:
+        loss = bce_elem.mean()
+    else:
+        loss = bce_elem.sum() / (num_masks * H_t * W_t)
 
     return loss

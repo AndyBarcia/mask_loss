@@ -14,11 +14,15 @@ except ImportError:
 
 class SigmoidCELossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets):
+    def forward(ctx, logits, targets, num_masks=None):
+        if num_masks is None:
+            B, C = logits.shape[:2]
+            num_masks = B*C
+
         logits = logits.contiguous().float()
         targets = targets.contiguous()
         ctx.save_for_backward(logits, targets)
-        output = mask_loss.forward_sigmoid_ce_loss(logits, targets)
+        output = mask_loss.forward_sigmoid_ce_loss(logits, targets, num_masks)
         return output
 
     @staticmethod
@@ -28,7 +32,7 @@ class SigmoidCELossFunction(Function):
         grad_weights = mask_loss.backward_sigmoid_ce_loss(grad_output, logits, targets)
         return grad_weights, None
 
-def sigmoid_cross_entropy_loss(logits, targets):
+def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None):
     """
     Naive approach: upsample logits (nearest) to high-res, build per-class one-hot targets,
     and compute BCEWithLogits per pixel then mean.
@@ -49,10 +53,11 @@ def sigmoid_cross_entropy_loss(logits, targets):
     logexp = torch.log1p(torch.exp(-torch.abs(L)))
     bce_elem = maxL - L * y + logexp
 
-    loss = bce_elem.sum() / (B * C * H_t * W_t)
+    num_masks = B*C if num_masks is None else num_masks
+    loss = bce_elem.sum() / (num_masks * H_t * W_t)
     return loss
 
-def sigmoid_cross_entropy_loss_efficient(logits, targets):
+def sigmoid_cross_entropy_loss_efficient_py(logits, targets, num_masks=None):
     """
     Efficient count-based BCE-with-logits for non-mutually-exclusive multi-class case.
     logits: (B, C, h, w)
@@ -90,5 +95,6 @@ def sigmoid_cross_entropy_loss_efficient(logits, targets):
     logexp = torch.log1p(torch.exp(-torch.abs(L)))
     loss_block = N2 * maxL - L * n_k + N2 * logexp  # (B, C, h*w)
 
-    loss = loss_block.sum() / (B * C * H_t * W_t)
+    num_masks = B*C if num_masks is None else num_masks
+    loss = loss_block.sum() / (num_masks * H_t * W_t)
     return loss

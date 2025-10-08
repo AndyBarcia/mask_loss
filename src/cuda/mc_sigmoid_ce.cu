@@ -188,7 +188,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
 torch::Tensor mc_sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
-    const torch::Tensor& class_mapping
+    const torch::Tensor& class_mapping,
+    const int num_masks
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -236,7 +237,7 @@ torch::Tensor mc_sigmoid_cross_entropy_forward(
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
 
-    return (total_loss_sum_tensor.to(torch::kFloat32) / total_elements).squeeze();
+    return (total_loss_sum_tensor.to(torch::kFloat32) / (num_masks*H_t * W_t)).squeeze();
 }
 
 torch::Tensor mc_sigmoid_cross_entropy_backward(

@@ -184,7 +184,7 @@ def test_sigmoid_ce_loss():
     
     tester = CUDAKernelTester(
         cuda_function=SigmoidCELossFunction.apply,
-        python_function=sigmoid_cross_entropy_loss,
+        python_function=sigmoid_cross_entropy_loss_py,
         input_creators=input_creators,
         arg_order=arg_order
     )
@@ -206,7 +206,7 @@ def test_mc_sigmoid_ce_loss():
     
     tester = CUDAKernelTester(
         cuda_function=MultiClassSigmoidCELossFunction.apply,
-        python_function=multiclass_sigmoid_cross_entropy_loss,
+        python_function=multiclass_sigmoid_cross_entropy_loss_py,
         input_creators=input_creators,
         arg_order=arg_order
     )
@@ -227,7 +227,7 @@ def test_dice_loss():
     
     tester = CUDAKernelTester(
         cuda_function=DiceLossFunction.apply,
-        python_function=dice_loss,
+        python_function=dice_loss_py,
         input_creators=input_creators,
         arg_order=arg_order
     )
@@ -249,7 +249,7 @@ def test_mc_dice_loss():
     
     tester = CUDAKernelTester(
         cuda_function=MultiClassDiceLossFunction.apply,
-        python_function=multiclass_dice_loss,
+        python_function=multiclass_dice_loss_py,
         input_creators=input_creators,
         arg_order=arg_order
     )
@@ -257,4 +257,4 @@ def test_mc_dice_loss():
     tester.run()
 
 if __name__ == "__main__":
-    test_mc_dice_loss()
+    test_mc_sigmoid_ce_loss()
