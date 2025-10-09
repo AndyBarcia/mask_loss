@@ -30,7 +30,7 @@ class PairwiseSigmoidCELossFunction(Function):
 
 def pairwise_sigmoid_cross_entropy_loss_py(logits, targets):
     """
-    Computes pairwise sigmoid cross-entropy loss.
+    Computes pairwise sigmoid cross-entropy loss and returns a tensor list.
 
     This function calculates the loss for each predicted class against every
     possible ground truth class. It upsamples the logits to the resolution of the
@@ -47,10 +47,9 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets):
                                 spatial dimensions of the targets.
 
     Returns:
-        torch.Tensor: A tensor of shape (B, C, GT) where GT is the maximum value
-                      in the targets tensor + 1. It contains the pairwise loss
-                      for each class against each possible target. For target masks
-                      with 0 area, a value of infinity is returned.
+        torch.Tensor: A list of tensors where each element corresponds to a batch
+                      item and contains a tensor of shape (C, num_present_gt_classes)
+                      with the pairwise losses.
     """
     B, C, h, w = logits.shape
     B_t, H_t, W_t = targets.shape
@@ -66,8 +65,8 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets):
     gt_max = targets_long.max().item()
     GT = gt_max + 1
     
-    # Initialized to infinity.
-    pairwise_loss = torch.full((B, C, GT), torch.inf, device=device)
+    # A list to hold tensors for each item in the batch.
+    batch_losses = [[] for _ in range(B)]
 
     # Iterate over each possible ground truth class
     for gt_class in range(GT):
@@ -76,6 +75,9 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets):
         
         # Check which batch elements contain this GT class
         has_class = y.sum(dim=(2, 3)) > 0  # Shape: (B, 1)
+
+        if not has_class.any():
+            continue
         
         # Stable BCE-with-logits calculation
         maxL = torch.clamp(logits_up, min=0.0)
@@ -85,19 +87,24 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets):
         # Sum the loss for each predicted class and normalize
         loss_per_class = bce_elem.sum(dim=(2, 3)) / (H_t * W_t)
         
-        # Only update loss where the class exists in the batch element
-        pairwise_loss[:, :, gt_class] = torch.where(
-            has_class.expand(-1, C),
-            loss_per_class,
-            torch.tensor(torch.inf, device=device, dtype=loss_per_class.dtype)
-        )
+        # Append the loss for batch items that have the current gt_class
+        for b in range(B):
+            if has_class[b]:
+                batch_losses[b].append(loss_per_class[b])
 
-    return pairwise_loss
+    # Stack the losses for each batch item to get tensors of shape (C, num_gt)
+    final_tensors = [
+        torch.stack(tensors, dim=1) if tensors else torch.empty((C, 0), device=device) 
+        for tensors in batch_losses
+    ]
+
+    return final_tensors
 
 
 def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets):
     """
-    Efficiently computes pairwise sigmoid cross-entropy loss using a count-based method.
+    Efficiently computes pairwise sigmoid cross-entropy loss using a count-based method
+    and returns a tensor list.
 
     This function avoids high-resolution one-hot target tensors by using unfolding
     to count the occurrences of each ground truth class within the regions
@@ -112,8 +119,9 @@ def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets):
                                 of h and w.
 
     Returns:
-        torch.Tensor: A tensor of shape (B, C, GT), where GT is the max value in the
-                      targets tensor + 1, containing the pairwise losses.
+        torch.Tensor: List of tensors where each element corresponds to a batch
+                      item and contains a tensor of shape (C, num_present_gt_classes)
+                      with the pairwise losses.
     """
     B, C, h, w = logits.shape
     B_t, H_t, W_t = targets.shape
@@ -134,8 +142,8 @@ def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets):
     gt_max = targets_long.max().item()
     GT = gt_max + 1
 
-    # Initialized to infinity.
-    pairwise_loss = torch.full((B, C, GT), torch.inf, device=device)
+    # A list to hold tensors for each item in the batch.
+    batch_losses = [[] for _ in range(B)]
     
     L_reshaped = logits.reshape(B, C, h * w)
     
@@ -150,6 +158,9 @@ def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets):
         # Check which batch elements contain this GT class
         has_class = onehot_gt.sum(dim=(2, 3)) > 0  # Shape: (B, 1)
         
+        if not has_class.any():
+            continue
+
         # Reshape for unfolding to count ground truth classes in each block
         Bc = onehot_gt.reshape(B, 1, H_t, W_t)
         unf = F.unfold(Bc, kernel_size=(s, s), stride=(s, s))
@@ -162,11 +173,15 @@ def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets):
         # Sum the loss over the spatial dimensions and normalize
         loss_sum = loss_block.sum(dim=2) / (H_t * W_t)
         
-        # Only update loss where the class exists in the batch element
-        pairwise_loss[:, :, gt_class] = torch.where(
-            has_class.expand(-1, C),
-            loss_sum,
-            torch.tensor(torch.inf, device=device, dtype=loss_sum.dtype)
-        )
+        # Append the loss for batch items that have the current gt_class
+        for b in range(B):
+            if has_class[b]:
+                batch_losses[b].append(loss_sum[b])
+
+    # Stack the losses for each batch item to get tensors of shape (C, num_gt)
+    final_tensors = [
+        torch.stack(tensors, dim=1) if tensors else torch.empty((C, 0), device=device) 
+        for tensors in batch_losses
+    ]
         
-    return pairwise_loss
+    return final_tensors

@@ -124,7 +124,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_loss_kernel(
     }
 }
 
-torch::Tensor pairwise_sigmoid_cross_entropy_forward(
+std::vector<torch::Tensor> pairwise_sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets
 ) {
@@ -209,5 +209,19 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after reduce kernel: ", cudaGetErrorString(err));
 
-    return out_accum.to(logits.options().dtype(torch::kFloat32)) / (H_t * W_t);
+    auto out_float = out_accum.to(logits.options().dtype(torch::kFloat32)) / (H_t * W_t);
+
+    std::vector<torch::Tensor> final_tensors;
+    final_tensors.reserve(B);
+
+    for (int b = 0; b < B; ++b) {
+        torch::Tensor present_classes = torch::where(total_counts[b] > 0)[0];
+        if (present_classes.numel() > 0) {
+            final_tensors.push_back(out_float[b].index_select(1, present_classes));
+        } else {
+            final_tensors.push_back(torch::empty({C, 0}, out_float.options()));
+        }
+    }
+
+    return final_tensors;
 }
