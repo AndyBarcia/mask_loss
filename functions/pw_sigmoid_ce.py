@@ -50,7 +50,8 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets):
     Returns:
         torch.Tensor: A tensor of shape (B, C, GT) where GT is the maximum value
                       in the targets tensor + 1. It contains the pairwise loss
-                      for each class against each possible target.
+                      for each class against each possible target. For target masks
+                      with 0 area, a value of infinity is returned.
     """
     B, C, h, w = logits.shape
     B_t, H_t, W_t = targets.shape
@@ -74,6 +75,9 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets):
         # Create a binary target mask for the current ground truth class
         y = (targets_long == gt_class).unsqueeze(1).to(dtype=logits.dtype)
         
+        # Check which batch elements contain this GT class
+        has_class = y.sum(dim=(2, 3)) > 0  # Shape: (B, 1)
+        
         # Stable BCE-with-logits calculation
         maxL = torch.clamp(logits_up, min=0.0)
         logexp = torch.log1p(torch.exp(-torch.abs(logits_up)))
@@ -81,7 +85,13 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets):
         
         # Sum the loss for each predicted class and normalize
         loss_per_class = bce_elem.sum(dim=(2, 3)) / (H_t * W_t)
-        pairwise_loss[:, :, gt_class] = loss_per_class
+        
+        # Only update loss where the class exists in the batch element
+        pairwise_loss[:, :, gt_class] = torch.where(
+            has_class.expand(-1, C),
+            loss_per_class,
+            torch.tensor(torch.inf, device=device, dtype=loss_per_class.dtype)
+        )
 
     return pairwise_loss
 
@@ -125,10 +135,8 @@ def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets):
     gt_max = targets_long.max().item()
     GT = gt_max + 1
 
-    # Initialized to infinity. TODO fix. Idea
-    # Mask later based on number of masks per batch element.
-    pairwise_loss = torch.zeros((B, C, GT), device=device)
-    #pairwise_loss = torch.full((B, C, GT), torch.inf, device=device)
+    # Initialized to infinity.
+    pairwise_loss = torch.full((B, C, GT), torch.inf, device=device)
     
     L_reshaped = logits.reshape(B, C, h * w)
     
@@ -139,6 +147,9 @@ def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets):
     for gt_class in range(GT):
         # Create a binary mask for the current ground truth class
         onehot_gt = (targets_long == gt_class).unsqueeze(1).to(dtype=logits.dtype)
+        
+        # Check which batch elements contain this GT class
+        has_class = onehot_gt.sum(dim=(2, 3)) > 0  # Shape: (B, 1)
         
         # Reshape for unfolding to count ground truth classes in each block
         Bc = onehot_gt.reshape(B, 1, H_t, W_t)
@@ -151,6 +162,12 @@ def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets):
         
         # Sum the loss over the spatial dimensions and normalize
         loss_sum = loss_block.sum(dim=2) / (H_t * W_t)
-        pairwise_loss[:, :, gt_class] = loss_sum
+        
+        # Only update loss where the class exists in the batch element
+        pairwise_loss[:, :, gt_class] = torch.where(
+            has_class.expand(-1, C),
+            loss_sum,
+            torch.tensor(torch.inf, device=device, dtype=loss_sum.dtype)
+        )
         
     return pairwise_loss

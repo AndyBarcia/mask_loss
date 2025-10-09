@@ -65,7 +65,8 @@ template <int C, int H, int W, int H_t>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_loss_kernel(
     const float* __restrict__ logits,
     const int32_t* __restrict__ counts,
-    double* __restrict__ out, // shape (B, C, GT)
+    double* __restrict__ out, // (B, C, GT)
+    const int32_t* __restrict__ total_counts,  // (B,GT)
     const int B,
     const int GT
 ) {
@@ -74,6 +75,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_loss_kernel(
     const int gt = blockIdx.x; // Ground Truth class index
     const int ci = blockIdx.y; // Logit class index
     const int b = blockIdx.z;  // Batch index
+
+    // If the total count for this ground truth label is 0, it's a zero-area mask.
+    // Set the loss to infinity and return. Only one thread writes the output
+    if (total_counts[b * GT + gt] == 0) {
+        if (threadIdx.x == 0) {
+            out[(b * C + ci) * GT + gt] = INFINITY;
+        }
+        return;
+    }
 
     const int tid = threadIdx.x;
     const int s = H_t / H;
@@ -162,6 +172,10 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after count kernel: ", cudaGetErrorString(err));
 
+    // Calculate the total number of pixels for each ground truth label (mask area)
+    // This is used to mask 0-area masks with a loss of infinity.
+    auto total_counts = counts.sum({2, 3}).to(torch::kInt32).contiguous();
+
     // Launch reduction kernel
     auto out_accum = torch::zeros({B, C, GT}, logits.options().dtype(torch::kFloat64));
     {
@@ -176,6 +190,7 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
                     logits.data_ptr<float>(),
                     counts.data_ptr<int32_t>(),
                     out_accum.data_ptr<double>(),
+                    total_counts.data_ptr<int32_t>(),
                     B, GT
                 );
         };

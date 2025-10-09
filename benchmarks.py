@@ -74,6 +74,7 @@ class CUDAKernelTester:
     def _check_correctness(self, tensor_cuda, tensor_python, label, atol, rtol):
         """Checks if two tensors are close and prints detailed differences if they are not."""
         are_close = torch.allclose(tensor_cuda, tensor_python.to(self.device), atol=atol, rtol=rtol)
+        print(torch.isfinite(tensor_python).sum())
         if not are_close:
             print(f"\n--- Correctness FAILED for '{label}' ---")
             abs_diff = (tensor_cuda - tensor_python.to(self.device)).abs()
@@ -199,6 +200,32 @@ def test_sigmoid_ce_loss():
     
     tester.run()
 
+def test_pw_sigmoid_ce_loss():
+    """Test the CUDA implementation of sigmoid cross-entropy loss"""
+    B, C, K, H, W = 1, 256, 20, 64, 64
+    H_t, W_t = 512, 512
+    
+    def create_targets(device, dtype):
+        targets = torch.randint(0, K, (B, H_t, W_t), device=device, dtype=torch.long)
+        targets[0] = 0
+        return targets
+
+    input_creators = {
+        "logits": lambda device, dtype: torch.randn(B, C, H, W, device=device, dtype=dtype),
+        "targets": create_targets,
+    }
+    
+    arg_order = ["logits", "targets"]
+    
+    tester = CUDAKernelTester(
+        cuda_function=PairwiseSigmoidCELossFunction.apply,
+        python_function=pairwise_sigmoid_cross_entropy_loss_py,
+        input_creators=input_creators,
+        arg_order=arg_order
+    )
+    
+    tester.run()
+
 def test_mc_sigmoid_ce_loss():
     """Test the CUDA implementation of sigmoid cross-entropy loss"""
     B, C, K, H, W = 1, 8, 256, 64, 64
@@ -265,4 +292,4 @@ def test_mc_dice_loss():
     tester.run()
 
 if __name__ == "__main__":
-    test_mc_sigmoid_ce_loss()
+    test_pw_sigmoid_ce_loss()
