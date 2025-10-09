@@ -1,6 +1,5 @@
 import torch
 from scipy.optimize import linear_sum_assignment
-import numpy as np
 from typing import List
 
 from .pw_sigmoid_ce import PairwiseSigmoidCELossFunction
@@ -12,39 +11,58 @@ def hungarian_match_assignment(
     cls_logits: torch.Tensor,
     mask_logits: torch.Tensor,
     mask_targets: torch.Tensor,
-    cls_targets: List[torch.Tensor]
+    cls_targets: List[torch.Tensor],
+    cost_class: float = 1.0,
+    cost_mask: float = 1.0,
+    cost_dice: float = 1.0,
+    use_binary_classification: bool = False,
+    use_focal_classification: bool = False,
+    focal_alpha: float = 0.25,
+    focal_gamma: float = 2.0,
 ) -> torch.Tensor:
     """
-    Performs Hungarian matching between predictions and ground truth targets in an
-    optimized, batched manner.
+    Performs Hungarian matching with configurable costs and loss types.
 
     Args:
         cls_logits: (B, Q, C) classification logits for each query.
         mask_logits: (B, Q, H, W) mask logits for each query.
-        mask_targets: (B, H_t, W_t) ground truth masks, where integer values
-                      greater than 0 represent different object instances.
-        cls_targets: A list of B tensors, where the n-th entry of each tensor
-                     is the class label for the mask with value n+1.
+        mask_targets: (B, H_t, W_t) ground truth masks.
+        cls_targets: List of B tensors with class labels for each mask.
+        cost_class: Weight for the classification cost.
+        cost_mask: Weight for the sigmoid cross-entropy mask cost.
+        cost_dice: Weight for the Dice mask cost.
+        use_binary_classification: If True, use binary variants of the classification loss.
+        use_focal_classification: If True, use focal loss for classification cost.
+        focal_alpha: Alpha parameter for focal loss.
+        focal_gamma: Gamma parameter for focal loss.
 
     Returns:
-        class_mapping: (B, 256) tensor mapping mask target values (0-255) to the
-                       index of the query (0 to Q-1) assigned to it. A value of -1
-                       indicates no assignment.
+        class_mapping: (B, 256) tensor mapping mask values to assigned query indices.
     """
     B, Q, C = cls_logits.shape
     device = cls_logits.device
 
-    # Calculate Pairwise Costs for the Entire Batch
+    # Mask costs
     mask_ce_cost = PairwiseSigmoidCELossFunction.apply(mask_logits, mask_targets)
     mask_dice_cost = PairwiseDiceLossFunction.apply(mask_logits, mask_targets)
-    cls_cost = pairwise_label_loss(cls_logits, cls_targets)
 
-    # The final mapping from mask value to the assigned query index.
-    # Initialize with -1 (no assignment).
+    # Classification cost
+    if use_focal_classification:
+        cls_loss_type = 'binary_focal_loss' if use_binary_classification else 'focal_loss'
+    else:
+        cls_loss_type = 'binary_cross_entropy' if use_binary_classification else 'cross_entropy'
+    cls_cost = pairwise_label_loss(
+        cls_logits,
+        cls_targets,
+        loss_type = cls_loss_type,
+        focal_loss_alpha = focal_alpha if use_focal_classification else None,
+        focal_loss_gamma = focal_gamma if use_focal_classification else None
+    )
+
+    # Final mapping tensor, initialized to -1 (no assignment)
     class_mapping = torch.full((B, 256), -1, dtype=torch.long, device=device)
 
-    # The matching process is iterative per batch item because the number
-    # of ground truth objects can vary.
+    # Iterate per batch item to perform the assignment
     for b in range(B):
         gt_labels = cls_targets[b].to(device)
         num_gt_objects = len(gt_labels)
@@ -52,25 +70,25 @@ def hungarian_match_assignment(
         if num_gt_objects == 0:
             continue
 
-        # Get costs of non-background massks
+        # Select costs for non-background masks
         batch_mask_ce_cost = mask_ce_cost[b, :, 1:num_gt_objects + 1]
         batch_mask_dice_cost = mask_dice_cost[b, :, 1:num_gt_objects + 1]
 
-        # Get costs of labels.
+        # Select costs for the corresponding ground truth class labels
         batch_cls_cost = cls_cost[b, :, gt_labels]
 
-        # Combine the costs to get the final cost matrix.
+        # Combine the costs with their respective weights
         cost_matrix = (
-            batch_mask_ce_cost +
-            batch_mask_dice_cost +
-            batch_cls_cost
+            cost_mask * batch_mask_ce_cost +
+            cost_dice * batch_mask_dice_cost +
+            cost_class * batch_cls_cost
         )
 
         # Run the Hungarian Algorithm
         cost_matrix_cpu = cost_matrix.cpu().detach().numpy()
         query_indices, gt_indices = linear_sum_assignment(cost_matrix_cpu)
 
-        # Populate the Class Mapping
+        # Populate the Class Mapping to later used for loss computation.
         for query_idx, gt_obj_idx in zip(query_indices, gt_indices):
             gt_mask_value = gt_obj_idx + 1
             if gt_mask_value < 256:
