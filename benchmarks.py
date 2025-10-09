@@ -72,33 +72,19 @@ class CUDAKernelTester:
         return output, total_cuda_time_ms, peak_mem_mb
 
     def _check_correctness(self, tensor_cuda, tensor_python, label, atol, rtol):
-        """
-        Checks if two tensors or lists of tensors are close and prints detailed 
-        differences if they are not.
-        """
-        if isinstance(tensor_cuda, list):
-            # If the inputs are lists, iterate through them
-            all_close = True
-            for i, (t_cuda, t_python) in enumerate(zip(tensor_cuda, tensor_python)):
-                item_label = f"{label} - item {i}"
-                # Recursively call the function for each tensor pair
-                if not self._check_correctness(t_cuda, t_python, item_label, atol, rtol):
-                    all_close = False
-            return all_close
-        else:
-            # Original logic for a single pair of tensors
-            are_close = torch.allclose(tensor_cuda, tensor_python.to(self.device), atol=atol, rtol=rtol)
-            print(f"Number of finite elements in '{label}' (python): {torch.isfinite(tensor_python).sum()}")
-            if not are_close:
-                print(f"\n--- Correctness FAILED for '{label}' ---")
-                abs_diff = (tensor_cuda - tensor_python.to(self.device)).abs()
-                rel_diff = abs_diff / (tensor_python.to(self.device).abs() + 1e-8)
-                print(f"  Max Absolute Difference: {abs_diff.max().item():.6e}")
-                print(f"  Mean Absolute Difference: {abs_diff.mean().item():.6e}")
-                print(f"  Max Relative Difference: {rel_diff.max().item():.6e}")
-                print(f"  Mean Relative Difference: {rel_diff.mean().item():.6e}")
-                print("-" * 40)
-            return are_close
+        """Checks if two tensors are close and prints detailed differences if they are not."""
+        are_close = torch.allclose(tensor_cuda, tensor_python.to(self.device), atol=atol, rtol=rtol)
+        print(torch.isfinite(tensor_python).sum())
+        if not are_close:
+            print(f"\n--- Correctness FAILED for '{label}' ---")
+            abs_diff = (tensor_cuda - tensor_python.to(self.device)).abs()
+            rel_diff = abs_diff / (tensor_python.to(self.device).abs() + 1e-8)
+            print(f"  Max Absolute Difference: {abs_diff.max().item():.6e}")
+            print(f"  Mean Absolute Difference: {abs_diff.mean().item():.6e}")
+            print(f"  Max Relative Difference: {rel_diff.max().item():.6e}")
+            print(f"  Mean Relative Difference: {rel_diff.max().item():.6e}")
+            print("-" * 40)
+        return are_close
 
     def run(self, fwd_atol=1e-6, fwd_rtol=1e-6, bwd_atol=1e-4, bwd_rtol=1e-3, **kwargs):
         """
@@ -134,10 +120,7 @@ class CUDAKernelTester:
         output_py, fwd_time_py, fwd_mem_py = self._measure_pass(self.python_function, *ordered_args_py)
         results['pytorch']['fwd_time_ms'] = fwd_time_py
         results['pytorch']['fwd_mem_mb'] = fwd_mem_py
-        if isinstance(output_py, list):
-            loss_py = torch.stack([t.sum() for t in output_py]).sum()
-        else:
-            loss_py = output_py.sum()
+        loss_py = output_py.sum()
 
         _, bwd_time_py, bwd_mem_py = self._measure_pass(lambda: loss_py.backward())
         results['pytorch']['bwd_time_ms'] = bwd_time_py
@@ -153,12 +136,9 @@ class CUDAKernelTester:
         
         output_cu, fwd_time_cu, fwd_mem_cu = self._measure_pass(self.cuda_function, *ordered_args_cu)
         results['cuda']['fwd_time_ms'] = fwd_time_cu
-        results['cuda']['fwd_mem_mb'] = fwd_mem_cu        
-        if isinstance(output_cu, list):
-            loss_cu = torch.stack([t.sum() for t in output_cu]).sum().requires_grad_(True)
-        else:
-            loss_cu = output_cu.sum()
-
+        results['cuda']['fwd_mem_mb'] = fwd_mem_cu
+        loss_cu = output_cu.sum()
+        
         _, bwd_time_cu, bwd_mem_cu = self._measure_pass(lambda: loss_cu.backward())
         results['cuda']['bwd_time_ms'] = bwd_time_cu
         results['cuda']['bwd_mem_mb'] = max(fwd_mem_cu, bwd_mem_cu)

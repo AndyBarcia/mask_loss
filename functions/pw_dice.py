@@ -31,12 +31,12 @@ class PairwiseDiceLossFunction(Function):
 
 def pairwise_dice_loss_py(logits, targets, smooth=1.0):
     """
-    Computes the pairwise Dice loss and returns a list of tensors.
+    Computes the pairwise Dice loss.
 
     This function calculates the Dice loss for each predicted class against every
-    present ground truth class for each item in the batch. It upsamples the
-    logits, creates one-hot representations for present target classes, and then
-    computes the Dice loss.
+    possible ground truth class. It upsamples the logits to the resolution of the
+    targets, creates a one-hot representation for each potential target class,
+    and then computes the Dice loss.
 
     Args:
         logits (torch.Tensor): A tensor of shape (B, C, h, w) representing the
@@ -47,9 +47,10 @@ def pairwise_dice_loss_py(logits, targets, smooth=1.0):
                         for numerical stability.
 
     Returns:
-        list[torch.Tensor]: A list of tensors where each element corresponds to a
-                            batch item and contains a tensor of shape
-                            (C, num_present_gt_classes) with the pairwise Dice losses.
+        torch.Tensor: A tensor of shape (B, C, GT) where GT is the maximum value
+                      in the targets tensor + 1. It contains the pairwise Dice
+                      loss for each class against each possible target. For target
+                      masks with 0 area, a value of infinity is returned.
     """
     B, C, h, w = logits.shape
     B_t, H_t, W_t = targets.shape
@@ -66,8 +67,8 @@ def pairwise_dice_loss_py(logits, targets, smooth=1.0):
     gt_max = targets_long.max().item()
     GT = gt_max + 1
 
-    # A list to hold tensors for each item in the batch.
-    batch_losses = [[] for _ in range(B)]
+    # Initialize pairwise_loss tensor with infinity
+    pairwise_loss = torch.full((B, C, GT), torch.inf, device=device, dtype=logits.dtype)
 
     # Iterate over each possible ground truth class
     for gt_class in range(GT):
@@ -77,27 +78,20 @@ def pairwise_dice_loss_py(logits, targets, smooth=1.0):
         # Check which batch elements contain this GT class
         has_class = y.sum(dim=(1, 2, 3)) > 0  # Shape: (B,)
 
-        if not has_class.any():
-            continue
-
         # Calculate intersection, probability sum, and target sum
         intersection = (probs * y).sum(dim=(2, 3))
         p_sum = probs.sum(dim=(2, 3))
-        t_sum = y.sum(dim=(2, 3))
+        t_sum = y.sum(dim=(2, 3)).squeeze(1) # Squeeze to match p_sum and intersection shape
 
         # Calculate Dice score and Dice loss
         dice_score = (2.0 * intersection + smooth) / (p_sum + t_sum + smooth)
         dice_loss = 1.0 - dice_score
 
-        # Append the loss for batch items that have the current gt_class
-        for b in range(B):
-            if has_class[b]:
-                batch_losses[b].append(dice_loss[b])
+        # Update loss only where the class exists in the batch element
+        pairwise_loss[:, :, gt_class] = torch.where(
+            has_class.unsqueeze(1).expand(-1, C),
+            dice_loss,
+            torch.tensor(torch.inf, device=device, dtype=dice_loss.dtype)
+        )
 
-    # Stack the losses for each batch item to get tensors of shape (C, num_gt)
-    final_tensors = [
-        torch.stack(tensors, dim=1) if tensors else torch.empty((C, 0), device=device, dtype=logits.dtype)
-        for tensors in batch_losses
-    ]
-
-    return final_tensors
+    return pairwise_loss

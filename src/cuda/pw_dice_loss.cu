@@ -139,7 +139,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_pairwise_dice_kernel
 }
 
 
-std::vector<torch::Tensor> pairwise_dice_loss_forward(
+torch::Tensor pairwise_dice_loss_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
     const float smooth
@@ -191,7 +191,7 @@ std::vector<torch::Tensor> pairwise_dice_loss_forward(
     // Calculate the total number of pixels for each ground truth label (mask area)
     // This is used to mask 0-area masks with a loss of infinity.
     auto total_counts = counts.sum({2, 3}).to(torch::kInt32).contiguous();
-    auto out_accum = torch::zeros({B, C, GT}, logits.options());
+    auto out = torch::zeros({B, C, GT}, logits.options());
 
     // Kernel 2: Reduce and Compute Pairwise Dice Loss
     {
@@ -206,7 +206,7 @@ std::vector<torch::Tensor> pairwise_dice_loss_forward(
                 <<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
                     logits.data_ptr<float>(),
                     counts.data_ptr<int32_t>(),
-                    out_accum.data_ptr<float>(),
+                    out.data_ptr<float>(),
                     total_counts.data_ptr<int32_t>(),
                     B, GT, smooth
                 );
@@ -225,19 +225,5 @@ std::vector<torch::Tensor> pairwise_dice_loss_forward(
     err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after reduce kernel: ", cudaGetErrorString(err));
 
-    auto out_float = out_accum.to(logits.options().dtype(torch::kFloat32));
-
-    std::vector<torch::Tensor> final_tensors;
-    final_tensors.reserve(B);
-
-    for (int b = 0; b < B; ++b) {
-        torch::Tensor present_classes = torch::where(total_counts[b] > 0)[0];
-        if (present_classes.numel() > 0) {
-            final_tensors.push_back(out_float[b].index_select(1, present_classes));
-        } else {
-            final_tensors.push_back(torch::empty({C, 0}, out_float.options()));
-        }
-    }
-
-    return final_tensors;
+    return out;
 }

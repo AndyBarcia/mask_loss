@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from typing import List, Optional, Union
 
+
 def _as_list_of_1d_tensors(targets):
     """
     Normalize targets to a list of 1D LongTensors.
