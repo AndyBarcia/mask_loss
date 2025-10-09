@@ -3,3 +3,4 @@ from .mc_sigmoid_ce import MultiClassSigmoidCELossFunction, multiclass_sigmoid_c
 from .dice import DiceLossFunction, dice_loss_py
 from .mc_dice import MultiClassDiceLossFunction, multiclass_dice_loss_py
 from .pw_sigmoid_ce import PairwiseSigmoidCELossFunction, pairwise_sigmoid_cross_entropy_loss_py
+from .pw_dice import PairwiseDiceLossFunction, pairwise_dice_loss_py

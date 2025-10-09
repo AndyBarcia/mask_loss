@@ -21,7 +21,6 @@ class PairwiseSigmoidCELossFunction(Function):
         
         logits = logits.contiguous().float()
         targets = targets.contiguous()
-        ctx.save_for_backward(logits, targets)
         output = mask_loss.forward_pw_sigmoid_ce_loss(logits, targets)
         return output
 
