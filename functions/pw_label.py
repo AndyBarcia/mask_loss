@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 from typing import List, Union
 
-from .mc_label import _as_list_of_1d_tensors
 
 def pairwise_label_loss(
     logits: torch.Tensor,
@@ -25,89 +24,116 @@ def pairwise_label_loss(
         targets (Union[List[torch.Tensor], torch.Tensor]): A list of 1D tensors,
                                one for each item in the batch. Each tensor
                                contains the ground truth class indices for that item.
-        loss_type (str): The type of loss to compute. Must be either
-                         'binary_cross_entropy' or 'focal_loss'.
+        loss_type (str): The type of loss to compute. Must be either 'cross_entropy', 
+                               'binary_cross_entropy', 'focal_loss', or 'binary_focal_loss'
         focal_loss_gamma (float): The gamma parameter for focal loss.
         focal_loss_alpha (float): The alpha parameter for focal loss.
 
     Returns:
-        torch.Tensor: A tensor of shape (B, Q, C) containing the pairwise
-                      loss. For a given batch item `b` and ground truth class `gt`,
-                      if `gt` is not present in `targets[b]`, the loss values
-                      at `pairwise_loss[b, :, gt]` will be infinity.
+        torch.Tensor: A tensor of shape (B, Q, max_GT) containing the pairwise
+                      loss between each query and ground truth. As batches contain
+                      different number of elements, the output will be masked
+                      with infinity values.
     """
-    if logits.dim() != 3:
-        raise ValueError("Logits must have shape (B, Q, C)")
+    if loss_type not in {
+        'cross_entropy', 'binary_cross_entropy', 'focal_loss', 'binary_focal_loss'
+    }:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+
     B, Q, C = logits.shape
-    GT = C  # Assume the number of ground truth classes is the same as logit classes
-
-    if loss_type not in ['binary_cross_entropy', 'focal_loss']:
-        raise ValueError(f"Unsupported loss_type: '{loss_type}'. Must be 'binary_cross_entropy' or 'focal_loss'.")
-
-    target_list = _as_list_of_1d_tensors(targets)
-    if len(target_list) != B:
-        raise ValueError(f"Number of target tensors ({len(target_list)}) must match batch size ({B})")
-
     device = logits.device
+    dtype = logits.dtype
 
-    # `built_target_classes` stores the GT class index assigned to each query.
-    # A value of -1 serves as an ignore index for unassigned queries.
-    built_target_classes = torch.full((B, Q), -1, dtype=torch.long, device=device)
+    # Normalize targets into a list of 1D LongTensors (one per batch element).
+    if isinstance(targets, torch.Tensor):
+        if targets.dim() == 2:
+            # treat negative indices as padding
+            targets_list = []
+            for b in range(B):
+                row = targets[b]
+                if row.numel() == 0:
+                    targets_list.append(torch.empty(0, dtype=torch.long, device=device))
+                else:
+                    # allow -1 or any negative to be padding marker
+                    valid = row >= 0
+                    targets_list.append(row[valid].to(torch.long).to(device))
+        elif targets.dim() == 1:
+            # only allowed if batch size is 1
+            if B != 1:
+                raise ValueError("When passing 1D targets tensor, logits batch size must be 1.")
+            targets_list = [targets.to(torch.long).to(device)]
+        else:
+            raise ValueError("Unsupported targets tensor shape.")
+    else:
+        # assume list-like of tensors
+        targets_list = []
+        for t in targets:
+            t = t.to(device)
+            if t.numel() == 0:
+                targets_list.append(torch.empty(0, dtype=torch.long, device=device))
+            else:
+                targets_list.append(t.to(torch.long).to(device))
 
-    # `has_gt_in_item` tracks which GT classes were present in the original targets
-    # for each batch item, before assignment to queries.
-    has_gt_in_item = torch.zeros((B, GT), dtype=torch.bool, device=device)
+    # find max number of GTs across batch
+    max_G = max((t.numel() for t in targets_list), default=0)
 
-    for i in range(B):
-        t_i = target_list[i].to(device).long()
-        if t_i.numel() == 0:
-            continue
+    # output initialized with +inf for masked entries
+    out = torch.full((B, Q, max_G), float('inf'), device=device, dtype=dtype)
 
-        # Validate that targets are valid class indices
-        if torch.any(t_i < 0) or torch.any(t_i >= GT):
-            raise ValueError(f"Target class indices must be in the range [0, {GT-1}]")
+    # Loop over batch items
+    for b in range(B):
+        gt = targets_list[b]  # 1D LongTensor of length G_b
+        G_b = gt.numel()
+        if G_b == 0:
+            continue  # leave as +inf
+        logits_b = logits[b]  # (Q, C)
 
-        # Mark which GT classes are present in this batch item
-        has_gt_in_item[i, t_i] = True
+        if loss_type == 'cross_entropy':
+            # multiclass CE per (Q, G_b): -log_softmax(logits)[:, gt_indices]
+            log_probs = F.log_softmax(logits_b, dim=-1)  # (Q, C)
+            # indexing columns by gt produces (Q, G_b)
+            loss_qg = -log_probs[:, gt]  # (Q, G_b)
 
-        # Assign the first N ground truths to the first N queries
-        num_to_assign = min(t_i.numel(), Q)
-        built_target_classes[i, :num_to_assign] = t_i[:num_to_assign]
+        elif loss_type == 'focal_loss':
+            # multiclass focal: FL = -alpha * (1 - p_t)^gamma * log(p_t)
+            probs = F.softmax(logits_b, dim=-1)  # (Q, C)
+            log_probs = torch.log(probs + 1e-12)
+            p_t = probs[:, gt]  # (Q, G_b)
+            log_p_t = log_probs[:, gt]  # (Q, G_b)
+            modulator = (1.0 - p_t).pow(focal_loss_gamma)
+            loss_qg = -focal_loss_alpha * modulator * log_p_t  # (Q, G_b)
 
-    # Initialize the final loss tensor to infinity.
-    pairwise_loss = torch.full((B, Q, GT), torch.inf, device=device, dtype=logits.dtype)
+        elif loss_type == 'binary_cross_entropy':
+            # treat each GT as one-hot vector across C, compute sum over classes of
+            # per-class binary cross entropy -> same pattern as batch_sigmoid_ce_loss
+            # pos = BCE logits vs 1  ; neg = BCE logits vs 0
+            pos = F.binary_cross_entropy_with_logits(logits_b, torch.ones_like(logits_b), reduction='none')  # (Q,C)
+            neg = F.binary_cross_entropy_with_logits(logits_b, torch.zeros_like(logits_b), reduction='none')  # (Q,C)
+            # targets one-hot: use einsum to sum pos over classes where target=1 and neg where target=0
+            # gt_one_hot shape (G_b, C)
+            gt_one_hot = F.one_hot(gt, num_classes=C).to(dtype=dtype)  # (G_b, C)
+            # einsum: "qc,gc->qg"
+            loss_qg = torch.einsum("qc,gc->qg", pos, gt_one_hot) + torch.einsum("qc,gc->qg", neg, (1.0 - gt_one_hot))
 
-    # Iterate over each possible ground truth class to compute the pairwise loss
-    for gt_class in range(GT):
-        # Create a binary target `y` of shape (B, Q).
-        # y[b, q] is 1.0 if query `q` in batch `b` was assigned `gt_class`.
-        y = (built_target_classes == gt_class).to(dtype=logits.dtype)
+        elif loss_type == 'binary_focal_loss':
+            # per-class sigmoid focal loss with alpha for positives and (1-alpha) for negatives:
+            # pos_base = BCE_with_logits(inputs,1) = -log(sigmoid(x)); neg_base = BCE(...,0) = -log(1-sigmoid(x))
+            p = torch.sigmoid(logits_b)  # (Q,C)
+            pos_base = F.binary_cross_entropy_with_logits(logits_b, torch.ones_like(logits_b), reduction='none')  # (Q,C)
+            neg_base = F.binary_cross_entropy_with_logits(logits_b, torch.zeros_like(logits_b), reduction='none')  # (Q,C)
+            pos_mod = (1.0 - p).pow(focal_loss_gamma)  # (Q,C)
+            neg_mod = (p).pow(focal_loss_gamma)        # (Q,C)
+            pos = focal_loss_alpha * pos_base * pos_mod
+            neg = (1.0 - focal_loss_alpha) * neg_base * neg_mod
 
-        # Select the logits corresponding to the current ground truth class.
-        # Shape: (B, Q)
-        logits_for_gt = logits[..., gt_class]
+            gt_one_hot = F.one_hot(gt, num_classes=C).to(dtype=dtype)  # (G_b, C)
+            loss_qg = torch.einsum("qc,gc->qg", pos, gt_one_hot) + torch.einsum("qc,gc->qg", neg, (1.0 - gt_one_hot))
 
-        # Compute the element-wise loss based on the specified loss_type.
-        if loss_type == 'binary_cross_entropy':
-            loss_elem = F.binary_cross_entropy_with_logits(logits_for_gt, y, reduction='none')
-        else:  # focal_loss
-            p = logits_for_gt.sigmoid()
-            ce_elem = F.binary_cross_entropy_with_logits(logits_for_gt, y, reduction='none')
-            p_t = p * y + (1 - p) * (1 - y)
-            alpha_t = focal_loss_alpha * y + (1 - focal_loss_alpha) * (1 - y)
-            loss_elem = alpha_t * ((1 - p_t).pow(focal_loss_gamma)) * ce_elem
+        else:
+            raise RuntimeError("Unhandled loss_type; should not reach here.")
 
-        # Identify which batch items originally contained the current gt_class.
-        # Shape: (B,)
-        class_is_present = has_gt_in_item[:, gt_class]
+        # place into output; transpose to (Q, G_b) already
+        # ensure dtype matches out dtype
+        out[b, :, :G_b] = loss_qg.to(dtype=dtype, device=device)
 
-        # Use `where` to fill the loss tensor. If a gt_class was not in the
-        # original targets for a batch item, its loss for all queries remains infinity.
-        # `unsqueeze` broadcasts the (B,) mask to (B, 1) to align with loss_elem's (B, Q) shape.
-        pairwise_loss[..., gt_class] = torch.where(
-            class_is_present.unsqueeze(1),
-            loss_elem,
-            torch.tensor(torch.inf, device=device, dtype=loss_elem.dtype)
-        )
-
-    return pairwise_loss
+    return out
