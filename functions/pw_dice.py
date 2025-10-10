@@ -14,7 +14,7 @@ except ImportError:
 
 class PairwiseDiceLossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, smooth=1.0):
+    def forward(ctx, logits, targets, smooth=1.0, background_index=None):
         B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
@@ -22,14 +22,23 @@ class PairwiseDiceLossFunction(Function):
         logits = logits.contiguous().float()
         targets = targets.contiguous()
 
-        output = mask_loss.forward_pw_dice_loss(logits, targets, smooth)
+        output = mask_loss.forward_pw_dice_loss(
+            logits, 
+            targets, 
+            smooth,
+            background_index if background_index is not None else -1
+        )
+        ctx.background_index = background_index
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return None, None, None
+        if ctx.background_index is not None:
+            return None, None, None
+        else:
+            return None, None
 
-def pairwise_dice_loss_py(logits, targets, smooth=1.0):
+def pairwise_dice_loss_py(logits, targets, smooth=1.0, background_index=None):
     """
     Computes the pairwise Dice loss.
 
@@ -40,16 +49,24 @@ def pairwise_dice_loss_py(logits, targets, smooth=1.0):
 
     Args:
         logits (torch.Tensor): A tensor of shape (B, C, h, w) representing the
-                             predicted logits for each class.
+                        predicted logits for each class. B is the batch size,
+                        C is the number of classes, and h, w are the spatial
+                        dimensions of the logits.
         targets (torch.Tensor): A tensor of shape (B, H_t, W_t) with integer
-                                labels for the ground truth.
+                        labels for the ground truth. H_t and W_t are the
+                        spatial dimensions of the targets.
         smooth (float): A small value added to the numerator and denominator
                         for numerical stability.
+        background_index (Optional[int]): The index that corresponds to the background
+                        to be ignored. If not provided, all classses are
+                        computed normally. If specified, the output tensor
+                        has the column corresponding to the background removed.
 
     Returns:
-        torch.Tensor: A tensor of shape (B, C, GT) where GT is the maximum value
-                      in the targets tensor + 1. It contains the pairwise Dice
-                      loss for each class against each possible target. For target
+        torch.Tensor: A tensor of shape (B, C, max_GT) where max_GT is the maximum value
+                      in the targets tensor + 1 if no background index is provided, or
+                      th maximum value in the targets tensor otherwise. It contains the 
+                      pairwise loss for each class against each possible target. For target 
                       masks with 0 area, a value of infinity is returned.
     """
     B, C, h, w = logits.shape
@@ -63,15 +80,24 @@ def pairwise_dice_loss_py(logits, targets, smooth=1.0):
     device = logits.device
     targets_long = targets.long().to(device)
 
-    # Determine the number of ground truth classes
+    # Determine the full range of GT classes present in the targets
     gt_max = targets_long.max().item()
-    GT = gt_max + 1
+    GT_all = gt_max + 1
+
+    # Build list of ground-truth classes to evaluate, optionally excluding background
+    if background_index is None:
+        gt_classes = list(range(GT_all))
+    else:
+        # If background_index is outside the observed range, it has no effect
+        gt_classes = [i for i in range(GT_all) if i != background_index]
+
+    GT = len(gt_classes)
 
     # Initialize pairwise_loss tensor with infinity
     pairwise_loss = torch.full((B, C, GT), torch.inf, device=device, dtype=logits.dtype)
 
-    # Iterate over each possible ground truth class
-    for gt_class in range(GT):
+    # Iterate over each ground truth class we will evaluate
+    for out_idx, gt_class in enumerate(gt_classes):
         # Create a binary target mask for the current ground truth class
         y = (targets_long == gt_class).unsqueeze(1).to(dtype=logits.dtype)
 
@@ -88,7 +114,7 @@ def pairwise_dice_loss_py(logits, targets, smooth=1.0):
         dice_loss = 1.0 - dice_score
 
         # Update loss only where the class exists in the batch element
-        pairwise_loss[:, :, gt_class] = torch.where(
+        pairwise_loss[:, :, out_idx] = torch.where(
             has_class.unsqueeze(1).expand(-1, C),
             dice_loss,
             torch.tensor(torch.inf, device=device, dtype=dice_loss.dtype)

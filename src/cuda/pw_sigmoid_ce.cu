@@ -15,9 +15,9 @@ const int THREADS_PER_BLOCK = 16*16;
 template <int H, int W, int H_t, int W_t>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK) count_labels_per_block_kernel(
     const int64_t* __restrict__ targets,
-    int32_t* __restrict__ counts, // out: shape (B, GT, H, W)
+    int32_t* __restrict__ counts, // out: shape (B, GT_total, H, W)
     const int B,
-    const int GT
+    const int GT_total
 ) {
     extern __shared__ int32_t sh_mem_counts[];
     int* sh_counts = sh_mem_counts;
@@ -31,7 +31,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) count_labels_per_block_kern
     const int s2 = s * s;
 
     // Initialize shared memory counts for this block
-    for (int idx = tid; idx < GT; idx += THREADS_PER_BLOCK) {
+    for (int idx = tid; idx < GT_total; idx += THREADS_PER_BLOCK) {
         sh_counts[idx] = 0;
     }
     __syncthreads();
@@ -48,7 +48,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) count_labels_per_block_kern
         int xx = base_x + dx;
         if (yy < H_t && xx < W_t) {
             int64_t lab = targets[(b * H_t + yy) * W_t + xx];
-            if (lab >= 0 && lab < GT) {
+            if (lab >= 0 && lab < GT_total) {
                 atomicAdd(&sh_counts[(int)lab], 1);
             }
         }
@@ -56,31 +56,36 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) count_labels_per_block_kern
     __syncthreads();
 
     // Write the counts from shared memory to the global counts tensor
-    for (int gt = tid; gt < GT; gt += THREADS_PER_BLOCK) {
-        counts[((b * GT + gt) * H + i) * W + j] = sh_counts[gt];
+    for (int gt = tid; gt < GT_total; gt += THREADS_PER_BLOCK) {
+        counts[((b * GT_total + gt) * H + i) * W + j] = sh_counts[gt];
     }
 }
 
 template <int C, int H, int W, int H_t>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_loss_kernel(
     const float* __restrict__ logits,
-    const int32_t* __restrict__ counts,
-    double* __restrict__ out, // (B, C, GT)
-    const int32_t* __restrict__ total_counts,  // (B,GT)
-    const int B,
-    const int GT
+    const int32_t* __restrict__ counts,         // shape (B, GT_total, H, W)
+    double* __restrict__ out,                   // shape (B, C, GT_out)
+    const int32_t* __restrict__ total_counts,   // shape (B, GT_total)
+    const int32_t* __restrict__ gt_map,         // length GT_out: maps output index -> actual GT label
+    const int GT_total,
+    const int GT_out,
+    const int B
 ) {
     extern __shared__ double s_block_loss[];
 
-    const int gt = blockIdx.x; // Ground Truth class index
-    const int ci = blockIdx.y; // Logit class index
-    const int b = blockIdx.z;  // Batch index
+    const int out_gt_idx = blockIdx.x; // compacted output index (0..GT_out-1)
+    const int ci = blockIdx.y;         // Logit class index
+    const int b = blockIdx.z;          // Batch index
+
+    // Map to the actual ground-truth label index
+    const int gt_actual = gt_map[out_gt_idx];
 
     // If the total count for this ground truth label is 0, it's a zero-area mask.
     // Set the loss to infinity and return. Only one thread writes the output
-    if (total_counts[b * GT + gt] == 0) {
+    if (total_counts[b * GT_total + gt_actual] == 0) {
         if (threadIdx.x == 0) {
-            out[(b * C + ci) * GT + gt] = INFINITY;
+            out[(b * C + ci) * GT_out + out_gt_idx] = INFINITY;
         }
         return;
     }
@@ -97,12 +102,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_loss_kernel(
         int j = idx % W;
 
         float L = logits[((b * C + ci) * H + i) * W + j];
-        int32_t n = counts[((b * GT + gt) * H + i) * W + j];
+        int32_t n = counts[((b * GT_total + gt_actual) * H + i) * W + j];
 
         float maxL = L > 0.0f ? L : 0.0f;
         float absL = fabsf(L);
         float logexp = log1pf(expf(-absL));
 
+        // This follows: sum_{pixels in HR patch} [ max(L,0) - L*y + log(1+exp(-|L|)) ]
+        // where y is the per-pixel binary GT. Here n is the count of y==1 in the HR patch,
+        // and N2 is number of HR pixels in the patch.
         thread_loss_sum += static_cast<double>(N2 * maxL - L * n + N2 * logexp);
     }
 
@@ -120,13 +128,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_loss_kernel(
 
     // The first thread writes the final reduced result for the block, no atomic needed
     if (tid == 0) {
-        out[(b * C + ci) * GT + gt] = s_block_loss[0];
+        out[(b * C + ci) * GT_out + out_gt_idx] = s_block_loss[0];
     }
 }
 
 torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,
-    const torch::Tensor& targets
+    const torch::Tensor& targets,
+    const int64_t background_index = -1
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -138,17 +147,18 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
 
-    // Automatically compute GT from the max value in targets
+    // Automatically compute GT_total from the max value in targets
     torch::Tensor targets_max_tensor = targets.max();
-    const int64_t GT = targets_max_tensor.item<int64_t>() + 1;
+    const int64_t GT_total_64 = targets_max_tensor.item<int64_t>() + 1;
+    const int GT_total = static_cast<int>(GT_total_64);
 
-    // Intermediate tensor to store counts
-    auto counts = torch::zeros({B, GT, H, W}, logits.options().dtype(torch::kInt32));
+    // Intermediate tensor to store counts for every possible GT label (including background)
+    auto counts = torch::zeros({B, GT_total, H, W}, logits.options().dtype(torch::kInt32));
 
-    // Launch count kernel
+    // Launch count kernel (counts for ALL GT labels)
     {
         dim3 grid(W, H, B);
-        const size_t shared_mem_size = GT * sizeof(int32_t);
+        const size_t shared_mem_size = GT_total * sizeof(int32_t);
 
         auto static_launcher = [&](auto H_val, auto W_val, auto H_t_val, auto W_t_val) {
             count_labels_per_block_kernel<
@@ -157,7 +167,7 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
                 <<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
                     targets.data_ptr<int64_t>(),
                     counts.data_ptr<int32_t>(),
-                    B, GT
+                    B, GT_total
                 );
         };
         const auto supported_dims = std::make_tuple(
@@ -174,12 +184,30 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
 
     // Calculate the total number of pixels for each ground truth label (mask area)
     // This is used to mask 0-area masks with a loss of infinity.
-    auto total_counts = counts.sum({2, 3}).to(torch::kInt32).contiguous();
+    auto total_counts = counts.sum({2, 3}).to(torch::kInt32).contiguous(); // shape (B, GT_total)
 
-    // Launch reduction kernel
-    auto out_accum = torch::zeros({B, C, GT}, logits.options().dtype(torch::kFloat64));
+    // Build gt_map: list of actual GT labels to evaluate (exclude background_index if requested and valid)
+    std::vector<int32_t> host_gt_map;
+    host_gt_map.reserve(GT_total);
+    for (int i = 0; i < GT_total; ++i) {
+        if (background_index >= 0 && i == static_cast<int>(background_index)) {
+            continue;
+        }
+        host_gt_map.push_back(i);
+    }
+    const int GT_out = static_cast<int>(host_gt_map.size());
+    // If no classes left to evaluate (edge case), return an empty tensor of shape (B,C,0)
+    if (GT_out == 0) {
+        return torch::zeros({B, C, 0}, logits.options().dtype(torch::kFloat32));
+    }
+
+    // Copy gt_map to device
+    auto gt_map = torch::from_blob(host_gt_map.data(), {GT_out}, torch::kInt32).clone().to(logits.device());
+
+    // Launch reduction kernel only for the compacted GT_out entries (mapping via gt_map)
+    auto out_accum = torch::zeros({B, C, GT_out}, logits.options().dtype(torch::kFloat64));
     {
-        dim3 grid(GT, C, B);
+        dim3 grid(GT_out, C, B);
         const size_t shared_mem_size = THREADS_PER_BLOCK * sizeof(double);
 
         auto static_launcher = [&](auto C_val, auto H_val, auto W_val, auto H_t_val) {
@@ -191,7 +219,10 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
                     counts.data_ptr<int32_t>(),
                     out_accum.data_ptr<double>(),
                     total_counts.data_ptr<int32_t>(),
-                    B, GT
+                    gt_map.data_ptr<int32_t>(),
+                    GT_total,
+                    GT_out,
+                    B
                 );
         };
 
@@ -209,5 +240,8 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after reduce kernel: ", cudaGetErrorString(err));
 
-    return out_accum.to(logits.options().dtype(torch::kFloat32)) / (H_t * W_t);
+    // Normalize by total high-res pixels per block (H_t * W_t)
+    auto out_final = out_accum.to(logits.options().dtype(torch::kFloat32)) / static_cast<float>(H_t * W_t);
+
+    return out_final;
 }

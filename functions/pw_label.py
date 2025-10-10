@@ -23,9 +23,13 @@ def pairwise_label_loss(
                                number of classes.
         targets (Union[List[torch.Tensor], torch.Tensor]): A list of 1D tensors,
                                one for each item in the batch. Each tensor
-                               contains the ground truth class indices for that item.
-        loss_type (str): The type of loss to compute. Must be either 'cross_entropy', 
-                               'binary_cross_entropy', 'focal_loss', or 'binary_focal_loss'
+                               contains the ground truth class indices for that 
+                               item, in the range [0,C-1].
+        loss_type (str): The type of loss to compute. Must be either 
+                                - 'cross_entropy', 
+                                - 'binary_cross_entropy', 
+                                - 'focal_loss', or 
+                                - 'binary_focal_loss'
         focal_loss_gamma (float): The gamma parameter for focal loss.
         focal_loss_alpha (float): The alpha parameter for focal loss.
 

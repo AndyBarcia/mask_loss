@@ -15,7 +15,8 @@ torch::Tensor sigmoid_cross_entropy_backward(
 
 torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,
-    const torch::Tensor& targets
+    const torch::Tensor& targets,
+    const int64_t background_index = -1
 );
 
 torch::Tensor mc_sigmoid_cross_entropy_forward(
@@ -54,7 +55,8 @@ torch::Tensor dice_loss_backward(
 torch::Tensor pairwise_dice_loss_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
-    const float smooth
+    const float smooth,
+    const int64_t background_index = -1
 );
 
 std::vector<torch::Tensor> mc_dice_loss_forward(

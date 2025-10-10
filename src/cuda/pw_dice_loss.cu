@@ -15,9 +15,9 @@ const int THREADS_PER_BLOCK = 16*16;
 template <int H, int W, int H_t, int W_t>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK) count_labels_per_block_kernel(
     const int64_t* __restrict__ targets,
-    int32_t* __restrict__ counts, // out: shape (B, GT, H, W)
+    int32_t* __restrict__ counts, // out: shape (B, GT_total, H, W)
     const int B,
-    const int GT
+    const int GT_total
 ) {
     extern __shared__ int32_t sh_mem_counts[];
     int* sh_counts = sh_mem_counts;
@@ -31,7 +31,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) count_labels_per_block_kern
     const int s2 = s * s;
 
     // Initialize shared memory counts for this block
-    for (int idx = tid; idx < GT; idx += THREADS_PER_BLOCK) {
+    for (int idx = tid; idx < GT_total; idx += THREADS_PER_BLOCK) {
         sh_counts[idx] = 0;
     }
     __syncthreads();
@@ -40,7 +40,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) count_labels_per_block_kern
     int base_y = i * s;
     int base_x = j * s;
 
-    // Parallel count of pixels per GT label within the block
+    // Parallel count of pixels per GT_total label within the block
     for (int idx = tid; idx < s2; idx += THREADS_PER_BLOCK) {
         int dy = idx / s;
         int dx = idx % s;
@@ -48,7 +48,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) count_labels_per_block_kern
         int xx = base_x + dx;
         if (yy < H_t && xx < W_t) {
             int64_t lab = targets[(b * H_t + yy) * W_t + xx];
-            if (lab >= 0 && lab < GT) {
+            if (lab >= 0 && lab < GT_total) {
                 atomicAdd(&sh_counts[(int)lab], 1);
             }
         }
@@ -56,19 +56,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) count_labels_per_block_kern
     __syncthreads();
 
     // Write the counts from shared memory to the global counts tensor
-    for (int gt = tid; gt < GT; gt += THREADS_PER_BLOCK) {
-        counts[((b * GT + gt) * H + i) * W + j] = sh_counts[gt];
+    for (int gt = tid; gt < GT_total; gt += THREADS_PER_BLOCK) {
+        counts[((b * GT_total + gt) * H + i) * W + j] = sh_counts[gt];
     }
 }
 
 template <int C, int H, int W, int H_t>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_pairwise_dice_kernel(
     const float* __restrict__ logits,
-    const int32_t* __restrict__ counts,
-    float* __restrict__ out, // out: shape (B, C, GT)
-    const int32_t* __restrict__ total_counts, // in: shape (B, GT)
+    const int32_t* __restrict__ counts,             // shape (B, GT_total, H, W)
+    float* __restrict__ out,                        // shapeshape (B, C, GT_total)
+    const int32_t* __restrict__ total_counts,       // shape (B, GT_total)
+    const int32_t* __restrict__ gt_map,             // length GT_out: maps output index -> actual GT label
+    const int GT_total,
+    const int GT_out,
     const int B,
-    const int GT,
     const float smooth
 ) {
     // Shared memory for performing the reduction of the three Dice components
@@ -77,15 +79,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_pairwise_dice_kernel
     float* s_p_sum = s_intersection + THREADS_PER_BLOCK;
     float* s_t_sum = s_p_sum + THREADS_PER_BLOCK;
 
-    const int gt = blockIdx.x; // Ground Truth class index
+    const int out_gt_idx = blockIdx.x; // Ground Truth class index
     const int ci = blockIdx.y; // Logit class index
     const int b = blockIdx.z;  // Batch index
 
+    // Map to the actual ground-truth label index
+    const int gt_actual = gt_map[out_gt_idx];
+
     // If the total count for this ground truth label is 0, it's a zero-area mask.
     // Set the loss to infinity and return, matching the Python implementation.
-    if (total_counts[b * GT + gt] == 0) {
+    if (total_counts[b * GT_total + gt_actual] == 0) {
         if (threadIdx.x == 0) {
-            out[(b * C + ci) * GT + gt] = INFINITY;
+            out[(b * C + ci) * GT_total + out_gt_idx] = INFINITY;
         }
         return;
     }
@@ -105,7 +110,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_pairwise_dice_kernel
 
         float L = logits[((b * C + ci) * H + i) * W + j];
         float p = 1.0f / (1.0f + expf(-L));
-        float n = static_cast<float>(counts[((b * GT + gt) * H + i) * W + j]);
+        float n = static_cast<float>(counts[((b * GT_total + gt_actual) * H + i) * W + j]);
 
         thread_intersection_sum += p * n;
         thread_p_sum += N2 * p;
@@ -134,7 +139,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_pairwise_dice_kernel
         float total_p = s_p_sum[0];
         float total_t = s_t_sum[0];
         float dice = (2.0f * total_intersection + smooth) / (total_p + total_t + smooth);
-        out[(b * C + ci) * GT + gt] = 1.0f - dice;
+        out[(b * C + ci) * GT_total + out_gt_idx] = 1.0f - dice;
     }
 }
 
@@ -142,7 +147,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_pairwise_dice_kernel
 torch::Tensor pairwise_dice_loss_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
-    const float smooth
+    const float smooth,
+    const int64_t background_index = -1
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -154,17 +160,18 @@ torch::Tensor pairwise_dice_loss_forward(
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
 
-    // Automatically compute GT from the max value in targets
+    // Automatically compute GT_total from the max value in targets
     torch::Tensor targets_max_tensor = targets.max();
-    const int64_t GT = targets_max_tensor.item<int64_t>() + 1;
+    const int64_t GT_total_64 = targets_max_tensor.item<int64_t>() + 1;
+    const int GT_total = static_cast<int>(GT_total_64);
 
-    // Intermediate tensor to store counts of GT labels per low-res block
-    auto counts = torch::zeros({B, GT, H, W}, logits.options().dtype(torch::kInt32));
+    // Intermediate tensor to store counts of GT_total labels per low-res block
+    auto counts = torch::zeros({B, GT_total, H, W}, logits.options().dtype(torch::kInt32));
 
     // Kernel 1: Count Labels
     {
         dim3 grid(W, H, B);
-        const size_t shared_mem_size = GT * sizeof(int32_t);
+        const size_t shared_mem_size = GT_total * sizeof(int32_t);
 
         auto static_launcher = [&](auto H_val, auto W_val, auto H_t_val, auto W_t_val) {
             count_labels_per_block_kernel<
@@ -173,7 +180,7 @@ torch::Tensor pairwise_dice_loss_forward(
                 <<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
                     targets.data_ptr<int64_t>(),
                     counts.data_ptr<int32_t>(),
-                    B, GT
+                    B, GT_total
                 );
         };
         const auto supported_dims = std::make_tuple(
@@ -191,11 +198,29 @@ torch::Tensor pairwise_dice_loss_forward(
     // Calculate the total number of pixels for each ground truth label (mask area)
     // This is used to mask 0-area masks with a loss of infinity.
     auto total_counts = counts.sum({2, 3}).to(torch::kInt32).contiguous();
-    auto out = torch::zeros({B, C, GT}, logits.options());
+
+    // Build gt_map: list of actual GT labels to evaluate (exclude background_index if requested and valid)
+    std::vector<int32_t> host_gt_map;
+    host_gt_map.reserve(GT_total);
+    for (int i = 0; i < GT_total; ++i) {
+        if (background_index >= 0 && i == static_cast<int>(background_index)) {
+            continue;
+        }
+        host_gt_map.push_back(i);
+    }
+    const int GT_out = static_cast<int>(host_gt_map.size());
+    // If no classes left to evaluate (edge case), return an empty tensor of shape (B,C,0)
+    if (GT_out == 0) {
+        return torch::zeros({B, C, 0}, logits.options().dtype(torch::kFloat32));
+    }
+
+    // Copy gt_map to device
+    auto gt_map = torch::from_blob(host_gt_map.data(), {GT_out}, torch::kInt32).clone().to(logits.device());
 
     // Kernel 2: Reduce and Compute Pairwise Dice Loss
+    auto out = torch::zeros({B, C, GT_total}, logits.options());
     {
-        dim3 grid(GT, C, B);
+        dim3 grid(GT_total, C, B);
         // Shared memory for 3 float arrays used in reduction
         const size_t shared_mem_size = 3 * THREADS_PER_BLOCK * sizeof(float);
 
@@ -208,7 +233,10 @@ torch::Tensor pairwise_dice_loss_forward(
                     counts.data_ptr<int32_t>(),
                     out.data_ptr<float>(),
                     total_counts.data_ptr<int32_t>(),
-                    B, GT, smooth
+                    gt_map.data_ptr<int32_t>(),
+                    GT_total,
+                    GT_out,
+                    B, smooth
                 );
         };
 
