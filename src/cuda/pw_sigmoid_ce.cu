@@ -67,7 +67,7 @@ template <int C, int H, int W, int H_t>
 __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kernel(
     const float* __restrict__ logits,           // shape (L, B, C, H, W)
     const int32_t* __restrict__ counts,         // shape (B, GT_total, H, W)
-    double* __restrict__ out,                   // shape (L, B, C, GT_out)
+    float* __restrict__ out,                   // shape (L, B, C, GT_out)
     const int32_t* __restrict__ total_counts,   // shape (B, GT_total)
     const int32_t* __restrict__ gt_map,         // length GT_out: maps output index -> actual GT label
     const int GT_total,
@@ -75,7 +75,7 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
     const int B,
     const int L
 ) {
-    extern __shared__ double s_block_loss[];
+    extern __shared__ float s_block_loss[];
 
     const int out_gt_idx = blockIdx.x; // compacted output index (0..GT_out-1)
     const int ci = blockIdx.y;         // Logit class index
@@ -101,7 +101,7 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
     const int s = H_t / H;
     const float N2 = static_cast<float>(s * s);
 
-    double thread_loss_sum = 0.0;
+    float thread_loss_sum = 0.0;
 
     // Each thread computes a partial sum of the loss over the HxW logit plane
     for (int idx = tid; idx < H * W; idx += REDUCTION_THREADS_PER_BLOCK) {
@@ -113,12 +113,12 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
 
         float maxL = L > 0.0f ? L : 0.0f;
         float absL = fabsf(L);
-        float logexp = log1pf(__expf(-absL));
+        float logexp = my_log1pf(__expf(-absL));
 
         // This follows: sum_{pixels in HR patch} [ max(L,0) - L*y + log(1+exp(-|L|)) ]
         // where y is the per-pixel binary GT. Here n is the count of y==1 in the HR patch,
         // and N2 is number of HR pixels in the patch.
-        thread_loss_sum += static_cast<double>(N2 * maxL - L * n + N2 * logexp);
+        thread_loss_sum += (N2 * (maxL + logexp) - L * n);
     }
 
     // Warp-level-reduction: Sum thread-level losses within each warp.
@@ -227,10 +227,10 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     auto gt_map = torch::from_blob(host_gt_map.data(), {GT_out}, torch::kInt32).clone().to(logits.device());
 
     // Launch reduction kernel only for the compacted GT_out entries (mapping via gt_map)
-    auto out_accum = torch::zeros({L, B, C, GT_out}, logits.options().dtype(torch::kFloat64));
+    auto out_accum = torch::zeros({L, B, C, GT_out}, logits.options().dtype(torch::kFloat32));
     {
         dim3 grid(GT_out, C, B*L);
-        const size_t shared_mem_size = (REDUCTION_THREADS_PER_BLOCK / 32) * sizeof(double);
+        const size_t shared_mem_size = (REDUCTION_THREADS_PER_BLOCK / 32) * sizeof(float);
 
         auto static_launcher = [&](auto C_val, auto H_val, auto W_val, auto H_t_val) {
             reduce_loss_kernel<
@@ -239,7 +239,7 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
                 <<<grid, REDUCTION_THREADS_PER_BLOCK, shared_mem_size>>>(
                     logits.data_ptr<float>(),
                     counts.data_ptr<int32_t>(),
-                    out_accum.data_ptr<double>(),
+                    out_accum.data_ptr<float>(),
                     total_counts.data_ptr<int32_t>(),
                     gt_map.data_ptr<int32_t>(),
                     GT_total,

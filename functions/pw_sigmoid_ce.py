@@ -36,7 +36,7 @@ class PairwiseSigmoidCELossFunction(Function):
         else:
             return None, None
 
-def pairwise_sigmoid_cross_entropy_loss_py(logits, targets, background_index=None):
+def pairwise_sigmoid_cross_entropy_loss_inneficient_py(logits, targets, background_index=None):
     """
     Computes pairwise sigmoid cross-entropy loss.
 
@@ -135,7 +135,7 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets, background_index=Non
     return pairwise_loss
 
 
-def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets, background_index=None):
+def pairwise_sigmoid_cross_entropy_loss_py(logits, targets, background_index=None):
     """
     Computes pairwise sigmoid cross-entropy loss in an efficient way.
 
