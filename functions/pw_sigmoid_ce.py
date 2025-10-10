@@ -15,7 +15,7 @@ except ImportError:
 class PairwiseSigmoidCELossFunction(Function):
     @staticmethod
     def forward(ctx, logits, targets, background_index=None):
-        B, C, h, w = logits.shape
+        L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
         
@@ -46,10 +46,10 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets, background_index=Non
     and then computes the binary cross-entropy with logits.
 
     Args:
-        logits (torch.Tensor): A tensor of shape (B, C, h, w) representing the
-                            predicted logits for each class. B is the batch size,
-                            C is the number of classes, and h, w are the spatial
-                            dimensions of the logits.
+        logits (torch.Tensor): A tensor of shape (L, B, C, h, w) representing the
+                            predicted logits for each class. L is the number of 
+                            layers, B is the batch size, C is the number of classes, 
+                            and h, w are the spatial dimensions of the logits.
         targets (torch.Tensor): A tensor of shape (B, H_t, W_t) with integer
                             labels for the ground truth. H_t and W_t are the
                             spatial dimensions of the targets.
@@ -59,58 +59,75 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets, background_index=Non
                             has the column corresponding to the background removed.
 
     Returns:
-        torch.Tensor: A tensor of shape (B, C, max_GT) where max_GT is the maximum value
+        torch.Tensor: A tensor of shape (L, B, C, max_GT) where max_GT is the maximum value
                       in the targets tensor + 1 if no background index is provided, or
                       th maximum value in the targets tensor otherwise. It contains the 
                       pairwise loss for each class against each possible target. For target 
                       masks with 0 area, a value of infinity is returned.
     """
-    B, C, h, w = logits.shape
+    # Validate & extract shapes
+    assert logits.dim() == 5, "logits must have shape (L, B, C, h, w)"
+    L, B, C, h, w = logits.shape
     B_t, H_t, W_t = targets.shape
     assert B == B_t, "Batch size mismatch between logits and targets"
 
-    # Upsample logits to match the spatial dimensions of the targets
-    logits_up = F.interpolate(logits, size=(H_t, W_t), mode='nearest')
-
     device = logits.device
+    dtype = logits.dtype
+
+    # Upsample logits to match the targets spatial size efficiently:
+    # reshape to (L*B, C, h, w) -> interpolate -> reshape back to (L, B, C, H_t, W_t)
+    logits_reshaped = logits.view(L * B, C, h, w)
+    logits_up = F.interpolate(logits_reshaped, size=(H_t, W_t), mode='nearest')
+    logits_up = logits_up.view(L, B, C, H_t, W_t)  # (L, B, C, H_t, W_t)
+
     targets_long = targets.long().to(device)
 
-    # Determine the full range of GT classes present in the targets
+    # Determine GT classes present
     gt_max = targets_long.max().item()
     GT_all = gt_max + 1
 
-    # Build list of ground-truth classes to evaluate, optionally excluding background
     if background_index is None:
         gt_classes = list(range(GT_all))
     else:
-        # If background_index is outside the observed range, it has no effect
         gt_classes = [i for i in range(GT_all) if i != background_index]
 
     GT = len(gt_classes)
 
-    # Initialized to infinity.
-    pairwise_loss = torch.full((B, C, GT), torch.inf, device=device)
+    # Initialize output with +inf
+    pairwise_loss = torch.full((L, B, C, GT), torch.inf, device=device, dtype=dtype)
 
-    # Iterate over each ground truth class we will evaluate
+    # Precompute parts used in stable BCE-with-logits
+    # We'll compute per-ground-truth-class using broadcasting
     for out_idx, gt_class in enumerate(gt_classes):
-        # Create a binary target mask for the current ground truth class
-        y = (targets_long == gt_class).unsqueeze(1).to(dtype=logits.dtype)  # shape (B,1,H_t,W_t)
+        # Create binary target mask y: shape (B, H_t, W_t)
+        y_mask = (targets_long == gt_class).to(dtype=dtype)  # (B, H_t, W_t)
 
-        # Check which batch elements contain this GT class
-        has_class = y.sum(dim=(2, 3)) > 0  # Shape: (B, 1)
+        # Determine which batch elements contain this GT
+        has_class = (y_mask.sum(dim=(1, 2)) > 0)  # (B,)
 
-        # Stable BCE-with-logits calculation (broadcasts y over channels)
+        if not has_class.any():
+            # No batch element has this class — skip (pairwise_loss stays +inf)
+            continue
+
+        # Broadcast y_mask to match logits_up: (L, B, C, H_t, W_t)
+        # First shape to (1, B, 1, H_t, W_t) and let broadcasting do the rest
+        y_b = y_mask.unsqueeze(0).unsqueeze(2)  # (1, B, 1, H_t, W_t)
+
+        # Stable BCE-with-logits (broadcasts y_b over L and C)
         maxL = torch.clamp(logits_up, min=0.0)
         logexp = torch.log1p(torch.exp(-torch.abs(logits_up)))
-        bce_elem = maxL - logits_up * y + logexp  # shape (B,C,H_t,W_t)
+        bce_elem = maxL - logits_up * y_b + logexp  # (L, B, C, H_t, W_t)
 
-        # Sum the loss for each predicted class and normalize
-        loss_per_class = bce_elem.sum(dim=(2, 3)) / (H_t * W_t)  # shape (B,C)
+        # Sum spatially and normalize by area
+        loss_per_class = bce_elem.sum(dim=(3, 4)) / (H_t * W_t)  # (L, B, C)
 
-        # Only update loss where the class exists in the batch element, otherwise keep inf
-        inf_tensor = torch.tensor(torch.inf, device=device, dtype=loss_per_class.dtype)
-        pairwise_loss[:, :, out_idx] = torch.where(
-            has_class.expand(-1, C),
+        # Build mask to select where to write loss (expand has_class to (L,B,C))
+        has_class_expand = has_class.unsqueeze(0).unsqueeze(-1).expand(L, B, C)  # (L,B,C)
+
+        # Use torch.where to leave +inf where has_class is False
+        inf_tensor = torch.tensor(torch.inf, device=device, dtype=dtype)
+        pairwise_loss[:, :, :, out_idx] = torch.where(
+            has_class_expand,
             loss_per_class,
             inf_tensor
         )
@@ -128,10 +145,10 @@ def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets, background
     and then computes the binary cross-entropy with logits.
 
     Args:
-        logits (torch.Tensor): A tensor of shape (B, C, h, w) representing the
-                            predicted logits for each class. B is the batch size,
-                            C is the number of classes, and h, w are the spatial
-                            dimensions of the logits.
+        logits (torch.Tensor): A tensor of shape (L, B, C, h, w) representing the
+                            predicted logits for each class. L is the number of 
+                            layers, B is the batch size, C is the number of classes, 
+                            and h, w are the spatial dimensions of the logits.
         targets (torch.Tensor): A tensor of shape (B, H_t, W_t) with integer
                             labels for the ground truth. H_t and W_t are the
                             spatial dimensions of the targets.
@@ -141,18 +158,19 @@ def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets, background
                             has the column corresponding to the background removed.
 
     Returns:
-        torch.Tensor: A tensor of shape (B, C, max_GT) where max_GT is the maximum value
+        torch.Tensor: A tensor of shape (L, B, C, max_GT) where max_GT is the maximum value
                       in the targets tensor + 1 if no background index is provided, or
                       th maximum value in the targets tensor otherwise. It contains the 
                       pairwise loss for each class against each possible target. For target 
                       masks with 0 area, a value of infinity is returned.
     """
-    B, C, h, w = logits.shape
+    assert logits.dim() == 5, "logits must have shape (L, B, C, h, w)"
+    L, B, C, h, w = logits.shape
     B_t, H_t, W_t = targets.shape
     assert B == B_t, "Batch size mismatch between logits and targets"
     assert H_t % h == 0 and W_t % w == 0, \
         "Target dimensions must be integer multiples of logit dimensions"
-    
+
     sH = H_t // h
     sW = W_t // w
     if sH != sW:
@@ -161,6 +179,7 @@ def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets, background
     N2 = s * s
 
     device = logits.device
+    dtype = logits.dtype
     targets_long = targets.long().to(device)
 
     # Determine the full range of GT classes present in the targets
@@ -171,45 +190,58 @@ def pairwise_sigmoid_cross_entropy_loss_efficient_py(logits, targets, background
     if background_index is None:
         gt_classes = list(range(GT_all))
     else:
-        # If background_index is outside the observed range, it has no effect
         gt_classes = [i for i in range(GT_all) if i != background_index]
 
     GT = len(gt_classes)
 
-    # Initialized to infinity.
-    pairwise_loss = torch.full((B, C, GT), torch.inf, device=device)
-    
-    L_reshaped = logits.reshape(B, C, h * w)
-    
+    # Initialize to infinity: (L, B, C, GT)
+    pairwise_loss = torch.full((L, B, C, GT), torch.inf, device=device, dtype=dtype)
+
+    # Reshape logits for efficient per-cell operations: (L, B, C, h*w)
+    L_flat = logits.reshape(L, B, C, h * w)
+
     # Precompute parts of the stable BCE-with-logits formula
-    maxL = torch.clamp(L_reshaped, min=0.0)
-    logexp = torch.log1p(torch.exp(-torch.abs(L_reshaped)))
+    maxL = torch.clamp(L_flat, min=0.0)  # (L,B,C,h*w)
+    logexp = torch.log1p(torch.exp(-torch.abs(L_flat)))  # (L,B,C,h*w)
 
-    # Iterate over each ground truth class we will evaluate
+    # Iterate over ground-truth classes (usually a small loop)
     for out_idx, gt_class in enumerate(gt_classes):
-        # Create a binary mask for the current ground truth class
-        onehot_gt = (targets_long == gt_class).unsqueeze(1).to(dtype=logits.dtype)
-        
-        # Check which batch elements contain this GT class
-        has_class = onehot_gt.sum(dim=(2, 3)) > 0  # Shape: (B, 1)
-        
-        # Reshape for unfolding to count ground truth classes in each block
-        Bc = onehot_gt.reshape(B, 1, H_t, W_t)
-        unf = F.unfold(Bc, kernel_size=(s, s), stride=(s, s))
-        unf = unf.reshape(B, 1, s * s, h * w)
-        n_k = unf.sum(dim=2)  # Shape: (B, 1, h*w)
+        # Binary mask for current GT: (B, H_t, W_t) -> then (B,1,H_t,W_t)
+        onehot_gt = (targets_long == gt_class).unsqueeze(1).to(dtype=dtype)  # (B,1,H_t,W_t)
 
-        # Stable BCE-with-logits summed across the block for each predicted class
-        loss_block = N2 * maxL - L_reshaped * n_k + N2 * logexp
-        
-        # Sum the loss over the spatial dimensions and normalize
-        loss_sum = loss_block.sum(dim=2) / (H_t * W_t)
-        
-        # Only update loss where the class exists in the batch element
-        pairwise_loss[:, :, out_idx] = torch.where(
-            has_class.expand(-1, C),
+        # Check which batch elements contain this GT
+        has_class = (onehot_gt.sum(dim=(2, 3)) > 0).squeeze(1)  # (B,)
+
+        if not has_class.any():
+            # No examples in this batch have this GT — leave +inf for this column
+            continue
+
+        # Unfold to count number of GT pixels falling into each logit cell
+        Bc = onehot_gt.reshape(B, 1, H_t, W_t)  # (B,1,H_t,W_t)
+        unf = F.unfold(Bc, kernel_size=(s, s), stride=(s, s))  # (B, s*s, h*w)
+        # Note: F.unfold returns (B, C * kernelH * kernelW, L), but since C==1 here we get (B, s*s, h*w)
+        unf = unf.reshape(B, s * s, h * w)  # (B, s*s, h*w)
+        n_k = unf.sum(dim=1)  # (B, h*w)  -- counts per cell per batch
+
+        # Expand n_k to match L and channel dims: (L, B, 1, h*w)
+        n_k_exp = n_k.unsqueeze(0).unsqueeze(2).expand(L, B, 1, h * w)
+
+        # Compute stable BCE-with-logits summed across the block for each predicted class
+        # loss_block shape: (L, B, C, h*w)
+        loss_block = N2 * maxL - L_flat * n_k_exp + N2 * logexp
+
+        # Sum spatially and normalize by area -> (L, B, C)
+        loss_sum = loss_block.sum(dim=3) / (H_t * W_t)
+
+        # Build selection mask where GT exists: expand (B,) -> (L,B,C)
+        has_class_expand = has_class.unsqueeze(0).unsqueeze(-1).expand(L, B, C)
+
+        # Use torch.where to keep +inf where class absent
+        inf_tensor = torch.tensor(torch.inf, device=device, dtype=dtype)
+        pairwise_loss[:, :, :, out_idx] = torch.where(
+            has_class_expand,
             loss_sum,
-            torch.tensor(torch.inf, device=device, dtype=loss_sum.dtype)
+            inf_tensor
         )
-        
+
     return pairwise_loss

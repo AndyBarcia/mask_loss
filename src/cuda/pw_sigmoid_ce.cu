@@ -63,20 +63,25 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) count_labels_per_block_kern
 
 template <int C, int H, int W, int H_t>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_loss_kernel(
-    const float* __restrict__ logits,
+    const float* __restrict__ logits,           // shape (L, B, C, H, W)
     const int32_t* __restrict__ counts,         // shape (B, GT_total, H, W)
-    double* __restrict__ out,                   // shape (B, C, GT_out)
+    double* __restrict__ out,                   // shape (L, B, C, GT_out)
     const int32_t* __restrict__ total_counts,   // shape (B, GT_total)
     const int32_t* __restrict__ gt_map,         // length GT_out: maps output index -> actual GT label
     const int GT_total,
     const int GT_out,
-    const int B
+    const int B,
+    const int L
 ) {
     extern __shared__ double s_block_loss[];
 
     const int out_gt_idx = blockIdx.x; // compacted output index (0..GT_out-1)
     const int ci = blockIdx.y;         // Logit class index
-    const int b = blockIdx.z;          // Batch index
+    const int flat_b_l = blockIdx.z;   // flat index combining layer and batch: 0 .. (B*L - 1)
+
+    // Recover layer and batch indices
+    const int b = flat_b_l % B;
+    const int l = flat_b_l / B;
 
     // Map to the actual ground-truth label index
     const int gt_actual = gt_map[out_gt_idx];
@@ -85,7 +90,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_loss_kernel(
     // Set the loss to infinity and return. Only one thread writes the output
     if (total_counts[b * GT_total + gt_actual] == 0) {
         if (threadIdx.x == 0) {
-            out[(b * C + ci) * GT_out + out_gt_idx] = INFINITY;
+            out[((l*B + b)*C + ci) * GT_out + out_gt_idx] = INFINITY;
         }
         return;
     }
@@ -101,7 +106,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_loss_kernel(
         int i = idx / W;
         int j = idx % W;
 
-        float L = logits[((b * C + ci) * H + i) * W + j];
+        float L = logits[(((l * B + b) * C + ci) * H + i) * W + j];
         int32_t n = counts[((b * GT_total + gt_actual) * H + i) * W + j];
 
         float maxL = L > 0.0f ? L : 0.0f;
@@ -128,7 +133,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) reduce_loss_kernel(
 
     // The first thread writes the final reduced result for the block, no atomic needed
     if (tid == 0) {
-        out[(b * C + ci) * GT_out + out_gt_idx] = s_block_loss[0];
+        out[((l * B + b) * C + ci) * GT_out + out_gt_idx] = s_block_loss[0];
     }
 }
 
@@ -140,10 +145,11 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
 
-    const int B = logits.size(0);
-    const int C = logits.size(1);
-    const int H = logits.size(2);
-    const int W = logits.size(3);
+    const int L = logits.size(0);
+    const int B = logits.size(1);
+    const int C = logits.size(2);
+    const int H = logits.size(3);
+    const int W = logits.size(4);
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
 
@@ -198,16 +204,16 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const int GT_out = static_cast<int>(host_gt_map.size());
     // If no classes left to evaluate (edge case), return an empty tensor of shape (B,C,0)
     if (GT_out == 0) {
-        return torch::zeros({B, C, 0}, logits.options().dtype(torch::kFloat32));
+        return torch::zeros({L, B, C, 0}, logits.options().dtype(torch::kFloat32));
     }
 
     // Copy gt_map to device
     auto gt_map = torch::from_blob(host_gt_map.data(), {GT_out}, torch::kInt32).clone().to(logits.device());
 
     // Launch reduction kernel only for the compacted GT_out entries (mapping via gt_map)
-    auto out_accum = torch::zeros({B, C, GT_out}, logits.options().dtype(torch::kFloat64));
+    auto out_accum = torch::zeros({L, B, C, GT_out}, logits.options().dtype(torch::kFloat64));
     {
-        dim3 grid(GT_out, C, B);
+        dim3 grid(GT_out, C, B*L);
         const size_t shared_mem_size = THREADS_PER_BLOCK * sizeof(double);
 
         auto static_launcher = [&](auto C_val, auto H_val, auto W_val, auto H_t_val) {
@@ -222,7 +228,7 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
                     gt_map.data_ptr<int32_t>(),
                     GT_total,
                     GT_out,
-                    B
+                    B, L
                 );
         };
 
