@@ -67,7 +67,7 @@ template <int C, int H, int W, int H_t>
 __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kernel(
     const float* __restrict__ logits,           // shape (L, B, C, H, W)
     const int32_t* __restrict__ counts,         // shape (B, GT_total, H, W)
-    float* __restrict__ out,                   // shape (L, B, C, GT_out)
+    float* __restrict__ out,                    // shape (L, B, C, GT_out)
     const int32_t* __restrict__ total_counts,   // shape (B, GT_total)
     const int32_t* __restrict__ gt_map,         // length GT_out: maps output index -> actual GT label
     const int GT_total,
@@ -75,82 +75,99 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
     const int B,
     const int L
 ) {
-    extern __shared__ float s_block_loss[];
+    const int NUM_WARPS = REDUCTION_THREADS_PER_BLOCK / 32;
+    extern __shared__ float s_block_loss[NUM_WARPS];
 
-    const int out_gt_idx = blockIdx.x; // compacted output index (0..GT_out-1)
-    const int ci = blockIdx.y;         // Logit class index
-    const int flat_b_l = blockIdx.z;   // flat index combining layer and batch: 0 .. (B*L - 1)
-
-    // Recover layer and batch indices
-    const int b = flat_b_l % B;
-    const int l = flat_b_l / B;
-
-    // Map to the actual ground-truth label index
-    const int gt_actual = gt_map[out_gt_idx];
-
-    // If the total count for this ground truth label is 0, it's a zero-area mask.
-    // Set the loss to infinity and return. Only one thread writes the output
-    if (total_counts[b * GT_total + gt_actual] == 0) {
-        if (threadIdx.x == 0) {
-            out[((l*B + b)*C + ci) * GT_out + out_gt_idx] = INFINITY;
-        }
-        return;
-    }
+    const int l = blockIdx.x; // layer index
+    const int b = blockIdx.y; // batch index
+    const int ci = blockIdx.z; // class index
 
     const int tid = threadIdx.x;
     const int s = H_t / H;
     const float N2 = static_cast<float>(s * s);
 
+    // Each thread computes a partial sum of the loss
     float thread_loss_sum = 0.0;
 
-    // Each thread computes a partial sum of the loss over the HxW logit plane
-    for (int idx = tid; idx < H * W; idx += REDUCTION_THREADS_PER_BLOCK) {
+    // Store logits in register array for faster reuse later.
+    float s_logits[H*W / REDUCTION_THREADS_PER_BLOCK];
+
+    // Compute target independent base loss.
+    #pragma unroll
+    for (int idx = tid, l_i=0; idx < H * W; idx += REDUCTION_THREADS_PER_BLOCK, ++l_i) {
         int i = idx / W;
         int j = idx % W;
 
         float L = logits[(((l * B + b) * C + ci) * H + i) * W + j];
-        int32_t n = counts[((b * GT_total + gt_actual) * H + i) * W + j];
 
         float maxL = L > 0.0f ? L : 0.0f;
         float absL = fabsf(L);
-        float logexp = my_log1pf(__expf(-absL));
+        float logexp = log1pf(__expf(-absL));
 
-        // This follows: sum_{pixels in HR patch} [ max(L,0) - L*y + log(1+exp(-|L|)) ]
-        // where y is the per-pixel binary GT. Here n is the count of y==1 in the HR patch,
-        // and N2 is number of HR pixels in the patch.
-        thread_loss_sum += (N2 * (maxL + logexp) - L * n);
+        thread_loss_sum += (N2 * (maxL + logexp));
+        s_logits[l_i] = L;
     }
 
-    // Warp-level-reduction: Sum thread-level losses within each warp.
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) { // 16 is half the warp size
-        thread_loss_sum += __shfl_down_sync(0xffffffff, thread_loss_sum, offset);
-    }
+    // Then compute the contribution from the actual GT label
+    for (int out_gt_idx = 0; out_gt_idx < GT_total; ++out_gt_idx) {
+        // Map to the actual ground-truth label index
+        const int gt_actual = gt_map[out_gt_idx];
 
-    // The first thread (lane 0) of each warp writes the warp's sum to shared memory.
-    const int lane_id = tid % 32;
-    const int warp_id = tid / 32;
-    if (lane_id == 0) {
-        s_block_loss[warp_id] = thread_loss_sum;
-    }
+        // If the total count for this ground truth label is 0, it's a zero-area mask.
+        // Set the loss to infinity and return. Only one thread writes the output
+        if (total_counts[b * GT_total + gt_actual] == 0) {
+            if (tid == 0) {
+                out[((l*B + b)*C + ci) * GT_out + out_gt_idx] = INFINITY;
+            }
+            continue;
+        }
 
-    // Store each thread's accumulated loss into shared memory
-    //s_block_loss[tid] = thread_loss_sum;
-    __syncthreads();
+        // Otherwise, continue to compute the loss.
+        float thread_gt_loss = 0.0f;
+        const int32_t* gt_counts = counts + (b * GT_total + gt_actual) * H * W;
 
-    // Perform the block-level reduction
-    const int num_warps = REDUCTION_THREADS_PER_BLOCK / 32;
-    for (int s_reduce = num_warps / 2; s_reduce > 0; s_reduce >>= 1) {
-        if (tid < s_reduce) {
-            s_block_loss[tid] += s_block_loss[tid + s_reduce];
+        // Iterate over the same pixel grid
+        #pragma unroll
+        for (int idx = tid, l_i=0; idx < H * W; idx += REDUCTION_THREADS_PER_BLOCK, ++l_i) {
+            int i = idx / W;
+            int j = idx % W;
+            
+            // Load logit from register array and counts from global memory
+            float L = s_logits[l_i];
+            int32_t n = gt_counts[i*W + j];
+            thread_gt_loss += - L*n;
+        }
+
+        float total_gt_loss = thread_gt_loss + thread_loss_sum;
+
+        // Warp-level-reduction: Sum thread-level losses within each warp.
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            total_gt_loss += __shfl_down_sync(0xffffffff, total_gt_loss, offset);
+        }
+
+        // The first thread (lane 0) of each warp writes the warp's sum to shared memory.
+        const int lane_id = tid % 32;
+        const int warp_id = tid / 32;
+        if (lane_id == 0) {
+            s_block_loss[warp_id] = total_gt_loss;
         }
         __syncthreads();
+
+        // Perform the block-level reduction
+        for (int s_reduce = NUM_WARPS / 2; s_reduce > 0; s_reduce >>= 1) {
+            if (tid < s_reduce) {
+                s_block_loss[tid] += s_block_loss[tid + s_reduce];
+            }
+            __syncthreads();
+        }
+
+        // The first thread writes the final reduced result for the block, no atomic needed
+        if (tid == 0) {
+            out[((l * B + b) * C + ci) * GT_out + out_gt_idx] = s_block_loss[0];
+        }
     }
 
-    // The first thread writes the final reduced result for the block, no atomic needed
-    if (tid == 0) {
-        out[((l * B + b) * C + ci) * GT_out + out_gt_idx] = s_block_loss[0];
-    }
 }
 
 torch::Tensor pairwise_sigmoid_cross_entropy_forward(
@@ -229,14 +246,13 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     // Launch reduction kernel only for the compacted GT_out entries (mapping via gt_map)
     auto out_accum = torch::zeros({L, B, C, GT_out}, logits.options().dtype(torch::kFloat32));
     {
-        dim3 grid(GT_out, C, B*L);
-        const size_t shared_mem_size = (REDUCTION_THREADS_PER_BLOCK / 32) * sizeof(float);
+        dim3 grid(L, B, C);
 
         auto static_launcher = [&](auto C_val, auto H_val, auto W_val, auto H_t_val) {
             reduce_loss_kernel<
                 decltype(C_val)::value, decltype(H_val)::value,
                 decltype(W_val)::value, decltype(H_t_val)::value>
-                <<<grid, REDUCTION_THREADS_PER_BLOCK, shared_mem_size>>>(
+                <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
                     logits.data_ptr<float>(),
                     counts.data_ptr<int32_t>(),
                     out_accum.data_ptr<float>(),
