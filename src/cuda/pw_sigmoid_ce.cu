@@ -109,7 +109,7 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
     }
 
     // Then compute the contribution from the actual GT label
-    for (int out_gt_idx = 0; out_gt_idx < GT_total; ++out_gt_idx) {
+    for (int out_gt_idx = 0; out_gt_idx < GT_out; ++out_gt_idx) {
         // Map to the actual ground-truth label index
         const int gt_actual = gt_map[out_gt_idx];
 
