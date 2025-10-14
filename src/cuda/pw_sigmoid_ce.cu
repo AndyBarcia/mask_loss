@@ -77,6 +77,7 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
 ) {
     const int NUM_WARPS = REDUCTION_THREADS_PER_BLOCK / 32;
     extern __shared__ float s_block_loss[NUM_WARPS];
+    extern __shared__ float s_logits[H*W];
 
     const int l = blockIdx.x; // layer index
     const int b = blockIdx.y; // batch index
@@ -89,12 +90,9 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
     // Each thread computes a partial sum of the loss
     float thread_loss_sum = 0.0;
 
-    // Store logits in register array for faster reuse later.
-    float s_logits[H*W / REDUCTION_THREADS_PER_BLOCK];
-
     // Compute target independent base loss.
     #pragma unroll
-    for (int idx = tid, l_i=0; idx < H * W; idx += REDUCTION_THREADS_PER_BLOCK, ++l_i) {
+    for (int idx = tid; idx < H * W; idx += REDUCTION_THREADS_PER_BLOCK) {
         int i = idx / W;
         int j = idx % W;
 
@@ -105,7 +103,7 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
         float logexp = log1pf(__expf(-absL));
 
         thread_loss_sum += (N2 * (maxL + logexp));
-        s_logits[l_i] = L;
+        s_logits[idx] = L;
     }
 
     // Then compute the contribution from the actual GT label
@@ -128,12 +126,13 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
 
         // Iterate over the same pixel grid
         #pragma unroll
-        for (int idx = tid, l_i=0; idx < H * W; idx += REDUCTION_THREADS_PER_BLOCK, ++l_i) {
+        for (int idx = tid; idx < H * W; idx += REDUCTION_THREADS_PER_BLOCK) {
             int i = idx / W;
             int j = idx % W;
             
             // Load logit from register array and counts from global memory
-            float L = s_logits[l_i];
+            float L = s_logits[idx];
+            // Bottleneck is waiting for gt_counts here.
             int32_t n = gt_counts[i*W + j];
             thread_gt_loss += - L*n;
         }
