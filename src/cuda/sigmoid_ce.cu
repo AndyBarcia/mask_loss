@@ -8,9 +8,7 @@
 
 #include "utils.h"
 
-// Process regions of 16x16, perfect for logits of shape
-// 64x64 and ground truth of shape 1024x1024.
-const int THREADS_PER_BLOCK = 16*16;
+const int THREADS_PER_BLOCK = 64;
 
 template <int C, int H, int W, int H_t, int W_t>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_forward_kernel(
@@ -22,9 +20,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     // Each CUDA block processes one (b, i, j) low-res block
     // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = B (batch)
     // Shared memory is partitioned for per-class counts and per-thread partial loss sums
-    extern __shared__ char sh_mem[];
-    int* sh_counts = reinterpret_cast<int32_t*>(sh_mem);
-    double* s_block_loss = reinterpret_cast<double*>(sh_mem + C * sizeof(int32_t));
+    extern __shared__ int sh_counts[C];
+    extern __shared__ double s_block_loss[THREADS_PER_BLOCK];
 
     int j = blockIdx.x;  // low-res x (0..W-1)
     int i = blockIdx.y;  // low-res y (0..H-1)
@@ -115,9 +112,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     const float N2 = (float)(s * s);
 
     // Partition shared memory for counts and for caching logits
-    extern __shared__ char sh_mem[];
-    int* sh_counts = reinterpret_cast<int32_t*>(sh_mem);
-    float* sh_logits = reinterpret_cast<float*>(sh_mem + C * sizeof(int32_t));
+    extern __shared__ int sh_counts[C];
+    extern __shared__ float sh_logits[C];
 
     // Initialize shared counts to zero
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
@@ -170,7 +166,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
 torch::Tensor sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
-    const int num_masks
+    const float num_masks
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -190,20 +186,17 @@ torch::Tensor sigmoid_cross_entropy_forward(
     // Set grid dimensions based on the low-resolution output
     dim3 grid(W, H, B);
 
-    // Update shared memory size to accommodate both counts and the per-thread loss sums
-    const size_t shared_mem_size = C * sizeof(int32_t) + THREADS_PER_BLOCK * sizeof(double);
-
     auto static_launcher = [&](auto... Dims) {
-        sigmoid_cross_entropy_forward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
+        sigmoid_cross_entropy_forward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK>>>(
             logits.data_ptr<float>(), targets.data_ptr<int64_t>(), total_loss_sum_tensor.data_ptr<double>(), B);
     };
 
     const auto supported_dims = std::make_tuple(
-        std::make_tuple(std::integral_constant<int, 256>{}), // C
-        std::make_tuple(std::integral_constant<int, 64>{}),  // H
-        std::make_tuple(std::integral_constant<int, 64>{}),  // W
-        std::make_tuple(std::integral_constant<int, 512>{}), // H_t
-        std::make_tuple(std::integral_constant<int, 512>{})  // W_t
+        std::make_tuple(std::integral_constant<int, 133>{}), // C
+        std::make_tuple(std::integral_constant<int, 256>{}),  // H
+        std::make_tuple(std::integral_constant<int, 256>{}),  // W
+        std::make_tuple(std::integral_constant<int, 1024>{}), // H_t
+        std::make_tuple(std::integral_constant<int, 1024>{})  // W_t
     );
     const auto runtime_dims = std::make_tuple(C, H, W, H_t, W_t);
 
@@ -219,7 +212,7 @@ torch::Tensor sigmoid_cross_entropy_backward(
     const torch::Tensor& grad_out, 
     const torch::Tensor& logits, 
     const torch::Tensor& targets,
-    const int num_masks
+    const float num_masks
 ) {
     
     CHECK_INPUT(grad_out);
@@ -240,20 +233,18 @@ torch::Tensor sigmoid_cross_entropy_backward(
     const float grad_out_scalar = grad_out.item<float>() / (num_masks * H_t * W_t);
     
     dim3 grid(W, H, B);
-    // Increase shared memory to hold both counts and logits
-    const size_t shared_mem_size = C * sizeof(int32_t) + C * sizeof(float);
 
     auto static_launcher = [&](auto... Dims) {
-        sigmoid_cross_entropy_backward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK, shared_mem_size>>>(
+        sigmoid_cross_entropy_backward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK>>>(
             logits.data_ptr<float>(), targets.data_ptr<int64_t>(), grad_out_scalar, grad_logits.data_ptr<float>(), B);
     };
     
     const auto supported_dims = std::make_tuple(
-        std::make_tuple(std::integral_constant<int, 256>{}), // C
-        std::make_tuple(std::integral_constant<int, 64>{}),  // H
-        std::make_tuple(std::integral_constant<int, 64>{}),  // W
-        std::make_tuple(std::integral_constant<int, 512>{}), // H_t
-        std::make_tuple(std::integral_constant<int, 512>{})  // W_t
+        std::make_tuple(std::integral_constant<int, 133>{}), // C
+        std::make_tuple(std::integral_constant<int, 256>{}),  // H
+        std::make_tuple(std::integral_constant<int, 256>{}),  // W
+        std::make_tuple(std::integral_constant<int, 1024>{}), // H_t
+        std::make_tuple(std::integral_constant<int, 1024>{})  // W_t
     );
     const auto runtime_dims = std::make_tuple(C, H, W, H_t, W_t);
 

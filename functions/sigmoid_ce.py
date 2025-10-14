@@ -22,7 +22,7 @@ class SigmoidCELossFunction(Function):
         ctx.received_num_masks = num_masks is not None
         if num_masks is None:
             B, C = logits.shape[:2]
-            num_masks = B*C
+            num_masks = float(B*C)
         ctx.num_masks = num_masks
 
         logits = logits.contiguous().float()
@@ -41,7 +41,7 @@ class SigmoidCELossFunction(Function):
         else:
             return grad_weights, None
 
-def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None):
+def sigmoid_cross_entropy_loss_inefficient_py(logits, targets, num_masks=None):
     """
     Naive approach: upsample logits (nearest) to high-res, build per-class one-hot targets,
     and compute BCEWithLogits per pixel then mean.
@@ -66,7 +66,7 @@ def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None):
     loss = bce_elem.sum() / (num_masks * H_t * W_t)
     return loss
 
-def sigmoid_cross_entropy_loss_efficient_py(logits, targets, num_masks=None):
+def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None):
     """
     Efficient count-based BCE-with-logits for non-mutually-exclusive multi-class case.
     logits: (B, C, h, w)

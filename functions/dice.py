@@ -22,7 +22,7 @@ class DiceLossFunction(Function):
         ctx.received_num_masks = num_masks is not None
         if num_masks is None:
             B, C = logits.shape[:2]
-            num_masks = B*C
+            num_masks = float(B*C)
         ctx.num_masks = num_masks
 
         logits = logits.contiguous().float()
@@ -51,7 +51,7 @@ class DiceLossFunction(Function):
         else:
             return grad_weights, None
 
-def dice_loss_py(logits, targets, smooth=1e-6, num_masks=None):
+def dice_loss_inefficient_py(logits, targets, smooth=1e-6, num_masks=None):
     """
     Naive approach: upsample logits (nearest) to high-res, build per-class one-hot targets,
     compute sigmoid probabilities, compute Dice per (B,C) across the whole high-res map,
@@ -89,7 +89,7 @@ def dice_loss_py(logits, targets, smooth=1e-6, num_masks=None):
     return loss
 
 
-def dice_loss_efficient_py(logits, targets, smooth=1e-6, num_masks=None):
+def dice_loss_py(logits, targets, smooth=1e-6, num_masks=None):
     """
     Efficient count-based Dice loss consistent with nearest upsampling behavior.
     Assumes H_t and W_t are integer multiples of h and w respectively and that
