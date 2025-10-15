@@ -109,7 +109,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     int tid = threadIdx.x;
 
     const int s = H_t / H;
-    const float N2 = (float)(s * s);
+    const int s2 = s * s;
 
     // Partition shared memory for counts and for caching logits
     __shared__ int sh_counts[C];
@@ -124,7 +124,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     // Re-compute counts for the current block.
     int base_y = i * s;
     int base_x = j * s;
-    for (int idx = tid; idx < N2; idx += THREADS_PER_BLOCK) {
+    for (int idx = tid; idx < s2; idx += THREADS_PER_BLOCK) {
         int dy = idx / s;
         int dx = idx % s;
         int yy = base_y + dy;
@@ -150,10 +150,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
         float L = sh_logits[ci]; // Fast read from shared memory
         int32_t n = sh_counts[ci];
+        const float N2 = (float) s2;
 
         // Use a faster, mathematically equivalent implementation of the sigmoid function
-        float sigma = 0.5f * tanhf(0.5f * L) + 0.5f;
-        
+        float sigma = 1.0f / (1.0f + expf(-L));
+
         // Derivative: dLoss/dL = N2 * sigma - n
         float g = N2 * sigma - (float)n;
         
@@ -192,7 +193,7 @@ torch::Tensor sigmoid_cross_entropy_forward(
     };
 
     const auto supported_dims = std::make_tuple(
-        std::make_tuple(std::integral_constant<int, 133>{}), // C
+        std::make_tuple(std::integral_constant<int, 128>{}), // C
         std::make_tuple(std::integral_constant<int, 256>{}),  // H
         std::make_tuple(std::integral_constant<int, 256>{}),  // W
         std::make_tuple(std::integral_constant<int, 1024>{}), // H_t
@@ -240,7 +241,7 @@ torch::Tensor sigmoid_cross_entropy_backward(
     };
     
     const auto supported_dims = std::make_tuple(
-        std::make_tuple(std::integral_constant<int, 133>{}), // C
+        std::make_tuple(std::integral_constant<int, 128>{}), // C
         std::make_tuple(std::integral_constant<int, 256>{}),  // H
         std::make_tuple(std::integral_constant<int, 256>{}),  // W
         std::make_tuple(std::integral_constant<int, 1024>{}), // H_t
