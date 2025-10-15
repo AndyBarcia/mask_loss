@@ -20,8 +20,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     // Each CUDA block processes one (b, i, j) low-res block
     // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = B (batch)
     // Shared memory is partitioned for per-class counts and per-thread partial loss sums
-    extern __shared__ int sh_counts[C];
-    extern __shared__ double s_block_loss[THREADS_PER_BLOCK];
+    __shared__ int sh_counts[C];
+    __shared__ double s_block_loss[THREADS_PER_BLOCK];
 
     int j = blockIdx.x;  // low-res x (0..W-1)
     int i = blockIdx.y;  // low-res y (0..H-1)
@@ -112,8 +112,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     const float N2 = (float)(s * s);
 
     // Partition shared memory for counts and for caching logits
-    extern __shared__ int sh_counts[C];
-    extern __shared__ float sh_logits[C];
+    __shared__ int sh_counts[C];
+    __shared__ float sh_logits[C];
 
     // Initialize shared counts to zero
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
