@@ -14,12 +14,11 @@ except ImportError:
 
 class DiceLossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, smooth=1.0, num_masks=None):
+    def forward(ctx, logits, targets, smooth, num_masks):
         B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
     
-        ctx.received_num_masks = num_masks is not None
         if num_masks is None:
             B, C = logits.shape[:2]
             num_masks = float(B*C)
@@ -46,10 +45,7 @@ class DiceLossFunction(Function):
             ctx.smooth,
             ctx.num_masks
         )
-        if ctx.received_num_masks:
-            return grad_weights, None, None
-        else:
-            return grad_weights, None
+        return grad_weights, None, None, None
 
 def dice_loss_inefficient_py(logits, targets, smooth=1e-6, num_masks=None):
     """

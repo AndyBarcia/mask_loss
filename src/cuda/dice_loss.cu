@@ -21,7 +21,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_forward_kernel
 ) {
     // Each CUDA block processes one (b, i, j) low-res block
     // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = B (batch)
-    extern __shared__ int sh_counts[C];
+    __shared__ int sh_counts[C];
 
     int j = blockIdx.x; // low-res x (0..W-1)
     int i = blockIdx.y; // low-res y (0..H-1)
@@ -97,9 +97,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
     int tid = threadIdx.x;
 
     const int s = H_t / H;
-    const float N2 = (float)(s * s);
+    const int s2 = s * s;
 
-    extern __shared__ int sh_counts[C];
+    __shared__ int sh_counts[C];
 
     // Initialize shared counts to zero
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
@@ -110,7 +110,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
     // Re-compute counts for the current block.
     int base_y = i * s;
     int base_x = j * s;
-    for (int idx = tid; idx < N2; idx += THREADS_PER_BLOCK) {
+    for (int idx = tid; idx < s2; idx += THREADS_PER_BLOCK) {
         int dy = idx / s;
         int dx = idx % s;
         int yy = base_y + dy;
@@ -130,6 +130,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
         float L = logits[((b * C + ci) * H + i) * W + j];
         float p = 1.0f / (1.0f + expf(-L));
         float n_k = (float)sh_counts[ci];
+        const float N2 = (float) s2;
 
         float I = total_intersection_sum[b * C + ci];
         float P = total_p_sum[b * C + ci];
@@ -137,7 +138,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
 
         float denominator = P + T + smooth;
         float term1_numerator = 2.0 * n_k * (P + T + smooth);
-        float term2_numerator = 2.0 * N2 * (2.0 * I + smooth);
+        float term2_numerator = N2 * (2.0 * I + smooth);
 
         float d_dice_dp = (term1_numerator - term2_numerator) / (denominator * denominator);
         float dp_dL = p * (1.0 - p);
