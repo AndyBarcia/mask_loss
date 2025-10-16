@@ -15,7 +15,7 @@ except ImportError:
 class PairwiseDiceLossFunction(Function):
     @staticmethod
     def forward(ctx, logits, targets, smooth=1.0, background_index=None):
-        B, C, h, w = logits.shape
+        L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
 
@@ -48,7 +48,7 @@ def pairwise_dice_loss_py(logits, targets, smooth=1.0, background_index=None):
     and then computes the Dice loss.
 
     Args:
-        logits (torch.Tensor): A tensor of shape (B, C, h, w) representing the
+        logits (torch.Tensor): A tensor of shape (L, B, C, h, w) representing the
                         predicted logits for each class. B is the batch size,
                         C is the number of classes, and h, w are the spatial
                         dimensions of the logits.
@@ -63,21 +63,26 @@ def pairwise_dice_loss_py(logits, targets, smooth=1.0, background_index=None):
                         has the column corresponding to the background removed.
 
     Returns:
-        torch.Tensor: A tensor of shape (B, C, max_GT) where max_GT is the maximum value
+        torch.Tensor: A tensor of shape (L, B, C, max_GT) where max_GT is the maximum value
                       in the targets tensor + 1 if no background index is provided, or
                       th maximum value in the targets tensor otherwise. It contains the 
                       pairwise loss for each class against each possible target. For target 
                       masks with 0 area, a value of infinity is returned.
     """
-    B, C, h, w = logits.shape
+    L, B, C, h, w = logits.shape
     B_t, H_t, W_t = targets.shape
     assert B == B_t, "Batch size mismatch between logits and targets"
 
-    # Upsample logits to match the spatial dimensions of the targets
-    logits_up = F.interpolate(logits, size=(H_t, W_t), mode='nearest')
-    probs = torch.sigmoid(logits_up)
-
     device = logits.device
+    dtype = logits.dtype
+
+    # Upsample logits to match the targets spatial size efficiently:
+    # reshape to (L*B, C, h, w) -> interpolate -> reshape back to (L, B, C, H_t, W_t)
+    logits_reshaped = logits.view(L * B, C, h, w)
+    logits_up = F.interpolate(logits_reshaped, size=(H_t, W_t), mode='nearest')
+    logits_up = logits_up.view(L, B, C, H_t, W_t)  # (L, B, C, H_t, W_t)
+    probs = logits_up.sigmoid()
+
     targets_long = targets.long().to(device)
 
     # Determine the full range of GT classes present in the targets
@@ -94,30 +99,41 @@ def pairwise_dice_loss_py(logits, targets, smooth=1.0, background_index=None):
     GT = len(gt_classes)
 
     # Initialize pairwise_loss tensor with infinity
-    pairwise_loss = torch.full((B, C, GT), torch.inf, device=device, dtype=logits.dtype)
+    pairwise_loss = torch.full((L, B, C, GT), torch.inf, device=device, dtype=dtype)
 
     # Iterate over each ground truth class we will evaluate
     for out_idx, gt_class in enumerate(gt_classes):
         # Create a binary target mask for the current ground truth class
-        y = (targets_long == gt_class).unsqueeze(1).to(dtype=logits.dtype)
+        y = (targets_long == gt_class).unsqueeze(1).to(dtype=dtype) # (B, 1, H_t, W_t)
 
         # Check which batch elements contain this GT class
         has_class = y.sum(dim=(1, 2, 3)) > 0  # Shape: (B,)
 
+        if not has_class.any():
+            # No batch element has this class — skip (pairwise_loss stays +inf)
+            continue
+
+        # Broadcast y_mask to match logits_up: (L, B, C, H_t, W_t)
+        y = y.unsqueeze(0)  # (1, B, 1, H_t, W_t)
+
         # Calculate intersection, probability sum, and target sum
-        intersection = (probs * y).sum(dim=(2, 3))
-        p_sum = probs.sum(dim=(2, 3))
-        t_sum = y.sum(dim=(2, 3)).squeeze(1) # Squeeze to match p_sum and intersection shape
+        intersection = (probs * y).sum(dim=(3, 4))
+        p_sum = probs.sum(dim=(3, 4))
+        t_sum = y.sum(dim=(3, 4)).squeeze(1) # Squeeze to match p_sum and intersection shape
 
         # Calculate Dice score and Dice loss
         dice_score = (2.0 * intersection + smooth) / (p_sum + t_sum + smooth)
         dice_loss = 1.0 - dice_score
 
+        # Build selection mask where GT exists: expand (B,) -> (L,B,C)
+        has_class_expand = has_class.unsqueeze(0).unsqueeze(-1).expand(L, B, C)
+
         # Update loss only where the class exists in the batch element
-        pairwise_loss[:, :, out_idx] = torch.where(
-            has_class.unsqueeze(1).expand(-1, C),
+        inf_tensor = torch.tensor(torch.inf, device=device, dtype=dtype)
+        pairwise_loss[:, :, :, out_idx] = torch.where(
+            has_class_expand,
             dice_loss,
-            torch.tensor(torch.inf, device=device, dtype=dice_loss.dtype)
+            inf_tensor
         )
 
     return pairwise_loss
