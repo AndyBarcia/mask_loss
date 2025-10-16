@@ -8,65 +8,45 @@
 
 #include "utils.h"
 
-// Process regions of 16x16, perfect for logits of shape
-// 64x64 and ground truth of shape 1024x1024.
-const int HIGH_RES_BLOCK = 16;
-const int COUNTER_THREADS_PER_BLOCK = HIGH_RES_BLOCK*HIGH_RES_BLOCK;
+const int COUNTER_THREADS_PER_BLOCK = 256;
 const int REDUCTION_THREADS_PER_BLOCK = 256;
 
 template <int H, int W, int H_t, int W_t>
 __global__ void __launch_bounds__(COUNTER_THREADS_PER_BLOCK) count_labels_per_block_kernel(
     const int64_t* __restrict__ targets,
-    int32_t* __restrict__ counts, // out: shape (B, GT_total, H, W)
+    uint8_t* __restrict__ counts, // out: shape (B, GT_total, H, W)
     const int B,
     const int GT_total
 ) {
-    extern __shared__ int32_t sh_mem_counts[];
-    int* sh_counts = sh_mem_counts;
+    const int j = blockIdx.x * blockDim.x + threadIdx.x; // low-res x
+    const int i = blockIdx.y * blockDim.y + threadIdx.y; // low-res y
+    const int b = blockIdx.z;
+    if (i >= H || j >= W || b >= B) return;
 
-    int j = blockIdx.x;  // low-res x
-    int i = blockIdx.y;  // low-res y
-    int b = blockIdx.z;  // batch
+    const int s = H_t / H; // assume divisible
+    const int base_y = i * s;
+    const int base_x = j * s;
 
-    int tid = threadIdx.x;
-    const int s = H_t / H;
-    const int s2 = s * s;
-
-    // Initialize shared memory counts for this block
-    for (int idx = tid; idx < GT_total; idx += COUNTER_THREADS_PER_BLOCK) {
-        sh_counts[idx] = 0;
-    }
-    __syncthreads();
-
-    // Base corner of the corresponding high-resolution block
-    int base_y = i * s;
-    int base_x = j * s;
-
-    // Parallel count of pixels per GT label within the block
-    for (int idx = tid; idx < s2; idx += COUNTER_THREADS_PER_BLOCK) {
-        int dy = idx / s;
-        int dx = idx % s;
-        int yy = base_y + dy;
-        int xx = base_x + dx;
-        if (yy < H_t && xx < W_t) {
+    // Loop 4×4 high-resolution patch; single-thread increments 
+    // its (i,j) bin -> no atomics needed
+    for (int dy = 0; dy < s; ++dy) {
+        const int yy = base_y + dy;
+        for (int dx = 0; dx < s; ++dx) {
+            const int xx = base_x + dx;
             int64_t lab = targets[(b * H_t + yy) * W_t + xx];
-            if (lab >= 0 && lab < GT_total) {
-                atomicAdd(&sh_counts[(int)lab], 1);
+            if (unsigned(lab) < unsigned(GT_total)) {
+                uint8_t* cell_counts = counts + ((b * GT_total + (int)lab) * H + i) * W + j;
+                // safe: single writer per (b,i,j); value never exceeds 16
+                *cell_counts = (uint8_t)(*cell_counts + 1);
             }
         }
-    }
-    __syncthreads();
-
-    // Write the counts from shared memory to the global counts tensor
-    for (int gt = tid; gt < GT_total; gt += COUNTER_THREADS_PER_BLOCK) {
-        counts[((b * GT_total + gt) * H + i) * W + j] = sh_counts[gt];
     }
 }
 
 template <int C, int H, int W, int H_t>
 __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kernel(
     const float* __restrict__ logits,           // shape (L, B, C, H, W)
-    const int32_t* __restrict__ counts,         // shape (B, GT_total, H, W)
+    const uint8_t* __restrict__ counts,         // shape (B, GT_total, H, W)
     float* __restrict__ out,                    // shape (L, B, C, GT_out)
     const int32_t* __restrict__ total_counts,   // shape (B, GT_total)
     const int32_t* __restrict__ gt_map,         // length GT_out: maps output index -> actual GT label
@@ -75,98 +55,116 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
     const int B,
     const int L
 ) {
-    const int NUM_WARPS = REDUCTION_THREADS_PER_BLOCK / 32;
-    extern __shared__ float s_block_loss[NUM_WARPS];
-    extern __shared__ float s_logits[H*W];
+    constexpr int TILE_H = 32;
+    constexpr int TILE_W = 32;
+    constexpr int NUM_WARPS = REDUCTION_THREADS_PER_BLOCK / 32;
+    __shared__ float s_logits[TILE_H * TILE_W];
+    __shared__ float s_warp[NUM_WARPS];
 
-    const int l = blockIdx.x; // layer index
-    const int b = blockIdx.y; // batch index
-    const int ci = blockIdx.z; // class index
-
+    const int l  = blockIdx.x;
+    const int b  = blockIdx.y;
+    const int ci = blockIdx.z;
     const int tid = threadIdx.x;
+
     const int s = H_t / H;
     const float N2 = static_cast<float>(s * s);
 
-    // Each thread computes a partial sum of the loss
-    float thread_loss_sum = 0.0;
+    // Compute base loss, independent of GT label
+    float thread_base = 0.f;
 
-    // Compute target independent base loss.
-    #pragma unroll
-    for (int idx = tid; idx < H * W; idx += REDUCTION_THREADS_PER_BLOCK) {
-        int i = idx / W;
-        int j = idx % W;
-
-        float L = logits[(((l * B + b) * C + ci) * H + i) * W + j];
-
-        float maxL = L > 0.0f ? L : 0.0f;
-        float absL = fabsf(L);
-        float logexp = log1pf(__expf(-absL));
-
-        thread_loss_sum += (N2 * (maxL + logexp));
-        s_logits[idx] = L;
-    }
-
-    // Then compute the contribution from the actual GT label
-    for (int out_gt_idx = 0; out_gt_idx < GT_out; ++out_gt_idx) {
-        // Map to the actual ground-truth label index
-        const int gt_actual = gt_map[out_gt_idx];
-
-        // If the total count for this ground truth label is 0, it's a zero-area mask.
-        // Set the loss to infinity and return. Only one thread writes the output
-        if (total_counts[b * GT_total + gt_actual] == 0) {
-            if (tid == 0) {
-                out[((l*B + b)*C + ci) * GT_out + out_gt_idx] = INFINITY;
+    for (int ti = 0; ti < H; ti += TILE_H) {
+        for (int tj = 0; tj < W; tj += TILE_W) {
+            // load tile logits to SMEM
+            for (int idx = tid; idx < TILE_H*TILE_W; idx += REDUCTION_THREADS_PER_BLOCK) {
+                int di = idx / TILE_W, dj = idx % TILE_W;
+                int i = ti + di, j = tj + dj;
+                float Lij = 0.f;
+                if (i < H && j < W) {
+                    Lij = logits[(((l*B + b)*C + ci)*H + i)*W + j];
+                }
+                s_logits[idx] = Lij;
             }
-            continue;
-        }
+            __syncthreads();
 
-        // Otherwise, continue to compute the loss.
-        float thread_gt_loss = 0.0f;
-        const int32_t* gt_counts = counts + (b * GT_total + gt_actual) * H * W;
-
-        // Iterate over the same pixel grid
-        #pragma unroll
-        for (int idx = tid; idx < H * W; idx += REDUCTION_THREADS_PER_BLOCK) {
-            int i = idx / W;
-            int j = idx % W;
-            
-            // Load logit from register array and counts from global memory
-            float L = s_logits[idx];
-            // Bottleneck is waiting for gt_counts here.
-            int32_t n = gt_counts[i*W + j];
-            thread_gt_loss += - L*n;
-        }
-
-        float total_gt_loss = thread_gt_loss + thread_loss_sum;
-
-        // Warp-level-reduction: Sum thread-level losses within each warp.
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            total_gt_loss += __shfl_down_sync(0xffffffff, total_gt_loss, offset);
-        }
-
-        // The first thread (lane 0) of each warp writes the warp's sum to shared memory.
-        const int lane_id = tid % 32;
-        const int warp_id = tid / 32;
-        if (lane_id == 0) {
-            s_block_loss[warp_id] = total_gt_loss;
-        }
-        __syncthreads();
-
-        // Perform the block-level reduction
-        for (int s_reduce = NUM_WARPS / 2; s_reduce > 0; s_reduce >>= 1) {
-            if (tid < s_reduce) {
-                s_block_loss[tid] += s_block_loss[tid + s_reduce];
+            // Base contribution only
+            for (int idx = tid; idx < TILE_H*TILE_W; idx += REDUCTION_THREADS_PER_BLOCK) {
+                float Lij = s_logits[idx];
+                float maxL = Lij > 0.f ? Lij : 0.f;
+                float absL = fabsf(Lij);
+                float logexp = log1pf(__expf(-absL));
+                thread_base += N2 * (maxL + logexp);
             }
             __syncthreads();
         }
-
-        // The first thread writes the final reduced result for the block, no atomic needed
-        if (tid == 0) {
-            out[((l * B + b) * C + ci) * GT_out + out_gt_idx] = s_block_loss[0];
-        }
     }
 
+    // Reduce to base_sum
+    float base_sum = thread_base;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        base_sum += __shfl_down_sync(0xffffffff, base_sum, off);
+    if ((tid & 31) == 0) s_warp[tid >> 5] = base_sum;
+    __syncthreads();
+    for (int sred = NUM_WARPS>>1; sred > 0; sred >>= 1) {
+        if (tid < sred) s_warp[tid] += s_warp[tid + sred];
+        __syncthreads();
+    }
+    base_sum = (tid == 0) ? s_warp[0] : 0.f;
+    // Broadcast within warp 0
+    base_sum = __shfl_sync(0xffffffff, base_sum, 0);
+
+    // Compute GT-dependent terms
+    for (int out_gt_idx = 0; out_gt_idx < GT_out; ++out_gt_idx) {
+        const int gt_actual = gt_map[out_gt_idx];
+        if (total_counts[b*GT_total + gt_actual] == 0) {
+            if (tid == 0)
+                out[((l*B + b)*C + ci)*GT_out + out_gt_idx] = INFINITY;
+            continue;
+        }
+
+        float thread_gt = 0.f;
+
+        for (int ti = 0; ti < H; ti += TILE_H) {
+            for (int tj = 0; tj < W; tj += TILE_W) {
+                // load logits tile again (cheap; no log1pf)
+                for (int idx = tid; idx < TILE_H*TILE_W; idx += REDUCTION_THREADS_PER_BLOCK) {
+                    int di = idx / TILE_W, dj = idx % TILE_W;
+                    int i = ti + di, j = tj + dj;
+                    float Lij = 0.f;
+                    if (i < H && j < W) {
+                        Lij = logits[(((l*B + b)*C + ci)*H + i)*W + j];
+                    }
+                    s_logits[idx] = Lij; // reuse SMEM to coalesce loads
+                }
+                __syncthreads();
+
+                const uint8_t* gt_counts_base = counts + ( (b*GT_total + gt_actual)*H )*W;
+                for (int idx = tid; idx < TILE_H*TILE_W; idx += REDUCTION_THREADS_PER_BLOCK) {
+                    int di = idx / TILE_W, dj = idx % TILE_W;
+                    int i = ti + di, j = tj + dj;
+                    if (i < H && j < W) {
+                        uint8_t n = gt_counts_base[i*W + j];
+                        thread_gt += - s_logits[idx] * float(n);
+                    }
+                }
+                __syncthreads();
+            }
+        }
+
+        // reduce and add base_sum
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            thread_gt += __shfl_down_sync(0xffffffff, thread_gt, off);
+        if ((tid & 31) == 0) s_warp[tid >> 5] = thread_gt;
+        __syncthreads();
+        for (int s = NUM_WARPS>>1; s > 0; s >>= 1) {
+            if (tid < s) s_warp[tid] += s_warp[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            out[((l*B + b)*C + ci)*GT_out + out_gt_idx] = base_sum + s_warp[0];
+        }
+    }
 }
 
 torch::Tensor pairwise_sigmoid_cross_entropy_forward(
@@ -191,28 +189,28 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const int GT_total = static_cast<int>(GT_total_64);
 
     // Intermediate tensor to store counts for every possible GT label (including background)
-    auto counts = torch::zeros({B, GT_total, H, W}, logits.options().dtype(torch::kInt32));
+    auto counts = torch::zeros({B, GT_total, H, W}, logits.options().dtype(torch::kUInt8));
 
     // Launch count kernel (counts for ALL GT labels)
     {
-        dim3 grid(W, H, B);
-        const size_t shared_mem_size = GT_total * sizeof(int32_t);
+        dim3 block(16,16);
+        dim3 grid((W + block.x - 1)/block.x, (H + block.y - 1)/block.y, B);
 
         auto static_launcher = [&](auto H_val, auto W_val, auto H_t_val, auto W_t_val) {
             count_labels_per_block_kernel<
                 decltype(H_val)::value, decltype(W_val)::value,
                 decltype(H_t_val)::value, decltype(W_t_val)::value>
-                <<<grid, COUNTER_THREADS_PER_BLOCK, shared_mem_size>>>(
+                <<<grid, block>>>(
                     targets.data_ptr<int64_t>(),
-                    counts.data_ptr<int32_t>(),
+                    counts.data_ptr<uint8_t>(),
                     B, GT_total
                 );
         };
         const auto supported_dims = std::make_tuple(
-            std::make_tuple(std::integral_constant<int, 64>{}),  // H
-            std::make_tuple(std::integral_constant<int, 64>{}),  // W
-            std::make_tuple(std::integral_constant<int, 512>{}, std::integral_constant<int, 1024>{}), // H_t
-            std::make_tuple(std::integral_constant<int, 512>{}, std::integral_constant<int, 1024>{})  // W_t
+            std::make_tuple(std::integral_constant<int, 256>{}),  // H
+            std::make_tuple(std::integral_constant<int, 256>{}),  // W
+            std::make_tuple(std::integral_constant<int, 1024>{}), // H_t
+            std::make_tuple(std::integral_constant<int, 1024>{})  // W_t
         );
         const auto runtime_dims = std::make_tuple(H, W, H_t, W_t);
         dispatch_kernel(static_launcher, runtime_dims, supported_dims);
@@ -253,7 +251,7 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
                 decltype(W_val)::value, decltype(H_t_val)::value>
                 <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
                     logits.data_ptr<float>(),
-                    counts.data_ptr<int32_t>(),
+                    counts.data_ptr<uint8_t>(),
                     out_accum.data_ptr<float>(),
                     total_counts.data_ptr<int32_t>(),
                     gt_map.data_ptr<int32_t>(),
@@ -264,10 +262,10 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
         };
 
         const auto supported_dims = std::make_tuple(
-            std::make_tuple(std::integral_constant<int, 256>{}), // C
-            std::make_tuple(std::integral_constant<int, 64>{}),  // H
-            std::make_tuple(std::integral_constant<int, 64>{}),  // W
-            std::make_tuple(std::integral_constant<int, 512>{}, std::integral_constant<int, 1024>{}) // H_t
+            std::make_tuple(std::integral_constant<int, 128>{}), // C
+            std::make_tuple(std::integral_constant<int, 256>{}),  // H
+            std::make_tuple(std::integral_constant<int, 256>{}),  // W
+            std::make_tuple(std::integral_constant<int, 1024>{}) // H_t
         );
         // W_t is not needed by reduce_loss_kernel, so we only pass needed dims
         const auto runtime_dims = std::make_tuple(C, H, W, H_t);
