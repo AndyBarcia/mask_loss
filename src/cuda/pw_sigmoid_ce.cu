@@ -43,13 +43,20 @@ __global__ void __launch_bounds__(COUNTER_THREADS_PER_BLOCK) count_labels_per_bl
     }
 }
 
+// Map compacted output index -> actual GT index, skipping exactly one label.
+__device__ __forceinline__ int map_out_to_actual(int out_gt_idx, int background_index) {
+    // If skipping and we've passed the background slot, bump by 1.
+    const int bump = (out_gt_idx >= background_index) ? 1 : 0;
+    return out_gt_idx + bump;
+}
+
 template <int C, int H, int W, int H_t>
 __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kernel(
     const float* __restrict__ logits,           // shape (L, B, C, H, W)
     const uint8_t* __restrict__ counts,         // shape (B, GT_total, H, W)
     float* __restrict__ out,                    // shape (L, B, C, GT_out)
     const int32_t* __restrict__ total_counts,   // shape (B, GT_total)
-    const int32_t* __restrict__ gt_map,         // length GT_out: maps output index -> actual GT label
+    const int background_index,
     const int GT_total,
     const int GT_out,
     const int B,
@@ -115,7 +122,7 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
 
     // Compute GT-dependent terms
     for (int out_gt_idx = 0; out_gt_idx < GT_out; ++out_gt_idx) {
-        const int gt_actual = gt_map[out_gt_idx];
+        const int gt_actual = map_out_to_actual(out_gt_idx, background_index);
         if (total_counts[b*GT_total + gt_actual] == 0) {
             if (tid == 0)
                 out[((l*B + b)*C + ci)*GT_out + out_gt_idx] = INFINITY;
@@ -170,7 +177,7 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
 torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
-    const int64_t background_index = -1
+    int64_t background_index = -1
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -221,26 +228,21 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     // Calculate the total number of pixels for each ground truth label (mask area)
     // This is used to mask 0-area masks with a loss of infinity.
     auto total_counts = counts.sum({2, 3}).to(torch::kInt32).contiguous(); // shape (B, GT_total)
-
-    // Build gt_map: list of actual GT labels to evaluate (exclude background_index if requested and valid)
-    std::vector<int32_t> host_gt_map;
-    host_gt_map.reserve(GT_total);
-    for (int i = 0; i < GT_total; ++i) {
-        if (background_index >= 0 && i == static_cast<int>(background_index)) {
-            continue;
-        }
-        host_gt_map.push_back(i);
+    
+    // Determine whether the output matrix should have one less column (skip background).
+    const bool skip_class = (background_index >= 0 && background_index < GT_total);
+    if (background_index < 0) {
+        // If negative, set to an invalid index to simplify device code
+        background_index = GT_total; 
     }
-    const int GT_out = static_cast<int>(host_gt_map.size());
+    const int GT_out = GT_total - (skip_class ? 1 : 0);
+
     // If no classes left to evaluate (edge case), return an empty tensor of shape (B,C,0)
     if (GT_out == 0) {
         return torch::zeros({L, B, C, 0}, logits.options().dtype(torch::kFloat32));
     }
 
-    // Copy gt_map to device
-    auto gt_map = torch::from_blob(host_gt_map.data(), {GT_out}, torch::kInt32).clone().to(logits.device());
-
-    // Launch reduction kernel only for the compacted GT_out entries (mapping via gt_map)
+    // Launch reduction kernel only for the compacted GT_out entries
     auto out_accum = torch::zeros({L, B, C, GT_out}, logits.options().dtype(torch::kFloat32));
     {
         dim3 grid(L, B, C);
@@ -254,7 +256,7 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
                     counts.data_ptr<uint8_t>(),
                     out_accum.data_ptr<float>(),
                     total_counts.data_ptr<int32_t>(),
-                    gt_map.data_ptr<int32_t>(),
+                    static_cast<int32_t>(background_index),
                     GT_total,
                     GT_out,
                     B, L
