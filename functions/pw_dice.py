@@ -25,8 +25,9 @@ class PairwiseDiceLossFunction(Function):
         output = mask_loss.forward_pw_dice_loss(
             logits, 
             targets, 
-            smooth,
-            background_index if background_index is not None else -1
+            smooth if smooth is not None else 1.0,
+            background_index if background_index is not None else -1,
+            scale if scale is not None else 1.0
         )
         return output
 

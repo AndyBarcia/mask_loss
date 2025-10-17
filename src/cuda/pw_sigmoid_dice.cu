@@ -10,7 +10,7 @@
 #include "utils.cuh"
 #include "pw_sigmoid_dice.cuh"
 
-torch::Tensor pairwise_sigmoid_dice_loss_forward(
+torch::Tensor pairwise_mask_loss_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
     const float smooth,
@@ -121,7 +121,10 @@ torch::Tensor pairwise_sigmoid_dice_loss_forward(
 
     // Launch reduction kernel only for the compacted GT_out entries
     {
-        dim3 grid(GT_total, C, L*B);
+        dim3 grid(GT_out, C, L*B);
+
+        // Create a pointer to the start of the second slice of out_accum
+        float* out_accum_ptr_offset = out_accum.data_ptr<float>() + L * B * C * GT_out;
 
         auto static_launcher = [&](auto C_val, auto H_val, auto W_val, auto H_t_val) {
             reduce_pairwise_dice_kernel<
@@ -130,7 +133,7 @@ torch::Tensor pairwise_sigmoid_dice_loss_forward(
                 <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
                     logits.data_ptr<float>(),
                     counts.data_ptr<uint8_t>(),
-                    out_accum.data_ptr<float>(),
+                    out_accum_ptr_offset,
                     total_counts.data_ptr<int32_t>(),
                     GT_total,
                     GT_out,

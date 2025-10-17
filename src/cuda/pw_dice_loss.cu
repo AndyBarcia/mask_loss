@@ -13,7 +13,7 @@ template <int C, int H, int W, int H_t>
 __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_dice_kernel(
     const float* __restrict__ logits,               // shape (L, B, C, H, W)
     const uint8_t* __restrict__ counts,             // shape (B, GT_total, H, W)
-    float* __restrict__ out,                        // shapeshape (L, B, C, GT_total)
+    float* __restrict__ out,                        // shapeshape (L, B, C, GT_out)
     const int32_t* __restrict__ total_counts,       // shape (B, GT_total)
     const int GT_total,
     const int GT_out,
@@ -32,6 +32,7 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_d
     const int ci = blockIdx.y; // Logit class index
     const int b = blockIdx.z % B; // Batch index
     const int l = blockIdx.z / B; // Layer index
+    const int tid = threadIdx.x;
 
     // Map to the actual ground-truth label index
     const int gt_actual = MAP_OUT_TO_ACTUAL(out_gt_idx, background_index);
@@ -39,14 +40,13 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_d
     // If the total count for this ground truth label is 0, it's a zero-area mask.
     // Set the loss to infinity and return, matching the Python implementation.
     if (total_counts[b * GT_total + gt_actual] == 0) {
-        if (threadIdx.x == 0) {
+        if (tid == 0) {
             // doScale don't matter; set to infinity
-            out[(b * C + ci) * GT_total + out_gt_idx] = INFINITY;
+            out[((l * B + b) * C + ci) * GT_out + out_gt_idx] = INFINITY;
         }
         return;
     }
 
-    const int tid = threadIdx.x;
     const int s = H_t / H;
     const float N2 = static_cast<float>(s * s);
 
@@ -90,7 +90,7 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_d
         float total_p = s_p_sum[0];
         float total_t = s_t_sum[0];
         float dice = 1.0f - (2.0f * total_intersection + smooth) / (total_p + total_t + smooth);
-        out[((l * B + b) * C + ci) * GT_total + out_gt_idx] = dice * scale;
+        out[((l * B + b) * C + ci) * GT_out + out_gt_idx] = dice * scale;
     }
 }
 
@@ -166,9 +166,9 @@ torch::Tensor pairwise_dice_loss_forward(
     }
 
     // Launch reduction kernel only for the compacted GT_out entries
-    auto out = torch::zeros({L, B, C, GT_total}, logits.options());
+    auto out = torch::zeros({L, B, C, GT_out}, logits.options().dtype(torch::kFloat32));
     {
-        dim3 grid(GT_total, C, L*B);
+        dim3 grid(GT_out, C, L*B);
 
         auto static_launcher = [&](auto C_val, auto H_val, auto W_val, auto H_t_val) {
             reduce_pairwise_dice_kernel<
@@ -189,8 +189,8 @@ torch::Tensor pairwise_dice_loss_forward(
 
         const auto supported_dims = std::make_tuple(
             std::make_tuple(std::integral_constant<int, 128>{}), // C
-            std::make_tuple(std::integral_constant<int, 256>{}),  // H
-            std::make_tuple(std::integral_constant<int, 256>{}),  // W
+            std::make_tuple(std::integral_constant<int, 256>{}), // H
+            std::make_tuple(std::integral_constant<int, 256>{}), // W
             std::make_tuple(std::integral_constant<int, 1024>{}) // H_t
         );
         const auto runtime_dims = std::make_tuple(C, H, W, H_t);

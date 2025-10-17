@@ -61,15 +61,6 @@ torch::Tensor pairwise_dice_loss_forward(
     const float scale = 1.0f
 );
 
-torch::Tensor pairwise_sigmoid_dice_loss_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
-    const float smooth,
-    const float sigmoid_scale = 1.0,
-    const float dice_scale = 1.0,
-    int64_t background_index = -1
-);
-
 std::vector<torch::Tensor> mc_dice_loss_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
@@ -90,6 +81,25 @@ torch::Tensor mc_dice_loss_backward(
     const int num_masks
 );
 
+torch::Tensor pairwise_mask_loss_forward(
+    const torch::Tensor& logits,
+    const torch::Tensor& targets,
+    const float smooth,
+    const float sigmoid_scale = 1.0,
+    const float dice_scale = 1.0,
+    int64_t background_index = -1
+);
+
+torch::Tensor mask_matching(
+    const torch::Tensor& logits,         // (L,B,C,H,W) CUDA
+    const torch::Tensor& targets,        // (B,H_t,W_t) CUDA
+    float   smooth,
+    float   sigmoid_scale   = 1.0f,
+    float   dice_scale      = 1.0f,
+    int64_t background_index= -1,
+    double  inf_thresh      = 1e30
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_sigmoid_ce_loss", &sigmoid_cross_entropy_forward, "Sigmoid Cross Entropy forward (CUDA)");
     m.def("backward_sigmoid_ce_loss", &sigmoid_cross_entropy_backward, "Sigmoid Cross Entropy backward (CUDA)");
@@ -101,5 +111,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_pw_dice_loss", &pairwise_dice_loss_forward, "Dice loss forward (CUDA)");
     m.def("forward_mc_dice_loss", &mc_dice_loss_forward, "Dice loss forward (CUDA)");
     m.def("backward_mc_dice_loss", &mc_dice_loss_backward, "Dice loss backward (CUDA)");
-    m.def("forward_pw_sigmoid_dice_loss", &pairwise_sigmoid_dice_loss_forward, "Dice+Sigmoid loss forward (CUDA)");
+    m.def("pairwise_mask_loss_forward", &pairwise_mask_loss_forward, "Dice+Sigmoid loss forward (CUDA)");
+    m.def("mask_matching", &mask_matching, "Mask matching using OR-Tools (CUDA)");
 }
