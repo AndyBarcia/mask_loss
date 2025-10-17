@@ -9,8 +9,8 @@
 #include "utils.h"
 #include "utils.cuh"
 
-template <int C, int H, int W, int H_t>
-__global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kernel(
+template <int C, int H, int W, int H_t, int W_t>
+__global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_sigmoid_kernel(
     const float* __restrict__ logits,           // shape (L, B, C, H, W)
     const uint8_t* __restrict__ counts,         // shape (B, GT_total, H, W)
     float* __restrict__ out,                    // shape (L, B, C, GT_out)
@@ -19,7 +19,8 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
     const int GT_total,
     const int GT_out,
     const int B,
-    const int L
+    const int L,
+    const float scale
 ) {
     constexpr int TILE_H = 32;
     constexpr int TILE_W = 32;
@@ -81,8 +82,9 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
 
     // Compute GT-dependent terms
     for (int out_gt_idx = 0; out_gt_idx < GT_out; ++out_gt_idx) {
-        const int gt_actual = map_out_to_actual(out_gt_idx, background_index);
+        const int gt_actual = MAP_OUT_TO_ACTUAL(out_gt_idx, background_index);
         if (total_counts[b*GT_total + gt_actual] == 0) {
+            // doScale don't matter; set to infinity
             if (tid == 0)
                 out[((l*B + b)*C + ci)*GT_out + out_gt_idx] = INFINITY;
             continue;
@@ -128,7 +130,8 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
             __syncthreads();
         }
         if (tid == 0) {
-            out[((l*B + b)*C + ci)*GT_out + out_gt_idx] = base_sum + s_warp[0];
+            float v = (base_sum + s_warp[0]) / static_cast<float>(H_t * W_t);
+            out[((l*B + b)*C + ci)*GT_out + out_gt_idx] = v * scale;
         }
     }
 }
@@ -136,7 +139,8 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_loss_kerne
 torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
-    int64_t background_index = -1
+    int64_t background_index = -1,
+    const float scale = 1.0f
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -202,42 +206,41 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     }
 
     // Launch reduction kernel only for the compacted GT_out entries
-    auto out_accum = torch::zeros({L, B, C, GT_out}, logits.options().dtype(torch::kFloat32));
+    auto out = torch::zeros({L, B, C, GT_out}, logits.options().dtype(torch::kFloat32));
     {
         dim3 grid(L, B, C);
 
-        auto static_launcher = [&](auto C_val, auto H_val, auto W_val, auto H_t_val) {
-            reduce_loss_kernel<
+        auto static_launcher = [&](auto C_val, auto H_val, auto W_val, auto H_t_val, auto W_t_val) {
+            reduce_pairwise_sigmoid_kernel<
                 decltype(C_val)::value, decltype(H_val)::value,
-                decltype(W_val)::value, decltype(H_t_val)::value>
+                decltype(W_val)::value, decltype(H_t_val)::value, 
+                decltype(W_t_val)::value>
                 <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
                     logits.data_ptr<float>(),
                     counts.data_ptr<uint8_t>(),
-                    out_accum.data_ptr<float>(),
+                    out.data_ptr<float>(),
                     total_counts.data_ptr<int32_t>(),
                     static_cast<int32_t>(background_index),
                     GT_total,
                     GT_out,
-                    B, L
+                    B, L, scale
                 );
         };
 
         const auto supported_dims = std::make_tuple(
-            std::make_tuple(std::integral_constant<int, 128>{}), // C
+            std::make_tuple(std::integral_constant<int, 128>{}),  // C
             std::make_tuple(std::integral_constant<int, 256>{}),  // H
             std::make_tuple(std::integral_constant<int, 256>{}),  // W
-            std::make_tuple(std::integral_constant<int, 1024>{}) // H_t
+            std::make_tuple(std::integral_constant<int, 1024>{}), // H_t
+            std::make_tuple(std::integral_constant<int, 1024>{})  // W_t
         );
         // W_t is not needed by reduce_loss_kernel, so we only pass needed dims
-        const auto runtime_dims = std::make_tuple(C, H, W, H_t);
+        const auto runtime_dims = std::make_tuple(C, H, W, H_t, W_t);
         dispatch_kernel(static_launcher, runtime_dims, supported_dims);
     }
 
     err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after reduce kernel: ", cudaGetErrorString(err));
 
-    // Normalize by total high-res pixels per block (H_t * W_t)
-    auto out_final = out_accum.to(logits.options().dtype(torch::kFloat32)) / static_cast<float>(H_t * W_t);
-
-    return out_final;
+    return out;
 }

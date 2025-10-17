@@ -16,7 +16,8 @@ torch::Tensor sigmoid_cross_entropy_backward(
 torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
-    const int64_t background_index = -1
+    int64_t background_index = -1,
+    const float scale = 1.0f
 );
 
 torch::Tensor mc_sigmoid_cross_entropy_forward(
@@ -56,7 +57,17 @@ torch::Tensor pairwise_dice_loss_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
     const float smooth,
-    const int64_t background_index = -1
+    int64_t background_index = -1,
+    const float scale = 1.0f
+);
+
+torch::Tensor pairwise_sigmoid_dice_loss_forward(
+    const torch::Tensor& logits,
+    const torch::Tensor& targets,
+    const float smooth,
+    const float sigmoid_scale = 1.0,
+    const float dice_scale = 1.0,
+    int64_t background_index = -1
 );
 
 std::vector<torch::Tensor> mc_dice_loss_forward(
@@ -90,4 +101,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_pw_dice_loss", &pairwise_dice_loss_forward, "Dice loss forward (CUDA)");
     m.def("forward_mc_dice_loss", &mc_dice_loss_forward, "Dice loss forward (CUDA)");
     m.def("backward_mc_dice_loss", &mc_dice_loss_backward, "Dice loss backward (CUDA)");
+    m.def("forward_pw_sigmoid_dice_loss", &pairwise_sigmoid_dice_loss_forward, "Dice+Sigmoid loss forward (CUDA)");
 }

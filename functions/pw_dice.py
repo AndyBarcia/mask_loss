@@ -14,7 +14,7 @@ except ImportError:
 
 class PairwiseDiceLossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, smooth=1.0, background_index=None):
+    def forward(ctx, logits, targets, smooth, background_index, scale):
         L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
@@ -28,17 +28,13 @@ class PairwiseDiceLossFunction(Function):
             smooth,
             background_index if background_index is not None else -1
         )
-        ctx.background_index = background_index
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        if ctx.background_index is not None:
-            return None, None, None
-        else:
-            return None, None
+        return None, None, None, None, None
 
-def pairwise_dice_loss_py(logits, targets, smooth=1.0, background_index=None):
+def pairwise_dice_loss_py(logits, targets, smooth=1.0, background_index=None, scale=1.0):
     """
     Computes the pairwise Dice loss.
 
@@ -136,4 +132,4 @@ def pairwise_dice_loss_py(logits, targets, smooth=1.0, background_index=None):
             inf_tensor
         )
 
-    return pairwise_loss
+    return pairwise_loss * scale
