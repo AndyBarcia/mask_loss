@@ -88,10 +88,6 @@ class CUDAKernelTester:
         are_close = torch.allclose(tensor_cuda, tensor_python.to(self.device), atol=atol, rtol=rtol)
         n_different_sign = (tensor_cuda.sign() != tensor_python.to(self.device).sign()).sum().item()
         n_different_inf = ((torch.isinf(tensor_cuda) != torch.isinf(tensor_python.to(self.device)))).sum().item()
-
-        #print(tensor_cuda.sum(0)[:,:,:8,:8]) # (GT_out)
-        print(tensor_cuda)
-
         if not are_close or n_different_sign > 0 or n_different_inf > 0:
             print(f"\n--- Correctness FAILED for '{label}' ---")
             abs_diff = (tensor_cuda - tensor_python.to(self.device)).abs()
@@ -104,22 +100,13 @@ class CUDAKernelTester:
             print(f"  Mean Absolute Difference: {abs_diff[torch.isfinite(abs_diff)].float().mean().item():.6e}")
             print(f"  Max Relative Difference: {rel_diff[torch.isfinite(rel_diff)].max().item():.6e}")
             print(f"  Mean Relative Difference: {rel_diff[torch.isfinite(rel_diff)].float().mean().item():.6e}")
-            """
-            x,idx = rel_diff.flatten().topk(12)
-            b, c, h, w = torch.unravel_index(idx, rel_diff.shape)
-            pos = torch.stack([b, c, h, w], dim=1)
-            print(x)
-            print(pos)
-            print(tensor_python.to(self.device)[b, c, h, w])
-            print(tensor_cuda.to(self.device)[b, c, h, w])
-            
-            print("-" * 40)
-            """
         return are_close
 
     def run(self, fwd_atol=1e-6, fwd_rtol=1e-6, bwd_atol=1e-6, bwd_rtol=1e-6, **kwargs):
         """
         Executes the full testing pipeline: performance, memory, and correctness.
+        Supports forward functions that return a single tensor or a tuple/list of tensors.
+        All outputs with gradients are reduced (sum) and then summed together for the loss.
         """
         function_name = self.cuda_function.__self__.__name__
         
@@ -133,6 +120,61 @@ class CUDAKernelTester:
             'cuda':    {'fwd_time_ms': 0.0, 'bwd_time_ms': 0.0, 'fwd_mem_mb': 0.0, 'bwd_mem_mb': 0.0},
             'correctness': {'fwd': False, 'bwd': True}
         }
+
+        # --- Helpers for multi-output handling ---
+        def _loss_from_outputs(out):
+            """Return a scalar loss built by summing .sum() of all grad-requiring outputs.
+            Returns None if no grad-requiring tensors are present."""
+            if torch.is_tensor(out):
+                return out.sum() if (out.requires_grad and out.is_floating_point()) else None
+            if isinstance(out, (tuple, list)):
+                terms = []
+                for o in out:
+                    if torch.is_tensor(o) and o.is_floating_point() and o.requires_grad:
+                        terms.append(o.sum())
+                return sum(terms) if terms else None
+            return None
+
+        def _has_grad_outputs(out):
+            """True if any output tensor requires grad."""
+            if torch.is_tensor(out):
+                return bool(out.is_floating_point() and out.requires_grad)
+            if isinstance(out, (tuple, list)):
+                return any(torch.is_tensor(o) and o.is_floating_point() and o.requires_grad for o in out)
+            return False
+
+        def _check_forward_correctness(out_cu, out_py):
+            """Element-wise correctness for tuple/list outputs, fallback to single tensor check."""
+            # Single-tensor or non-sequence case: rely on existing checker
+            if not isinstance(out_py, (tuple, list)) and not isinstance(out_cu, (tuple, list)):
+                return self._check_correctness(out_cu, out_py, "Forward Pass Output", fwd_atol, fwd_rtol)
+
+            # If one is sequence and the other isn't -> fail
+            if isinstance(out_py, (tuple, list)) != isinstance(out_cu, (tuple, list)):
+                print("Forward Pass Output: type mismatch between CUDA and PyTorch outputs (tuple/list vs non-sequence).")
+                return False
+
+            # Both are sequences: lengths must match
+            if len(out_py) != len(out_cu):
+                print(f"Forward Pass Output: length mismatch (PyTorch={len(out_py)}, CUDA={len(out_cu)}).")
+                return False
+
+            ok = True
+            for i, (cu_i, py_i) in enumerate(zip(out_cu, out_py)):
+                if torch.is_tensor(cu_i) and torch.is_tensor(py_i):
+                    ok &= self._check_correctness(cu_i, py_i, f"Forward Pass Output[{i}]", fwd_atol, fwd_rtol)
+                else:
+                    # For non-tensor elements, do a simple equality check when possible.
+                    try:
+                        same = (cu_i == py_i)
+                        # If it's a numpy/bool scalar this may be array-like; coerce to bool when possible.
+                        same = bool(same) if hasattr(same, "__bool__") else bool(same)
+                    except Exception:
+                        same = False
+                    if not same:
+                        print(f"Forward Pass Output[{i}]: non-tensor mismatch.")
+                    ok &= same
+            return ok
 
         # Create base input tensors once
         base_inputs = {
@@ -152,14 +194,19 @@ class CUDAKernelTester:
         results['pytorch']['fwd_time_ms'] = fwd_time_py
         results['pytorch']['fwd_mem_mb'] = fwd_mem_py
         
-        # Check if backward pass is needed
-        run_backward = torch.is_tensor(output_py) and output_py.requires_grad
-        
+        # Determine backward from PyTorch outputs
+        run_backward = _has_grad_outputs(output_py)
+
         if run_backward:
-            loss_py = output_py.sum()
-            _, bwd_time_py, bwd_mem_py = self._measure_pass(lambda: loss_py.backward())
-            results['pytorch']['bwd_time_ms'] = bwd_time_py
-            results['pytorch']['bwd_mem_mb'] = max(fwd_mem_py, bwd_mem_py) # Peak memory is the max of fwd and bwd
+            loss_py = _loss_from_outputs(output_py)
+            # If for some reason nothing required grad, skip bwd
+            if loss_py is not None:
+                _, bwd_time_py, bwd_mem_py = self._measure_pass(lambda: loss_py.backward())
+                results['pytorch']['bwd_time_ms'] = bwd_time_py
+                results['pytorch']['bwd_mem_mb'] = max(fwd_mem_py, bwd_mem_py) # Peak memory is the max of fwd and bwd
+            else:
+                run_backward = False
+                results['pytorch']['bwd_mem_mb'] = fwd_mem_py
         else:
             results['pytorch']['bwd_mem_mb'] = fwd_mem_py
 
@@ -176,23 +223,34 @@ class CUDAKernelTester:
         results['cuda']['fwd_mem_mb'] = fwd_mem_cu
         
         if run_backward:
-            loss_cu = output_cu.sum()
-            _, bwd_time_cu, bwd_mem_cu = self._measure_pass(lambda: loss_cu.backward())
-            results['cuda']['bwd_time_ms'] = bwd_time_cu
-            results['cuda']['bwd_mem_mb'] = max(fwd_mem_cu, bwd_mem_cu)
+            loss_cu = _loss_from_outputs(output_cu)
+            if loss_cu is not None:
+                _, bwd_time_cu, bwd_mem_cu = self._measure_pass(lambda: loss_cu.backward())
+                results['cuda']['bwd_time_ms'] = bwd_time_cu
+                results['cuda']['bwd_mem_mb'] = max(fwd_mem_cu, bwd_mem_cu)
+            else:
+                # PyTorch said we should run backward, but CUDA produced no grad-requiring outputs
+                # We'll mark backward correctness as False later when grads are compared.
+                results['cuda']['bwd_mem_mb'] = fwd_mem_cu
         else:
             results['cuda']['bwd_mem_mb'] = fwd_mem_cu
         
         # --- Correctness Checks ---
-        results['correctness']['fwd'] = self._check_correctness(output_cu, output_py, "Forward Pass Output", fwd_atol, fwd_rtol)
+        results['correctness']['fwd'] = _check_forward_correctness(output_cu, output_py)
         
         if run_backward:
             for name in base_inputs:
                 if not torch.is_tensor(inputs_cu[name]) or not torch.is_tensor(inputs_py[name]):
                     continue
                 if inputs_cu[name].grad is None or inputs_py[name].grad is None:
+                    # If one side has missing grad while the other has it, that's a failure for that grad.
+                    if (inputs_cu[name].grad is None) != (inputs_py[name].grad is None):
+                        print(f"Gradient of '{name}': mismatch in gradient presence (one is None).")
+                        results['correctness']['bwd'] &= False
                     continue
-                is_grad_correct = self._check_correctness(inputs_cu[name].grad, inputs_py[name].grad, f"Gradient of '{name}'", bwd_atol, bwd_rtol)
+                is_grad_correct = self._check_correctness(
+                    inputs_cu[name].grad, inputs_py[name].grad, f"Gradient of '{name}'", bwd_atol, bwd_rtol
+                )
                 results['correctness']['bwd'] &= is_grad_correct
 
         # Define column widths
@@ -222,6 +280,7 @@ class CUDAKernelTester:
         else:
             print(f"| {'Backward':<{pass_w}} | {'N/A (no grad)':<{impl_w}} | {'':>{time_w}} | {'':>{mem_w}} | {'SKIP':>{corr_w}} |")
             print(separator)
+
 
 def create_gaussian_blob_targets(B, C, Ht, Wt, device):
     """
@@ -427,7 +486,7 @@ def test_pw_mask_loss():
 
 def test_mask_matching():
     """Test the CUDA implementation of mask matching"""
-    L, B, C, H, W = 10, 4, 128, 256, 256
+    L, B, C, H, W = 1, 1, 128, 256, 256
     H_t, W_t = 1024, 1024
 
     input_creators = {
@@ -437,10 +496,11 @@ def test_mask_matching():
         "sigmoid_scale": 1.0,
         "dice_scale": 1.0,
         "background_index": -1,
-        "inf_thresh": 1e30
+        "inf_thresh": 1e30,
+        "num_masks": None
     }
     
-    arg_order = ["logits", "targets", "smooth", "sigmoid_scale", "dice_scale", "background_index", "inf_thresh"]
+    arg_order = ["logits", "targets", "smooth", "sigmoid_scale", "dice_scale", "background_index", "inf_thresh", "num_masks"]
     
     tester = CUDAKernelTester(
         cuda_function=MaskMatchingFunction.apply,

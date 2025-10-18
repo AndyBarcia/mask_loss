@@ -27,7 +27,8 @@ class MaskMatchingFunction(Function):
         sigmoid_scale,
         dice_scale,
         background_index, 
-        inf_thresh
+        inf_thresh,
+        num_masks
     ):
         L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
@@ -42,13 +43,14 @@ class MaskMatchingFunction(Function):
             sigmoid_scale if sigmoid_scale is not None else 1.0,
             dice_scale if dice_scale is not None else 1.0,
             background_index if background_index is not None else -1,
-            inf_thresh if inf_thresh is not None else 1e30
+            inf_thresh if inf_thresh is not None else 1e30,
+            num_masks if num_masks is not None else -1,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
 
 def mask_matching(
     logits,         # (L,B,C,H,W) CUDA
@@ -57,7 +59,8 @@ def mask_matching(
     sigmoid_scale   = 1.0,
     dice_scale      = 1.0,
     background_index= -1,
-    inf_thresh      = 1e30
+    inf_thresh      = 1e30,
+    num_masks       = None,
 ):
     L, B, C, H, W = logits.shape
 
@@ -120,4 +123,33 @@ def mask_matching(
                 pred_row = int(c)                   # prediction row (0..C-1)
                 matches[l, b, gt_col] = pred_row
 
-    return matches  # (L,B,GT_out)
+    # Aggregate losses using assignments
+    assigned = matches.ge(0)                          # (L,B,GT)
+    matched = int(assigned.sum().item())              # local matched GTs
+
+    layer_mask_sum = torch.zeros(L, device=logits.device, dtype=logits.dtype)
+    layer_dice_sum = torch.zeros(L, device=logits.device, dtype=logits.dtype)
+
+    if matched > 0:
+        idx = assigned.nonzero(as_tuple=False)        # (N,3): [l,b,g]
+        l_idx = idx[:, 0]
+        b_idx = idx[:, 1]
+        g_idx = idx[:, 2]
+        p_idx = matches[assigned].to(torch.long)      # (N,)
+
+        sig_vals  = sigmoid_cost[l_idx, b_idx, p_idx, g_idx]
+        dice_vals = dice_cost[l_idx, b_idx, p_idx, g_idx]
+
+        layer_mask_sum.index_add_(0, l_idx, sig_vals)
+        layer_dice_sum.index_add_(0, l_idx, dice_vals)
+
+    denom = float(num_masks) if (num_masks is not None and num_masks > 0) else float(matched)
+    if denom <= 0:
+        denom = 1.0
+
+    layer_mask_mean = layer_mask_sum / denom          # (L,)
+    layer_dice_mean = layer_dice_sum / denom          # (L,)
+    loss = (layer_mask_sum.sum() + layer_dice_sum.sum()) / denom  # (1,)
+
+    # Return exactly like the C++ ext now does
+    return matches, loss.view(1), layer_mask_mean, layer_dice_mean

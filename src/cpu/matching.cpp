@@ -108,17 +108,19 @@ static inline void hungarian_assignment(
     }
 }
 
-torch::Tensor mask_matching(
+std::vector<torch::Tensor> mask_matching(
     const torch::Tensor& logits,         // (L,B,C,H,W) CUDA
     const torch::Tensor& targets,        // (B,H_t,W_t) CUDA
     float   smooth,
     float   sigmoid_scale   = 1.0f,
     float   dice_scale      = 1.0f,
     int64_t background_index= -1,
-    double  inf_thresh      = 1e30
+    double  inf_thresh      = 1e30,
+    int64_t num_masks       = -1
 ) {
     TORCH_CHECK(logits.is_cuda(), "logits must be CUDA");
     const auto device = logits.device();
+    const auto dtype  = logits.dtype();
 
     // Get the mask and dice pairwise costs, shape {2, L, B, C, GT_out}
     torch::Tensor costs2 = pairwise_mask_loss_forward(
@@ -168,14 +170,54 @@ torch::Tensor mask_matching(
 
             torch::Tensor host = torch::empty({C, GT}, pinned_opts);
             host.copy_(slice.to(torch::kDouble), /*non_blocking=*/true);
-            stream.synchronize(); // wait for this slice's copy only
+            stream.synchronize();
 
-            // Solve LAP and write dense GT->pred mapping
             auto* out_ptr_lb = out_ptr + ((l * B) + b) * GT;
             hungarian_assignment(host.data_ptr<double>(), C, GT, inf_thresh, out_ptr_lb);
         }
     });
 
-    // Return on same device as logits
-    return gt_to_pred_cpu.to(device, /*non_blocking=*/false);
+    // Convert matches to CUDA
+    torch::Tensor matches = gt_to_pred_cpu.to(device, /*non_blocking=*/false);
+
+    // Aggregate per-layer sigmoid/dice using assignments
+    torch::Tensor assigned = matches.ge(0);                       // (L,B,GT)
+    const int64_t matched = assigned.sum().item<int64_t>();       // local matched GTs
+
+    torch::Tensor layer_mask_sum = torch::zeros({L}, device).to(costs2.dtype());
+    torch::Tensor layer_dice_sum = torch::zeros({L}, device).to(costs2.dtype());
+
+    if (matched > 0) {
+        // idx: (N,3) with [l,b,g]
+        torch::Tensor idx = assigned.nonzero();                   // CUDA int64
+        auto l_idx = idx.select(1, 0);
+        auto b_idx = idx.select(1, 1);
+        auto g_idx = idx.select(1, 2);
+
+        // p: (N,) prediction rows
+        torch::Tensor p_idx = matches.masked_select(assigned).to(torch::kLong);
+
+        // Gather values
+        torch::Tensor sig_vals  = costs2.index({0, l_idx, b_idx, p_idx, g_idx});
+        torch::Tensor dice_vals = costs2.index({1, l_idx, b_idx, p_idx, g_idx});
+
+        // Scatter-add into per-layer sums
+        layer_mask_sum.index_add_(0, l_idx, sig_vals);
+        layer_dice_sum.index_add_(0, l_idx, dice_vals);
+    }
+
+    // Normalization
+    const double denom_val = (num_masks > 0) ? static_cast<double>(num_masks) : static_cast<double>(matched);
+    const double safe_denom = (denom_val > 0.0) ? denom_val : 1.0;
+
+    torch::Tensor denom = torch::tensor({safe_denom}, device).to(costs2.dtype());
+    torch::Tensor layer_mask_mean = layer_mask_sum / denom;       // (L,)
+    torch::Tensor layer_dice_mean = layer_dice_sum / denom;       // (L,)
+    torch::Tensor loss = (layer_mask_sum.sum() + layer_dice_sum.sum()) / denom; // (1,)
+
+    loss = loss.to(dtype);
+    layer_mask_mean = layer_mask_mean.to(dtype);
+    layer_dice_mean = layer_dice_mean.to(dtype);
+
+    return { matches, loss, layer_mask_mean, layer_dice_mean };
 }

@@ -90,14 +90,15 @@ torch::Tensor pairwise_mask_loss_forward(
     int64_t background_index = -1
 );
 
-torch::Tensor mask_matching(
+std::vector<torch::Tensor> mask_matching(
     const torch::Tensor& logits,         // (L,B,C,H,W) CUDA
     const torch::Tensor& targets,        // (B,H_t,W_t) CUDA
     float   smooth,
     float   sigmoid_scale   = 1.0f,
     float   dice_scale      = 1.0f,
     int64_t background_index= -1,
-    double  inf_thresh      = 1e30
+    double  inf_thresh      = 1e30,
+    int64_t num_masks       = -1
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
