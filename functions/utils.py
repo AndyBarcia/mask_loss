@@ -1,3 +1,7 @@
+import torch
+import torch.nn.functional as F
+
+
 def calculate_uncertainty(logits):
     assert logits.shape[1] == 1
     gt_class_logits = logits.clone()
