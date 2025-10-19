@@ -213,11 +213,14 @@ std::vector<torch::Tensor> mask_matching(
     torch::Tensor denom = torch::tensor({safe_denom}, device).to(costs2.dtype());
     torch::Tensor layer_mask_mean = layer_mask_sum / denom;       // (L,)
     torch::Tensor layer_dice_mean = layer_dice_sum / denom;       // (L,)
-    torch::Tensor loss = (layer_mask_sum.sum() + layer_dice_sum.sum()) / denom; // (1,)
 
-    loss = loss.to(dtype);
     layer_mask_mean = layer_mask_mean.to(dtype);
     layer_dice_mean = layer_dice_mean.to(dtype);
 
-    return { matches, loss, layer_mask_mean, layer_dice_mean };
+    auto matched_tensor = torch::scalar_tensor(
+        matched,
+        torch::TensorOptions().dtype(torch::kLong).device(device)
+    );
+
+    return { matches, layer_mask_mean, layer_dice_mean, matched_tensor };
 }

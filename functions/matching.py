@@ -7,14 +7,13 @@ from torch.autograd import Function
 from torch.utils.checkpoint import checkpoint
 
 from .pw_sigmoid_ce import (
-    pairwise_sigmoid_cross_entropy_loss_py, 
+    pairwise_sigmoid_cross_entropy_loss_py,
     pairwise_sigmoid_cross_entropy_loss_sampling_py
 )
 from .pw_dice import (
     pairwise_dice_loss_py,
     pairwise_dice_loss_sampling_py
 )
-
 from scipy.optimize import linear_sum_assignment
 
 try:
@@ -40,23 +39,84 @@ class MaskMatchingFunction(Function):
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
         
-        logits = logits.contiguous().float()
-        targets = targets.contiguous()
-        output = mask_loss.mask_matching(
-            logits, 
-            targets,
-            smooth if smooth is not None else 1.0,
-            sigmoid_scale if sigmoid_scale is not None else 1.0,
-            dice_scale if dice_scale is not None else 1.0,
-            background_index if background_index is not None else -1,
-            inf_thresh if inf_thresh is not None else 1e30,
-            num_masks if num_masks is not None else -1,
+        logits_f32 = logits.contiguous()
+        if logits_f32.dtype != torch.float32:
+            logits_f32 = logits_f32.to(torch.float32)
+        targets_i64 = targets.contiguous()
+
+        smooth_val = float(smooth if smooth is not None else 1.0)
+        sigmoid_scale_val = float(sigmoid_scale if sigmoid_scale is not None else 1.0)
+        dice_scale_val = float(dice_scale if dice_scale is not None else 1.0)
+        background_index_val = int(background_index if background_index is not None else -1)
+        inf_thresh_val = float(inf_thresh if inf_thresh is not None else 1e30)
+        num_masks_val = int(num_masks if num_masks is not None else -1)
+
+        matches, layer_mask_mean, layer_dice_mean, matched = mask_loss.mask_matching(
+            logits_f32,
+            targets_i64,
+            smooth_val,
+            sigmoid_scale_val,
+            dice_scale_val,
+            background_index_val,
+            inf_thresh_val,
+            num_masks_val,
         )
-        return output
+
+        ctx.save_for_backward(logits_f32.detach(), targets_i64.detach(), matches.detach())
+        ctx.logits_dtype = logits.dtype
+        ctx.smooth = smooth_val
+        ctx.sigmoid_scale = sigmoid_scale_val
+        ctx.dice_scale = dice_scale_val
+        ctx.background_index = background_index_val
+        ctx.num_masks = num_masks_val
+        ctx.matched = int(matched.item()) if matched.numel() > 0 else 0
+
+        return matches, layer_mask_mean, layer_dice_mean
 
     @staticmethod
-    def backward(ctx, grad_output):
-        return None, None, None, None, None, None, None, None
+    def backward(ctx, grad_matches, grad_layer_mask_mean, grad_layer_dice_mean):
+        logits, targets, matches = ctx.saved_tensors
+        logits_dtype = ctx.logits_dtype
+        smooth = ctx.smooth
+        sigmoid_scale = ctx.sigmoid_scale
+        dice_scale = ctx.dice_scale
+        background_index = ctx.background_index
+        num_masks = ctx.num_masks
+
+        L = logits.shape[0]
+
+        device = logits.device
+        dtype = logits.dtype
+
+        grad_mask_tensor = (
+            grad_layer_mask_mean
+            if grad_layer_mask_mean is not None
+            else torch.zeros(L, device=device, dtype=dtype)
+        ).to(device=device, dtype=dtype).contiguous()
+        grad_dice_tensor = (
+            grad_layer_dice_mean
+            if grad_layer_dice_mean is not None
+            else torch.zeros(L, device=device, dtype=dtype)
+        ).to(device=device, dtype=dtype).contiguous()
+
+        grad_logits = mask_loss.mask_matching_backward(
+            grad_mask_tensor,
+            grad_dice_tensor,
+            logits,
+            targets,
+            matches.contiguous(),
+            smooth,
+            sigmoid_scale,
+            dice_scale,
+            background_index,
+            num_masks,
+            ctx.matched,
+        )
+
+        if grad_logits.dtype != logits_dtype:
+            grad_logits = grad_logits.to(logits_dtype)
+
+        return grad_logits, None, None, None, None, None, None, None
 
 @torch.no_grad
 def mask_matching_py(
@@ -156,10 +216,9 @@ def mask_matching_py(
 
     layer_mask_mean = layer_mask_sum / denom          # (L,)
     layer_dice_mean = layer_dice_sum / denom          # (L,)
-    loss = (layer_mask_sum.sum() + layer_dice_sum.sum()) / denom  # (1,)
-
     # Return exactly like the C++ ext now does
-    return matches, loss.view(1), layer_mask_mean, layer_dice_mean
+    matched_tensor = torch.tensor(matched, device=logits.device, dtype=torch.long)
+    return matches, layer_mask_mean, layer_dice_mean, matched_tensor
 
 @torch.no_grad
 def mask_matching_sampling_py(
@@ -259,7 +318,5 @@ def mask_matching_sampling_py(
 
     layer_mask_mean = layer_mask_sum / denom          # (L,)
     layer_dice_mean = layer_dice_sum / denom          # (L,)
-    loss = (layer_mask_sum.sum() + layer_dice_sum.sum()) / denom  # (1,)
-
-    # Return exactly like the C++ ext now does
-    return matches, loss.view(1), layer_mask_mean, layer_dice_mean
+    matched_tensor = torch.tensor(matched, device=logits.device, dtype=torch.long)
+    return matches, layer_mask_mean, layer_dice_mean, matched_tensor
