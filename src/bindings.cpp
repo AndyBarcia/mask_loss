@@ -101,6 +101,20 @@ std::vector<torch::Tensor> mask_matching(
     int64_t num_masks       = -1
 );
 
+torch::Tensor mask_matching_backward(
+    const torch::Tensor& grad_layer_mask_mean,
+    const torch::Tensor& grad_layer_dice_mean,
+    const torch::Tensor& logits,
+    const torch::Tensor& targets,
+    const torch::Tensor& matches,
+    float   smooth,
+    float   sigmoid_scale   = 1.0f,
+    float   dice_scale      = 1.0f,
+    int64_t background_index= -1,
+    int64_t num_masks       = -1,
+    int64_t matched_count   = 0
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_sigmoid_ce_loss", &sigmoid_cross_entropy_forward, "Sigmoid Cross Entropy forward (CUDA)");
     m.def("backward_sigmoid_ce_loss", &sigmoid_cross_entropy_backward, "Sigmoid Cross Entropy backward (CUDA)");
@@ -114,4 +128,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_mc_dice_loss", &mc_dice_loss_backward, "Dice loss backward (CUDA)");
     m.def("pairwise_mask_loss_forward", &pairwise_mask_loss_forward, "Dice+Sigmoid loss forward (CUDA)");
     m.def("mask_matching", &mask_matching, "Mask matching using OR-Tools (CUDA)");
+    m.def("mask_matching_backward", &mask_matching_backward, "Mask matching backward (CUDA)");
 }
+
