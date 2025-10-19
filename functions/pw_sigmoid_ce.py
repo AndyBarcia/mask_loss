@@ -2,11 +2,10 @@ import math
 import torch
 import torch.nn.functional as F
 from torch.autograd import Function
-from einops import rearrange, einsum
 from torch.autograd import Function
 from torch.utils.checkpoint import checkpoint
 
-from .utils import point_sample
+from .utils import point_sample, counts_per_cell_per_class
 
 try:
     import mask_loss
@@ -133,36 +132,6 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(logits, targets, backgrou
 
     return pairwise_loss * scale
 
-@torch.no_grad()
-def _counts_per_cell_per_class(targets_long, h, w, s, GT_all):
-    """
-    targets_long: (B, H_t, W_t) long
-    Returns counts: (B, h*w, GT_all) with the number of pixels of each GT class
-    inside every downsampled cell.
-    """
-    B, H_t, W_t = targets_long.shape
-    N2 = s * s
-    J = h * w  # number of coarse cells per image
-
-    # Split target into s×s blocks matching each coarse logit cell: (B, N2, J)
-    patches = rearrange(
-        targets_long, 'b (h s1) (w s2) -> b (s1 s2) (h w)', s1=s, s2=s
-    )  # (B, N2, J)
-
-    # Global cell index (0..B*J-1) for every pixel inside each cell
-    # shape (B, N2, J) -> flatten to (B*N2*J,)
-    j_ids   = torch.arange(J, device=targets_long.device).view(1, 1, J).expand(B, N2, J)
-    b_offs  = (torch.arange(B, device=targets_long.device) * J).view(B, 1, 1).expand(B, N2, J)
-    global_cell = (b_offs + j_ids).reshape(-1)                           # (B*N2*J,)
-    classes_flat = patches.reshape(-1).to(torch.long)                    # (B*N2*J,)
-
-    # Bin by (global_cell, class) via a single bincount on packed keys
-    keys = global_cell * GT_all + classes_flat                            # (B*N2*J,)
-    counts = torch.bincount(
-        keys, minlength=B * J * GT_all
-    ).view(B * J, GT_all).view(B, J, GT_all)                             # (B, J, GT_all)
-    return counts
-
 
 def pairwise_sigmoid_cross_entropy_loss_py(logits, targets, background_index=None, scale=1.0):
     """
@@ -228,7 +197,7 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets, background_index=Non
         # No valid labels: return an empty last dim
         return logits.new_empty((L, B, C, 0))
 
-    counts_all = _counts_per_cell_per_class(targets_long, h, w, s, GT_all)  # (B, J, GT_all)
+    counts_all = counts_per_cell_per_class(targets_long, h, w, s, GT_all)  # (B, J, GT_all)
 
     # Select GT columns (optionally drop background)
     if background_index is None:

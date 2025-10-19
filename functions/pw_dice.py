@@ -6,6 +6,8 @@ from einops import rearrange, einsum
 from torch.autograd import Function
 from torch.utils.checkpoint import checkpoint
 
+from .utils import point_sample, counts_per_cell_per_class
+
 try:
     import mask_loss
 except ImportError:
@@ -35,102 +37,182 @@ class PairwiseDiceLossFunction(Function):
     def backward(ctx, grad_output):
         return None, None, None, None, None
 
-def pairwise_dice_loss_py(logits, targets, smooth=1.0, background_index=None, scale=1.0):
+def pairwise_dice_loss_py(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    smooth: float = 1.0,
+    background_index: int = None,
+    scale: float = 1.0,
+):
     """
-    Computes the pairwise Dice loss.
+    Pairwise Dice loss without upsampling or per-class loops.
 
-    This function calculates the Dice loss for each predicted class against every
-    possible ground truth class. It upsamples the logits to the resolution of the
-    targets, creates a one-hot representation for each potential target class,
-    and then computes the Dice loss.
-
-    Args:
-        logits (torch.Tensor): A tensor of shape (L, B, C, h, w) representing the
-                        predicted logits for each class. B is the batch size,
-                        C is the number of classes, and h, w are the spatial
-                        dimensions of the logits.
-        targets (torch.Tensor): A tensor of shape (B, H_t, W_t) with integer
-                        labels for the ground truth. H_t and W_t are the
-                        spatial dimensions of the targets.
-        smooth (float): A small value added to the numerator and denominator
-                        for numerical stability.
-        background_index (Optional[int]): The index that corresponds to the background
-                        to be ignored. If not provided, all classses are
-                        computed normally. If specified, the output tensor
-                        has the column corresponding to the background removed.
+    Shapes:
+      logits:  (L, B, C, h, w)
+      targets: (B, H_t, W_t) integer labels
 
     Returns:
-        torch.Tensor: A tensor of shape (L, B, C, max_GT) where max_GT is the maximum value
-                      in the targets tensor + 1 if no background index is provided, or
-                      th maximum value in the targets tensor otherwise. It contains the 
-                      pairwise loss for each class against each possible target. For target 
-                      masks with 0 area, a value of infinity is returned.
+      (L, B, C, G) where G = #classes considered (optionally excluding background).
+      Entries are +inf where that class is absent in the image.
     """
+    assert logits.dim() == 5, "logits must have shape (L, B, C, h, w)"
     L, B, C, h, w = logits.shape
-    B_t, H_t, W_t = targets.shape
-    assert B == B_t, "Batch size mismatch between logits and targets"
+    Bt, Ht, Wt = targets.shape
+    assert B == Bt, "Batch size mismatch between logits and targets"
+    assert Ht % h == 0 and Wt % w == 0, "Target dims must be integer multiples of logit dims"
+    sH, sW = Ht // h, Wt // w
+    if sH != sW:
+        raise ValueError("Height/width scale factors must be equal.")
+    s = sH
+    N2 = s * s
+    J = h * w
 
     device = logits.device
-    dtype = logits.dtype
+    dtype  = logits.dtype
 
-    # Upsample logits to match the targets spatial size efficiently:
-    # reshape to (L*B, C, h, w) -> interpolate -> reshape back to (L, B, C, H_t, W_t)
-    logits_reshaped = logits.view(L * B, C, h, w)
-    logits_up = F.interpolate(logits_reshaped, size=(H_t, W_t), mode='nearest')
-    logits_up = logits_up.view(L, B, C, H_t, W_t)  # (L, B, C, H_t, W_t)
-    probs = logits_up.sigmoid()
+    # Flatten spatial and get probabilities at coarse grid
+    z = logits.reshape(L, B, C, J)
+    p = torch.sigmoid(z)                                     # (L,B,C,J)
 
-    targets_long = targets.long().to(device)
-
-    # Determine the full range of GT classes present in the targets
-    gt_max = targets_long.max().item()
+    targets_long = targets.to(device=device, dtype=torch.long, non_blocking=True)
+    gt_max = int(targets_long.max().item()) if targets_long.numel() else -1
     GT_all = gt_max + 1
+    if GT_all <= 0:
+        return logits.new_empty((L, B, C, 0))
 
-    # Build list of ground-truth classes to evaluate, optionally excluding background
+    # Per-cell per-class positive counts k_{b, j, g}
+    counts_all = counts_per_cell_per_class(targets_long, h, w, s, GT_all)  # (B, J, GT_all)
+
+    # Select GT columns (optionally drop background)
     if background_index is None:
-        gt_classes = list(range(GT_all))
+        idxs = torch.arange(GT_all, device=device)
     else:
-        # If background_index is outside the observed range, it has no effect
-        gt_classes = [i for i in range(GT_all) if i != background_index]
+        idxs = torch.tensor([i for i in range(GT_all) if i != background_index],
+                            device=device, dtype=torch.long)
 
-    GT = len(gt_classes)
+    G = int(idxs.numel())
+    if G == 0:
+        return logits.new_empty((L, B, C, 0))
 
-    # Initialize pairwise_loss tensor with infinity
-    pairwise_loss = torch.full((L, B, C, GT), torch.inf, device=device, dtype=dtype)
+    counts = counts_all.index_select(2, idxs)                # (B, J, G)
+    counts_f = counts.to(dtype)                              # float for einsum
 
-    # Iterate over each ground truth class we will evaluate
-    for out_idx, gt_class in enumerate(gt_classes):
-        # Create a binary target mask for the current ground truth class
-        y = (targets_long == gt_class).unsqueeze(1).to(dtype=dtype) # (B, 1, H_t, W_t)
+    # Dice pieces:
+    # intersection = sum_j p_{lbcj} * k_{bjg}
+    inter = torch.einsum('lbcj,bjg->lbcg', p, counts_f)     # (L,B,C,G)
 
-        # Check which batch elements contain this GT class
-        has_class = y.sum(dim=(1, 2, 3)) > 0  # Shape: (B,)
+    # p_sum over full-resolution = sum_j N2 * p_{lbcj}
+    p_sum = (N2 * p).sum(dim=3)                              # (L,B,C)
 
-        if not has_class.any():
-            # No batch element has this class — skip (pairwise_loss stays +inf)
+    # t_sum over full-resolution = sum_j k_{bjg}
+    t_sum = counts.sum(dim=1)                                # (B,G)
+
+    # Dice score and loss
+    denom = p_sum[..., None] + t_sum[None, :, None, :] + smooth
+    dice_score = (2.0 * inter + smooth) / denom
+    dice_loss  = 1.0 - dice_score                            # (L,B,C,G)
+
+    # +inf where class absent in that image
+    present = (t_sum > 0)                                    # (B,G)
+    mask = present.unsqueeze(0).unsqueeze(2).expand(L, B, C, G)
+    out = torch.full_like(dice_loss, float('inf'))
+    out[mask] = dice_loss[mask]
+
+    return out * scale
+
+
+def pairwise_dice_loss_sampling_py(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    smooth: float = 1.0,
+    background_index: int = None,
+    scale: float = 1.0,
+    num_points: int = 5000,
+    align_corners: bool = False,
+):
+    """
+    Pairwise Dice loss with *point sampling*.
+
+    For each image we draw one shared set of random points and evaluate Dice
+    between every (L,C) prediction and each GT class using only those points.
+
+    Shapes:
+      logits:  (L, B, C, h, w)
+      targets: (B, H_t, W_t) integer labels
+
+    Returns:
+      (L, B, C, G) with +inf for classes absent in that image.
+    """
+    assert logits.dim() == 5, "logits must have shape (L, B, C, h, w)"
+    L, B, C, h, w = logits.shape
+    Bt, Ht, Wt = targets.shape
+    assert B == Bt, "Batch size mismatch"
+    assert num_points > 0, "num_points must be > 0"
+
+    device = logits.device
+    dtype  = logits.dtype
+
+    targets_long = targets.to(device=device, dtype=torch.long, non_blocking=True)
+    gt_max = int(targets_long.max().item()) if targets_long.numel() else -1
+    GT_all = gt_max + 1
+    if GT_all <= 0:
+        return logits.new_empty((L, B, C, 0))
+
+    # Global class list (columns of output)
+    if background_index is None:
+        gt_classes: List[int] = list(range(GT_all))
+    else:
+        gt_classes = [k for k in range(GT_all) if k != background_index]
+    G = len(gt_classes)
+    if G == 0:
+        return logits.new_empty((L, B, C, 0))
+
+    id2col = {cls_id: i for i, cls_id in enumerate(gt_classes)}
+    out = torch.full((L, B, C, G), float('inf'), device=device, dtype=dtype)
+
+    for b in range(B):
+        labels_b = targets_long[b]  # (Ht, Wt)
+
+        # Which classes appear in this image?
+        present_ids = torch.unique(labels_b).tolist()
+        if background_index is not None:
+            present_ids = [k for k in present_ids if k != background_index]
+        if len(present_ids) == 0:
             continue
 
-        # Broadcast y_mask to match logits_up: (L, B, C, H_t, W_t)
-        y = y.unsqueeze(0)  # (1, B, 1, H_t, W_t)
+        cols = torch.tensor([id2col[k] for k in present_ids], device=device, dtype=torch.long)
+        Gb = len(present_ids)
 
-        # Calculate intersection, probability sum, and target sum
-        intersection = (probs * y).sum(dim=(3, 4))
-        p_sum = probs.sum(dim=(3, 4))
-        t_sum = y.sum(dim=(3, 4)).squeeze(1) # Squeeze to match p_sum and intersection shape
+        # Shared random points in normalized coords [0,1]^2
+        coords = torch.rand(1, num_points, 2, device=device)  # (1, P, 2)
 
-        # Calculate Dice score and Dice loss
-        dice_score = (2.0 * intersection + smooth) / (p_sum + t_sum + smooth)
-        dice_loss = 1.0 - dice_score
+        # Sample predictions (differentiable)
+        z_b = logits[:, b]                         # (L, C, h, w)
+        z_flat = z_b.reshape(L * C, 1, h, w)       # (N, 1, h, w)
+        preds_pts = point_sample(
+            z_flat, coords.repeat(z_flat.shape[0], 1, 1), align_corners=align_corners
+        ).squeeze(1)                               # (N, P)
+        p_pts = torch.sigmoid(preds_pts)           # (N, P)
 
-        # Build selection mask where GT exists: expand (B,) -> (L,B,C)
-        has_class_expand = has_class.unsqueeze(0).unsqueeze(-1).expand(L, B, C)
+        # Sample labels at the same points (nearest indexing; constants -> no grad)
+        xy = coords[0]                             # (P, 2)
+        ix = torch.clamp((xy[:, 0] * (Wt - 1)).long(), 0, Wt - 1)
+        iy = torch.clamp((xy[:, 1] * (Ht - 1)).long(), 0, Ht - 1)
+        labels_pts = labels_b[iy, ix]              # (P,)
 
-        # Update loss only where the class exists in the batch element
-        inf_tensor = torch.tensor(torch.inf, device=device, dtype=dtype)
-        pairwise_loss[:, :, :, out_idx] = torch.where(
-            has_class_expand,
-            dice_loss,
-            inf_tensor
-        )
+        class_ids_b = torch.tensor(present_ids, device=device, dtype=torch.long)
+        tgt_pts = (labels_pts[None, :] == class_ids_b[:, None]).to(p_pts.dtype)  # (Gb, P)
 
-    return pairwise_loss * scale
+        # Dice over points
+        inter = torch.einsum("np,mp->nm", p_pts, tgt_pts)                 # (N, Gb)
+        p_sum = p_pts.sum(dim=1, keepdim=True)                            # (N, 1)
+        t_sum = tgt_pts.sum(dim=1, keepdim=True).transpose(0, 1)          # (1, Gb)
+
+        dice = (2.0 * inter + smooth) / (p_sum + t_sum + smooth)          # (N, Gb)
+        dice_loss = 1.0 - dice                                            # (N, Gb)
+
+        # Write back -> (L, C, Gb) -> (L, B, C, G)
+        loss_l_c_gb = dice_loss.view(L, C, Gb)
+        out[:, b, :, cols] = loss_l_c_gb
+
+    return out * scale
