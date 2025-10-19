@@ -6,6 +6,12 @@ from einops import rearrange, einsum
 from torch.autograd import Function
 from torch.utils.checkpoint import checkpoint
 
+from .utils import (
+    calculate_uncertainty, 
+    point_sample, 
+    get_uncertain_point_coords_with_randomness
+)
+
 try:
     import mask_loss
 except ImportError:
@@ -104,65 +110,6 @@ def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None):
     loss = loss_block.sum() / (num_masks * H_t * W_t)
     return loss
 
-
-def calculate_uncertainty(logits):
-    assert logits.shape[1] == 1
-    gt_class_logits = logits.clone()
-    return -(torch.abs(gt_class_logits))
-
-
-def point_sample(input, point_coords, **kwargs):
-    add_dim = False
-    if point_coords.dim() == 3:
-        add_dim = True
-        point_coords = point_coords.unsqueeze(2)
-    output = F.grid_sample(input, 2.0 * point_coords - 1.0, **kwargs)
-    if add_dim:
-        output = output.squeeze(3)
-    return output
-
-
-def get_uncertain_point_coords_with_randomness(
-    coarse_logits, 
-    uncertainty_func, 
-    num_points, 
-    oversample_ratio, 
-    importance_sample_ratio
-):
-    assert oversample_ratio >= 1
-    assert importance_sample_ratio <= 1 and importance_sample_ratio >= 0
-    num_boxes = coarse_logits.shape[0]
-    num_sampled = int(num_points * oversample_ratio)
-    point_coords = torch.rand(num_boxes, num_sampled, 2, device=coarse_logits.device)
-    point_logits = point_sample(coarse_logits, point_coords, align_corners=False)
-
-    point_uncertainties = uncertainty_func(point_logits)
-    num_uncertain_points = int(importance_sample_ratio * num_points)
-    num_random_points = num_points - num_uncertain_points
-    idx = torch.topk(point_uncertainties[:, 0, :], k=num_uncertain_points, dim=1)[1]
-    shift = num_sampled * torch.arange(num_boxes, dtype=torch.long, device=coarse_logits.device)
-    idx += shift[:, None]
-    point_coords = point_coords.view(-1, 2)[idx.view(-1), :].view(
-        num_boxes, num_uncertain_points, 2
-    )
-    if num_random_points > 0:
-        point_coords = torch.cat(
-            [
-                point_coords,
-                torch.rand(num_boxes, num_random_points, 2, device=coarse_logits.device),
-            ],
-            dim=1,
-        )
-    return point_coords
-
-
-def _sigmoid_bce_from_logits_labels(logits, labels):
-    """
-    Stable BCE-with-logits elementwise, summed over all elements.
-    logits, labels: same shape (...), labels in [0,1].
-    """
-    return F.binary_cross_entropy_with_logits(logits, labels, reduction='sum')
-
 def sigmoid_cross_entropy_loss_sampling_py(
     logits,        # (B, C, h, w) logits
     targets,          # (B, H_t, W_t) integer labels in [0, C-1]
@@ -215,7 +162,7 @@ def sigmoid_cross_entropy_loss_sampling_py(
     sampled_labels = sampled_labels.squeeze(1)  # (B*C, P)
 
     # Compute stable BCE sum across all sampled (class,point) pairs
-    sampled_loss_sum = _sigmoid_bce_from_logits_labels(sampled_logits, sampled_labels)  # scalar sum
+    sampled_loss_sum = F.binary_cross_entropy_with_logits(sampled_logits, sampled_labels, reduction='sum')
 
     # Normalization: sampled_loss_sum / (num_masks * P) to produce comparable mean-per-(mask,pixel)
     num_masks = B * C if num_masks is None else num_masks
