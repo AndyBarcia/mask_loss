@@ -201,7 +201,7 @@ torch::Tensor mc_sigmoid_cross_entropy_forward(
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
 
-    const int total_elements = B * C * H_t * W_t;
+    const int64_t total_elements = (int64_t) B * C * H_t * W_t;
     if (total_elements == 0) return torch::tensor(0.0, logits.options());
 
     auto total_loss_sum_tensor = torch::zeros({1}, logits.options().dtype(torch::kFloat64));
@@ -260,7 +260,7 @@ torch::Tensor mc_sigmoid_cross_entropy_backward(
     const int W_t = targets.size(2);
 
     auto grad_logits = torch::empty_like(logits);
-    const int total_elements = B * C * H * W;
+    const int64_t total_elements = (int64_t) B * C * H * W;
     if (total_elements == 0) return grad_logits;
 
     const float grad_out_scalar = grad_out.item<float>() / (num_masks * H_t * W_t);
