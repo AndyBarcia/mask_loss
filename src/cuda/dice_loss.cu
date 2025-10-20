@@ -92,7 +92,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
     float* __restrict__ grad_logits,
     const int B,
     const int L,
-    const float smooth
+    const float smooth,
+    const float scale
 ) {
     // Grid: dim.x = W (low-res x), dim.y = H (low-res y), dim.z = L * B
     int j = blockIdx.x;
@@ -132,7 +133,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
     __syncthreads();
 
     // Each thread computes the gradient for a subset of classes
-    float scale = grad_out_levels[l];
+    float grad_level = grad_out_levels[l] * scale;
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
         float logit = logits[((((l * B + b) * C + ci) * H + i) * W + j)];
         float p = 1.0f / (1.0f + expf(-logit));
@@ -151,7 +152,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
         float d_dice_dp = (term1_numerator - term2_numerator) / (denominator * denominator);
         float dp_dL = p * (1.0 - p);
 
-        grad_logits[((((l * B + b) * C + ci) * H + i) * W + j)] = scale * d_dice_dp * dp_dL;
+        grad_logits[((((l * B + b) * C + ci) * H + i) * W + j)] = grad_level * d_dice_dp * dp_dL;
     }
 }
 
@@ -159,7 +160,8 @@ std::vector<torch::Tensor> dice_loss_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
     const float smooth,
-    const float num_masks
+    const float num_masks,
+    const float scale
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -217,6 +219,7 @@ std::vector<torch::Tensor> dice_loss_forward(
     float norm = num_masks / static_cast<float>(L);
     auto loss_per_level = (1.0 - dice).reshape({L, -1}).sum(1) / norm;
 
+    loss_per_level.mul_(scale);
     return {loss_per_level.contiguous(), total_intersection_sum, total_p_sum, total_t_sum};
 }
 
@@ -228,7 +231,8 @@ torch::Tensor dice_loss_backward(
     const torch::Tensor& total_p_sum,
     const torch::Tensor& total_t_sum,
     const float smooth,
-    const float num_masks
+    const float num_masks,
+    const float scale
 ) {
     CHECK_INPUT(grad_out);
     CHECK_INPUT(logits);
@@ -250,7 +254,7 @@ torch::Tensor dice_loss_backward(
 
     auto grad_out_contig = grad_out.contiguous();
     float norm = num_masks / static_cast<float>(L);
-    auto grad_out_scaled = (-grad_out_contig / norm).to(torch::kFloat32);
+    auto grad_out_levels = (-grad_out_contig / norm).to(torch::kFloat32);
 
     dim3 grid(W, H, L * B);
 
@@ -261,11 +265,12 @@ torch::Tensor dice_loss_backward(
             total_intersection_sum.data_ptr<float>(),
             total_p_sum.data_ptr<float>(),
             total_t_sum.data_ptr<float>(),
-            grad_out_scaled.data_ptr<float>(),
+            grad_out_levels.data_ptr<float>(),
             grad_logits.data_ptr<float>(),
             B,
             L,
-            smooth
+            smooth,
+            scale
         );
     };
 

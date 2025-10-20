@@ -13,7 +13,7 @@ except ImportError:
 
 class DiceLossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, smooth, num_masks):
+    def forward(ctx, logits, targets, smooth, num_masks, scale=1.0):
         L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
@@ -21,12 +21,13 @@ class DiceLossFunction(Function):
         if num_masks is None:
             num_masks = float(L * B * C)
         ctx.num_masks = num_masks
+        ctx.scale = 1.0 if scale is None else float(scale)
 
         logits = logits.contiguous().float()
         targets = targets.contiguous().long()
         ctx.smooth = smooth
         output, int_sum, p_sum, t_sum = mask_loss.forward_dice_loss(
-            logits, targets, smooth, num_masks
+            logits, targets, smooth, num_masks, ctx.scale
         )
         ctx.save_for_backward(logits, targets, int_sum, p_sum, t_sum)
         return output
@@ -44,11 +45,12 @@ class DiceLossFunction(Function):
             t_sum,
             ctx.smooth,
             ctx.num_masks,
+            ctx.scale,
         )
-        return grad_weights, None, None, None
+        return grad_weights, None, None, None, None
 
 
-def dice_loss_inefficient_py(logits, targets, smooth=1e-6, num_masks=None):
+def dice_loss_inefficient_py(logits, targets, smooth=1e-6, num_masks=None, scale=1.0):
     """Naive Dice loss that explicitly upsamples logits to the target resolution.
 
     Args:
@@ -93,10 +95,10 @@ def dice_loss_inefficient_py(logits, targets, smooth=1e-6, num_masks=None):
     loss = 1.0 - dice
 
     norm = num_masks / float(L)
-    return loss.sum(dim=(1, 2)) / norm
+    return loss.sum(dim=(1, 2)) / norm * scale
 
 
-def dice_loss_py(logits, targets, smooth=1e-6, num_masks=None):
+def dice_loss_py(logits, targets, smooth=1e-6, num_masks=None, scale=1.0):
     """Efficient count-based Dice loss consistent with nearest upsampling behavior.
 
     Assumes H_t and W_t are integer multiples of h and w respectively and that
@@ -165,4 +167,7 @@ def dice_loss_py(logits, targets, smooth=1e-6, num_masks=None):
     loss = 1.0 - dice
 
     norm = num_masks / float(L)
-    return loss.sum(dim=(1, 2)) / norm
+    return loss.sum(dim=(1, 2)) / norm * scale
+
+
+dice_loss_efficient_py = dice_loss_py

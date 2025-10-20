@@ -16,7 +16,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     const int64_t* __restrict__ targets,
     double* __restrict__ total_loss_sum,
     const int B,
-    const int L
+    const int L,
+    const float scale
 ) {
     // Each CUDA block processes one (l, b, i, j) low-res block
     // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = L * B (level * batch)
@@ -93,7 +94,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     // Only the first thread of the block atomically adds the block's total loss to the global sum.
     // Accumulate into the (level, batch) slot so levels do not interfere with each other.
     if (tid == 0) {
-        atomicAdd(&total_loss_sum[lb], s_block_loss[0]);
+        atomicAdd(&total_loss_sum[lb], s_block_loss[0] * static_cast<double>(scale));
     }
 }
 
@@ -104,7 +105,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     const float* __restrict__ grad_out_levels,
     float* __restrict__ grad_logits,
     const int B,
-    const int L
+    const int L,
+    const float scale
 ) {
     // Grid: dim.x = W (low-res x), dim.y = H (low-res y), dim.z = L * B
     int j = blockIdx.x;
@@ -167,14 +169,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
         
         // Apply scaling. The write to global memory is still uncoalesced,
         // but modern GPU caches can help mitigate the performance impact.
-        grad_logits[idx_base + ci * H * W] = g * grad_out_levels[l];
+        grad_logits[idx_base + ci * H * W] = g * grad_out_levels[l] * scale;
     }
 }
 
 torch::Tensor sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
-    const float num_masks
+    const float num_masks,
+    const float scale
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -199,7 +202,12 @@ torch::Tensor sigmoid_cross_entropy_forward(
 
     auto static_launcher = [&](auto... Dims) {
         sigmoid_cross_entropy_forward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK>>>(
-            logits.data_ptr<float>(), targets.data_ptr<int64_t>(), total_loss_sum_tensor.data_ptr<double>(), B, L);
+            logits.data_ptr<float>(),
+            targets.data_ptr<int64_t>(),
+            total_loss_sum_tensor.data_ptr<double>(),
+            B,
+            L,
+            scale);
     };
 
     const auto supported_dims = std::make_tuple(
@@ -218,14 +226,16 @@ torch::Tensor sigmoid_cross_entropy_forward(
 
     float norm = num_masks / static_cast<float>(L);
     auto loss_per_level = total_loss_sum_tensor.view({L, B}).sum(1).to(torch::kFloat32) / (norm * H_t * W_t);
-    return loss_per_level.clone();
+    loss_per_level.mul_(scale);
+    return loss_per_level.contiguous();
 }
 
 torch::Tensor sigmoid_cross_entropy_backward(
-    const torch::Tensor& grad_out, 
-    const torch::Tensor& logits, 
+    const torch::Tensor& grad_out,
+    const torch::Tensor& logits,
     const torch::Tensor& targets,
-    const float num_masks
+    const float num_masks,
+    const float scale
 ) {
     
     CHECK_INPUT(grad_out);
@@ -245,13 +255,19 @@ torch::Tensor sigmoid_cross_entropy_backward(
     if (total_elements == 0) return grad_logits;
 
     float norm = num_masks / static_cast<float>(L);
-    auto grad_out_scaled = (grad_out.contiguous() / (norm * H_t * W_t)).to(torch::kFloat32);
+    auto grad_out_levels = (grad_out.contiguous() / (norm * H_t * W_t)).to(torch::kFloat32);
     
     dim3 grid(W, H, L * B);
 
     auto static_launcher = [&](auto... Dims) {
         sigmoid_cross_entropy_backward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK>>>(
-            logits.data_ptr<float>(), targets.data_ptr<int64_t>(), grad_out_scaled.data_ptr<float>(), grad_logits.data_ptr<float>(), B, L);
+            logits.data_ptr<float>(),
+            targets.data_ptr<int64_t>(),
+            grad_out_levels.data_ptr<float>(),
+            grad_logits.data_ptr<float>(),
+            B,
+            L,
+            scale);
     };
     
     const auto supported_dims = std::make_tuple(
