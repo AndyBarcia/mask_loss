@@ -15,17 +15,20 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     const float* __restrict__ logits,
     const int64_t* __restrict__ targets,
     double* __restrict__ total_loss_sum,
-    const int B
+    const int B,
+    const int L
 ) {
-    // Each CUDA block processes one (b, i, j) low-res block
-    // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = B (batch)
+    // Each CUDA block processes one (l, b, i, j) low-res block
+    // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = L * B (level * batch)
     // Shared memory is partitioned for per-class counts and per-thread partial loss sums
     __shared__ int sh_counts[C];
     __shared__ double s_block_loss[THREADS_PER_BLOCK];
 
     int j = blockIdx.x;  // low-res x (0..W-1)
     int i = blockIdx.y;  // low-res y (0..H-1)
-    int b = blockIdx.z;  // batch index
+    int lb = blockIdx.z;
+    int b = lb % B;      // batch index
+    int l = lb / B;      // level index
 
     int tid = threadIdx.x;
     const int s = H_t / H; // Stride
@@ -62,17 +65,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     // Each thread computes the loss for a subset of classes and accumulates into a local variable
     double thread_loss_sum = 0.0;
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
-        // logits layout: (B, C, H, W)
-        float L = logits[((b * C + ci) * H + i) * W + j];
+        // logits layout: (L, B, C, H, W)
+        float L_val = logits[((((l * B + b) * C + ci) * H + i) * W + j)];
         float n = (float) sh_counts[ci];
         float N2 = (float)s2;
 
         // Stable BCE-with-logits sum over the block:
         // loss_block = N2*max(L,0) - L*n + N2*log1p(exp(-|L|))
-        float maxL = L > 0.0f ? L : 0.0f;
-        float absL = fabsf(L);
+        float maxL = L_val > 0.0f ? L_val : 0.0f;
+        float absL = fabsf(L_val);
         float logexp = log1pf(expf(-absL));
-        thread_loss_sum += static_cast<double>(N2 * maxL - L * n + N2 * logexp);
+        thread_loss_sum += static_cast<double>(N2 * maxL - L_val * n + N2 * logexp);
     }
 
     // Store each thread's accumulated loss into shared memory
@@ -87,9 +90,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
         __syncthreads();
     }
 
-    // Only the first thread of the block atomically adds the block's total loss to the global sum
+    // Only the first thread of the block atomically adds the block's total loss to the global sum.
+    // Accumulate into the (level, batch) slot so levels do not interfere with each other.
     if (tid == 0) {
-        atomicAdd(total_loss_sum, s_block_loss[0]);
+        atomicAdd(&total_loss_sum[lb], s_block_loss[0]);
     }
 }
 
@@ -97,14 +101,17 @@ template <int C, int H, int W, int H_t, int W_t>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_backward_kernel(
     const float* __restrict__ logits,
     const int64_t* __restrict__ targets,
-    const float grad_out_scalar,
+    const float* __restrict__ grad_out_levels,
     float* __restrict__ grad_logits,
-    const int B
+    const int B,
+    const int L
 ) {
-    // Grid: dim.x = W (low-res x), dim.y = H (low-res y), dim.z = B
+    // Grid: dim.x = W (low-res x), dim.y = H (low-res y), dim.z = L * B
     int j = blockIdx.x;
     int i = blockIdx.y;
-    int b = blockIdx.z;
+    int lb = blockIdx.z;
+    int b = lb % B;
+    int l = lb / B;
 
     int tid = threadIdx.x;
 
@@ -138,7 +145,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     }
 
     // Base index for the current block in the logits/grad_logits tensors
-    int idx_base = ((b * C) * H + i) * W + j;
+    int idx_base = ((((l * B + b) * C) * H + i) * W + j);
 
     // Load logits for all C channels into shared memory to avoid uncoalesced global reads in the loop.
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
@@ -160,7 +167,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
         
         // Apply scaling. The write to global memory is still uncoalesced,
         // but modern GPU caches can help mitigate the performance impact.
-        grad_logits[idx_base + ci * H * W] = g * grad_out_scalar;
+        grad_logits[idx_base + ci * H * W] = g * grad_out_levels[l];
     }
 }
 
@@ -172,24 +179,27 @@ torch::Tensor sigmoid_cross_entropy_forward(
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
 
-    const int B = logits.size(0);
-    const int C = logits.size(1);
-    const int H = logits.size(2);
-    const int W = logits.size(3);
+    const int L = logits.size(0);
+    const int B = logits.size(1);
+    const int C = logits.size(2);
+    const int H = logits.size(3);
+    const int W = logits.size(4);
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
 
-    const int total_elements = B * C * H_t * W_t;
-    if (total_elements == 0) return torch::tensor(0.0, logits.options());
+    const int total_elements = L * B * C * H_t * W_t;
+    if (total_elements == 0) {
+        return torch::zeros({L}, logits.options());
+    }
 
-    auto total_loss_sum_tensor = torch::zeros({1}, logits.options().dtype(torch::kFloat64));
+    auto total_loss_sum_tensor = torch::zeros({L, B}, logits.options().dtype(torch::kFloat64));
 
     // Set grid dimensions based on the low-resolution output
-    dim3 grid(W, H, B);
+    dim3 grid(W, H, L * B);
 
     auto static_launcher = [&](auto... Dims) {
         sigmoid_cross_entropy_forward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK>>>(
-            logits.data_ptr<float>(), targets.data_ptr<int64_t>(), total_loss_sum_tensor.data_ptr<double>(), B);
+            logits.data_ptr<float>(), targets.data_ptr<int64_t>(), total_loss_sum_tensor.data_ptr<double>(), B, L);
     };
 
     const auto supported_dims = std::make_tuple(
@@ -206,7 +216,9 @@ torch::Tensor sigmoid_cross_entropy_forward(
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
 
-    return (total_loss_sum_tensor.to(torch::kFloat32) / (num_masks *H_t * W_t)).squeeze().clone();
+    float norm = num_masks / static_cast<float>(L);
+    auto loss_per_level = total_loss_sum_tensor.view({L, B}).sum(1).to(torch::kFloat32) / (norm * H_t * W_t);
+    return loss_per_level.clone();
 }
 
 torch::Tensor sigmoid_cross_entropy_backward(
@@ -220,24 +232,26 @@ torch::Tensor sigmoid_cross_entropy_backward(
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
 
-    const int B = logits.size(0);
-    const int C = logits.size(1);
-    const int H = logits.size(2);
-    const int W = logits.size(3);
+    const int L = logits.size(0);
+    const int B = logits.size(1);
+    const int C = logits.size(2);
+    const int H = logits.size(3);
+    const int W = logits.size(4);
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
 
     auto grad_logits = torch::empty_like(logits);
-    const int total_elements = B * C * H * W;
+    const int total_elements = L * B * C * H * W;
     if (total_elements == 0) return grad_logits;
 
-    const float grad_out_scalar = grad_out.item<float>() / (num_masks * H_t * W_t);
+    float norm = num_masks / static_cast<float>(L);
+    auto grad_out_scaled = (grad_out.contiguous() / (norm * H_t * W_t)).to(torch::kFloat32);
     
-    dim3 grid(W, H, B);
+    dim3 grid(W, H, L * B);
 
     auto static_launcher = [&](auto... Dims) {
         sigmoid_cross_entropy_backward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK>>>(
-            logits.data_ptr<float>(), targets.data_ptr<int64_t>(), grad_out_scalar, grad_logits.data_ptr<float>(), B);
+            logits.data_ptr<float>(), targets.data_ptr<int64_t>(), grad_out_scaled.data_ptr<float>(), grad_logits.data_ptr<float>(), B, L);
     };
     
     const auto supported_dims = std::make_tuple(

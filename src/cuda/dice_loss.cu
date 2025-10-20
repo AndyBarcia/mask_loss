@@ -17,15 +17,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_forward_kernel
     float* __restrict__ total_intersection_sum,
     float* __restrict__ total_p_sum,
     float* __restrict__ total_t_sum,
-    const int B
+    const int B,
+    const int L
 ) {
-    // Each CUDA block processes one (b, i, j) low-res block
-    // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = B (batch)
+    // Each CUDA block processes one (l, b, i, j) low-res block
+    // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = L * B (level * batch)
     __shared__ int sh_counts[C];
 
     int j = blockIdx.x; // low-res x (0..W-1)
     int i = blockIdx.y; // low-res y (0..H-1)
-    int b = blockIdx.z; // batch index
+    int lb = blockIdx.z;
+    int b = lb % B;     // batch index
+    int l = lb / B;     // level index
 
     int tid = threadIdx.x;
     const int s = H_t / H; // Stride
@@ -61,9 +64,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_forward_kernel
 
     // Each thread computes the intersection and sums for a subset of classes
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
-        // logits layout: (B, C, H, W)
-        float L = logits[((b * C + ci) * H + i) * W + j];
-        float p = 1.0f / (1.0f + expf(-L));
+        // logits layout: (L, B, C, H, W)
+        float logit = logits[((((l * B + b) * C + ci) * H + i) * W + j)];
+        float p = 1.0f / (1.0f + expf(-logit));
         float n_k = (float)sh_counts[ci];
         float N2 = (float)s2;
 
@@ -71,9 +74,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_forward_kernel
         float p_sum = N2 * p;
         float t_sum = n_k;
 
-        atomicAdd(&total_intersection_sum[b * C + ci], intersection);
-        atomicAdd(&total_p_sum[b * C + ci], p_sum);
-        atomicAdd(&total_t_sum[b * C + ci], t_sum);
+        int base_idx = ((l * B + b) * C) + ci;
+        atomicAdd(&total_intersection_sum[base_idx], intersection);
+        atomicAdd(&total_p_sum[base_idx], p_sum);
+        atomicAdd(&total_t_sum[base_idx], t_sum);
     }
 }
 
@@ -84,15 +88,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
     const float* __restrict__ total_intersection_sum,
     const float* __restrict__ total_p_sum,
     const float* __restrict__ total_t_sum,
-    const float grad_out_scalar,
+    const float* __restrict__ grad_out_levels,
     float* __restrict__ grad_logits,
     const int B,
+    const int L,
     const float smooth
 ) {
-    // Grid: dim.x = W (low-res x), dim.y = H (low-res y), dim.z = B
+    // Grid: dim.x = W (low-res x), dim.y = H (low-res y), dim.z = L * B
     int j = blockIdx.x;
     int i = blockIdx.y;
-    int b = blockIdx.z;
+    int lb = blockIdx.z;
+    int b = lb % B;
+    int l = lb / B;
 
     int tid = threadIdx.x;
 
@@ -125,16 +132,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
     __syncthreads();
 
     // Each thread computes the gradient for a subset of classes
-    float scale = -grad_out_scalar;
+    float scale = grad_out_levels[l];
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
-        float L = logits[((b * C + ci) * H + i) * W + j];
-        float p = 1.0f / (1.0f + expf(-L));
+        float logit = logits[((((l * B + b) * C + ci) * H + i) * W + j)];
+        float p = 1.0f / (1.0f + expf(-logit));
         float n_k = (float)sh_counts[ci];
         const float N2 = (float) s2;
 
-        float I = total_intersection_sum[b * C + ci];
-        float P = total_p_sum[b * C + ci];
-        float T = total_t_sum[b * C + ci];
+        int base_idx = ((l * B + b) * C) + ci;
+        float I = total_intersection_sum[base_idx];
+        float P = total_p_sum[base_idx];
+        float T = total_t_sum[base_idx];
 
         float denominator = P + T + smooth;
         float term1_numerator = 2.0 * n_k * (P + T + smooth);
@@ -143,7 +151,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
         float d_dice_dp = (term1_numerator - term2_numerator) / (denominator * denominator);
         float dp_dL = p * (1.0 - p);
 
-        grad_logits[((b * C + ci) * H + i) * W + j] = scale * d_dice_dp * dp_dL;
+        grad_logits[((((l * B + b) * C + ci) * H + i) * W + j)] = scale * d_dice_dp * dp_dL;
     }
 }
 
@@ -156,27 +164,28 @@ std::vector<torch::Tensor> dice_loss_forward(
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
 
-    const int B = logits.size(0);
-    const int C = logits.size(1);
-    const int H = logits.size(2);
-    const int W = logits.size(3);
+    const int L = logits.size(0);
+    const int B = logits.size(1);
+    const int C = logits.size(2);
+    const int H = logits.size(3);
+    const int W = logits.size(4);
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
 
     if (logits.numel() == 0) {
         return {
-            torch::tensor(0.0, logits.options()),
-            torch::zeros({B, C}, logits.options()),
-            torch::zeros({B, C}, logits.options()),
-            torch::zeros({B, C}, logits.options())
+            torch::zeros({L}, logits.options()),
+            torch::zeros({L, B, C}, logits.options()),
+            torch::zeros({L, B, C}, logits.options()),
+            torch::zeros({L, B, C}, logits.options())
         };
     }
 
-    auto total_intersection_sum = torch::zeros({B, C}, logits.options());
-    auto total_p_sum = torch::zeros({B, C}, logits.options());
-    auto total_t_sum = torch::zeros({B, C}, logits.options());
+    auto total_intersection_sum = torch::zeros({L, B, C}, logits.options());
+    auto total_p_sum = torch::zeros({L, B, C}, logits.options());
+    auto total_t_sum = torch::zeros({L, B, C}, logits.options());
 
-    dim3 grid(W, H, B);
+    dim3 grid(W, H, L * B);
 
     auto static_launcher = [&](auto... Dims) {
         dice_loss_forward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK>>>(
@@ -185,7 +194,8 @@ std::vector<torch::Tensor> dice_loss_forward(
             total_intersection_sum.data_ptr<float>(),
             total_p_sum.data_ptr<float>(),
             total_t_sum.data_ptr<float>(),
-            B
+            B,
+            L
         );
     };
 
@@ -204,9 +214,10 @@ std::vector<torch::Tensor> dice_loss_forward(
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
 
     auto dice = (2.0 * total_intersection_sum + smooth) / (total_p_sum + total_t_sum + smooth);
-    auto loss = (1.0 - dice).sum() / num_masks;
+    float norm = num_masks / static_cast<float>(L);
+    auto loss_per_level = (1.0 - dice).reshape({L, -1}).sum(1) / norm;
 
-    return {loss, total_intersection_sum, total_p_sum, total_t_sum};
+    return {loss_per_level.contiguous(), total_intersection_sum, total_p_sum, total_t_sum};
 }
 
 torch::Tensor dice_loss_backward(
@@ -226,19 +237,22 @@ torch::Tensor dice_loss_backward(
     CHECK_INPUT(total_p_sum);
     CHECK_INPUT(total_t_sum);
 
-    const int B = logits.size(0);
-    const int C = logits.size(1);
-    const int H = logits.size(2);
-    const int W = logits.size(3);
+    const int L = logits.size(0);
+    const int B = logits.size(1);
+    const int C = logits.size(2);
+    const int H = logits.size(3);
+    const int W = logits.size(4);
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
 
     auto grad_logits = torch::empty_like(logits);
     if (logits.numel() == 0) return grad_logits;
 
-    const float grad_out_scalar = grad_out.item<float>() / num_masks;
+    auto grad_out_contig = grad_out.contiguous();
+    float norm = num_masks / static_cast<float>(L);
+    auto grad_out_scaled = (-grad_out_contig / norm).to(torch::kFloat32);
 
-    dim3 grid(W, H, B);
+    dim3 grid(W, H, L * B);
 
     auto static_launcher = [&](auto... Dims) {
         dice_loss_backward_kernel<decltype(Dims)::value...><<<grid, THREADS_PER_BLOCK>>>(
@@ -247,9 +261,10 @@ torch::Tensor dice_loss_backward(
             total_intersection_sum.data_ptr<float>(),
             total_p_sum.data_ptr<float>(),
             total_t_sum.data_ptr<float>(),
-            grad_out_scalar,
+            grad_out_scaled.data_ptr<float>(),
             grad_logits.data_ptr<float>(),
             B,
+            L,
             smooth
         );
     };
