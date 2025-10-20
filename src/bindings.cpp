@@ -1,16 +1,18 @@
 #include <torch/extension.h>
 
 torch::Tensor sigmoid_cross_entropy_forward(
-    const torch::Tensor& logits, 
+    const torch::Tensor& logits,
     const torch::Tensor& targets,
-    const float num_masks
+    const float num_masks,
+    const float scale = 1.0f
 );
 
 torch::Tensor sigmoid_cross_entropy_backward(
-    const torch::Tensor& grad_out, 
-    const torch::Tensor& logits, 
+    const torch::Tensor& grad_out,
+    const torch::Tensor& logits,
     const torch::Tensor& targets,
-    const float num_masks
+    const float num_masks,
+    const float scale = 1.0f
 );
 
 torch::Tensor pairwise_sigmoid_cross_entropy_forward(
@@ -39,7 +41,8 @@ std::vector<torch::Tensor> dice_loss_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
     const float smooth,
-    const float num_masks
+    const float num_masks,
+    const float scale = 1.0f
 );
 
 torch::Tensor dice_loss_backward(
@@ -50,7 +53,8 @@ torch::Tensor dice_loss_backward(
     const torch::Tensor& total_p_sum,
     const torch::Tensor& total_t_sum,
     const float smooth,
-    const float num_masks
+    const float num_masks,
+    const float scale = 1.0f
 );
 
 torch::Tensor pairwise_dice_loss_forward(

@@ -19,7 +19,7 @@ except ImportError:
 
 class SigmoidCELossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, num_masks):
+    def forward(ctx, logits, targets, num_masks, scale=1.0):
         L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
@@ -27,11 +27,12 @@ class SigmoidCELossFunction(Function):
         if num_masks is None:
             num_masks = float(L * B * C)
         ctx.num_masks = num_masks
+        ctx.scale = 1.0 if scale is None else float(scale)
 
         logits = logits.contiguous().float()
         targets = targets.contiguous()
         ctx.save_for_backward(logits, targets)
-        output = mask_loss.forward_sigmoid_ce_loss(logits, targets, num_masks)
+        output = mask_loss.forward_sigmoid_ce_loss(logits, targets, num_masks, ctx.scale)
         return output
 
     @staticmethod
@@ -39,12 +40,12 @@ class SigmoidCELossFunction(Function):
         logits, targets = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_weights = mask_loss.backward_sigmoid_ce_loss(
-            grad_output, logits, targets, ctx.num_masks
+            grad_output, logits, targets, ctx.num_masks, ctx.scale
         )
-        return grad_weights, None, None
+        return grad_weights, None, None, None
 
 
-def sigmoid_cross_entropy_loss_inefficient_py(logits, targets, num_masks=None):
+def sigmoid_cross_entropy_loss_inefficient_py(logits, targets, num_masks=None, scale=1.0):
     """Naive BCE-with-logits computed by explicitly upsampling the logits.
 
     Args:
@@ -81,10 +82,10 @@ def sigmoid_cross_entropy_loss_inefficient_py(logits, targets, num_masks=None):
     bce_elem = maxL - L_up * y + logexp
 
     norm = num_masks / float(L)
-    return bce_elem.sum(dim=(1, 2, 3, 4)) / (norm * H_t * W_t)
+    return bce_elem.sum(dim=(1, 2, 3, 4)) / (norm * H_t * W_t) * scale
 
 
-def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None):
+def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None, scale=1.0):
     """Efficient count-based BCE-with-logits for non-mutually-exclusive classes.
 
     Args:
@@ -130,7 +131,7 @@ def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None):
     loss_block = N2 * maxL - L_flat * n_k.unsqueeze(0) + N2 * logexp
 
     norm = num_masks / float(L)
-    return loss_block.sum(dim=(1, 2, 3)) / (norm * H_t * W_t)
+    return loss_block.sum(dim=(1, 2, 3)) / (norm * H_t * W_t) * scale
 
 
 def sigmoid_cross_entropy_loss_sampling_py(
@@ -140,6 +141,7 @@ def sigmoid_cross_entropy_loss_sampling_py(
     num_points=5000,
     oversample_ratio=3,
     importance_sample_ratio=0.75,
+    scale=1.0,
 ):
     """Point-sampled BCE-with-logits performed per (level, image, class).
 
@@ -194,4 +196,7 @@ def sigmoid_cross_entropy_loss_sampling_py(
     P = sampled_logits.shape[-1]
     per_class_loss = per_point_loss.sum(dim=1).reshape(L, B, C)
     norm = num_masks / float(L)
-    return per_class_loss.sum(dim=(1, 2)) / (norm * float(P))
+    return per_class_loss.sum(dim=(1, 2)) / (norm * float(P)) * scale
+
+
+sigmoid_cross_entropy_loss_efficient_py = sigmoid_cross_entropy_loss_py

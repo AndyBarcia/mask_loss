@@ -10,7 +10,8 @@ def sigmoid_cross_entropy_loss(
     targets, # (B,H,W)
     class_mapping=None, # (256,)
     num_masks=None,
-    implementation="cuda"
+    implementation="cuda",
+    scale=1.0,
 ):
     """
     Efficient count-based BCE-with-logits for non-mutually-exclusive multi-class case.
@@ -22,12 +23,12 @@ def sigmoid_cross_entropy_loss(
     """
     if implementation == "python":
         if class_mapping is None:
-            return sigmoid_cross_entropy_loss_efficient_py(logits, targets, num_masks)
+            return sigmoid_cross_entropy_loss_efficient_py(logits, targets, num_masks, scale)
         else:
             return multiclass_sigmoid_cross_entropy_loss_py(logits, targets, class_mapping, num_masks)
     else:
         if class_mapping is None:
-            return SigmoidCELossFunction(logits, targets, num_masks)
+            return SigmoidCELossFunction(logits, targets, num_masks, scale)
         else:
             return MultiClassSigmoidCELossFunction(logits, targets, class_mapping, num_masks)
 
@@ -35,10 +36,11 @@ def sigmoid_cross_entropy_loss(
 def dice_loss(
     logits, # (B,C,h,w)
     targets, # (B,H,W)
-    smooth=1e-6, 
+    smooth=1e-6,
     class_mapping=None, # (256,)
     num_masks=None,
-    implementation="cuda"
+    implementation="cuda",
+    scale=1.0,
 ):
     """
     Efficient count-based Dice loss consistent with nearest upsampling behavior.
@@ -55,12 +57,12 @@ def dice_loss(
     """
     if implementation == "python":
         if class_mapping is None:
-            return dice_loss_efficient_py(logits, targets, smooth, num_masks)
+            return dice_loss_efficient_py(logits, targets, smooth, num_masks, scale)
         else:
             return multiclass_dice_loss_efficient_py(logits, targets, class_mapping, smooth, num_masks)
     else:
         if class_mapping is None:
-            return DiceLossFunction(logits, targets, smooth, num_masks)
+            return DiceLossFunction(logits, targets, smooth, num_masks, scale)
         else:
             return MultiClassDiceLossFunction(logits, targets, class_mapping, smooth, num_masks)
 
