@@ -90,9 +90,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
         __syncthreads();
     }
 
-    // Only the first thread of the block atomically adds the block's total loss to the global sum
+    // Only the first thread of the block atomically adds the block's total loss to the global sum.
+    // Accumulate into the (level, batch) slot so levels do not interfere with each other.
     if (tid == 0) {
-        atomicAdd(&total_loss_sum[l], s_block_loss[0]);
+        atomicAdd(&total_loss_sum[lb], s_block_loss[0]);
     }
 }
 
@@ -191,7 +192,7 @@ torch::Tensor sigmoid_cross_entropy_forward(
         return torch::zeros({L}, logits.options());
     }
 
-    auto total_loss_sum_tensor = torch::zeros({L}, logits.options().dtype(torch::kFloat64));
+    auto total_loss_sum_tensor = torch::zeros({L, B}, logits.options().dtype(torch::kFloat64));
 
     // Set grid dimensions based on the low-resolution output
     dim3 grid(W, H, L * B);
@@ -216,7 +217,7 @@ torch::Tensor sigmoid_cross_entropy_forward(
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
 
     float norm = num_masks / static_cast<float>(L);
-    auto loss_per_level = total_loss_sum_tensor.to(torch::kFloat32) / (norm * H_t * W_t);
+    auto loss_per_level = total_loss_sum_tensor.view({L, B}).sum(1).to(torch::kFloat32) / (norm * H_t * W_t);
     return loss_per_level.clone();
 }
 

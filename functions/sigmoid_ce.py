@@ -81,7 +81,7 @@ def sigmoid_cross_entropy_loss_inefficient_py(logits, targets, num_masks=None):
     bce_elem = maxL - L_up * y + logexp
 
     norm = num_masks / float(L)
-    return bce_elem.sum(dim=(1, 2, 3)) / (norm * H_t * W_t)
+    return bce_elem.sum(dim=(1, 2, 3, 4)) / (norm * H_t * W_t)
 
 
 def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None):
@@ -130,7 +130,7 @@ def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None):
     loss_block = N2 * maxL - L_flat * n_k.unsqueeze(0) + N2 * logexp
 
     norm = num_masks / float(L)
-    return loss_block.sum(dim=(1, 2)) / (norm * H_t * W_t)
+    return loss_block.sum(dim=(1, 2, 3)) / (norm * H_t * W_t)
 
 
 def sigmoid_cross_entropy_loss_sampling_py(
