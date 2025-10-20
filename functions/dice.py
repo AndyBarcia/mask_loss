@@ -94,8 +94,7 @@ def dice_loss_inefficient_py(logits, targets, smooth=1e-6, num_masks=None, scale
     dice = (2.0 * intersection + smooth) / (p_sum + t_sum + smooth)
     loss = 1.0 - dice
 
-    norm = num_masks / float(L)
-    return loss.sum(dim=(1, 2)) / norm * scale
+    return loss.sum(dim=(1, 2)) / num_masks * scale
 
 
 def dice_loss_py(logits, targets, smooth=1e-6, num_masks=None, scale=1.0):
@@ -166,8 +165,4 @@ def dice_loss_py(logits, targets, smooth=1e-6, num_masks=None, scale=1.0):
     dice = (2.0 * intersection_total + smooth) / (p_sum_total + t_sum_total + smooth)
     loss = 1.0 - dice
 
-    norm = num_masks / float(L)
-    return loss.sum(dim=(1, 2)) / norm * scale
-
-
-dice_loss_efficient_py = dice_loss_py
+    return loss.sum(dim=(1, 2)) / num_masks * scale

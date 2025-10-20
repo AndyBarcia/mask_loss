@@ -216,10 +216,8 @@ std::vector<torch::Tensor> dice_loss_forward(
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
 
     auto dice = (2.0 * total_intersection_sum + smooth) / (total_p_sum + total_t_sum + smooth);
-    float norm = num_masks / static_cast<float>(L);
-    auto loss_per_level = (1.0 - dice).reshape({L, -1}).sum(1) / norm;
+    auto loss_per_level = ((1.0 - dice).reshape({L, -1}).sum(1) / num_masks) * scale;
 
-    loss_per_level.mul_(scale);
     return {loss_per_level.contiguous(), total_intersection_sum, total_p_sum, total_t_sum};
 }
 
@@ -253,8 +251,7 @@ torch::Tensor dice_loss_backward(
     if (logits.numel() == 0) return grad_logits;
 
     auto grad_out_contig = grad_out.contiguous();
-    float norm = num_masks / static_cast<float>(L);
-    auto grad_out_levels = (-grad_out_contig / norm).to(torch::kFloat32);
+    auto grad_out_levels = (-grad_out_contig / num_masks).to(torch::kFloat32);
 
     dim3 grid(W, H, L * B);
 

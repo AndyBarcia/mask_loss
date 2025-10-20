@@ -207,7 +207,8 @@ torch::Tensor sigmoid_cross_entropy_forward(
             total_loss_sum_tensor.data_ptr<double>(),
             B,
             L,
-            scale);
+            scale
+        );
     };
 
     const auto supported_dims = std::make_tuple(
@@ -224,9 +225,7 @@ torch::Tensor sigmoid_cross_entropy_forward(
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after forward kernel: ", cudaGetErrorString(err));
 
-    float norm = num_masks / static_cast<float>(L);
-    auto loss_per_level = total_loss_sum_tensor.view({L, B}).sum(1).to(torch::kFloat32) / (norm * H_t * W_t);
-    loss_per_level.mul_(scale);
+    auto loss_per_level = (total_loss_sum_tensor.view({L, B}).sum(1).to(torch::kFloat32)) / (num_masks * H_t * W_t);
     return loss_per_level.contiguous();
 }
 
@@ -254,8 +253,7 @@ torch::Tensor sigmoid_cross_entropy_backward(
     const int64_t total_elements = (int64_t) L * B * C * H * W;
     if (total_elements == 0) return grad_logits;
 
-    float norm = num_masks / static_cast<float>(L);
-    auto grad_out_levels = (grad_out.contiguous() / (norm * H_t * W_t)).to(torch::kFloat32);
+    auto grad_out_levels = (grad_out.contiguous() / (num_masks * H_t * W_t)).to(torch::kFloat32);
     
     dim3 grid(W, H, L * B);
 
@@ -267,7 +265,8 @@ torch::Tensor sigmoid_cross_entropy_backward(
             grad_logits.data_ptr<float>(),
             B,
             L,
-            scale);
+            scale
+        );
     };
     
     const auto supported_dims = std::make_tuple(

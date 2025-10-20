@@ -19,7 +19,7 @@ except ImportError:
 
 class SigmoidCELossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, num_masks, scale=1.0):
+    def forward(ctx, logits, targets, num_masks, scale):
         L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
@@ -81,8 +81,7 @@ def sigmoid_cross_entropy_loss_inefficient_py(logits, targets, num_masks=None, s
     logexp = torch.log1p(torch.exp(-torch.abs(L_up)))
     bce_elem = maxL - L_up * y + logexp
 
-    norm = num_masks / float(L)
-    return bce_elem.sum(dim=(1, 2, 3, 4)) / (norm * H_t * W_t) * scale
+    return bce_elem.sum(dim=(1, 2, 3, 4)) / (num_masks * H_t * W_t) * scale
 
 
 def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None, scale=1.0):
@@ -130,8 +129,7 @@ def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None, scale=1.0):
 
     loss_block = N2 * maxL - L_flat * n_k.unsqueeze(0) + N2 * logexp
 
-    norm = num_masks / float(L)
-    return loss_block.sum(dim=(1, 2, 3)) / (norm * H_t * W_t) * scale
+    return loss_block.sum(dim=(1, 2, 3)) / (num_masks * H_t * W_t) * scale
 
 
 def sigmoid_cross_entropy_loss_sampling_py(
@@ -195,8 +193,4 @@ def sigmoid_cross_entropy_loss_sampling_py(
 
     P = sampled_logits.shape[-1]
     per_class_loss = per_point_loss.sum(dim=1).reshape(L, B, C)
-    norm = num_masks / float(L)
-    return per_class_loss.sum(dim=(1, 2)) / (norm * float(P)) * scale
-
-
-sigmoid_cross_entropy_loss_efficient_py = sigmoid_cross_entropy_loss_py
+    return per_class_loss.sum(dim=(1, 2)) / (num_masks * float(P)) * scale
