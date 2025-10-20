@@ -2,7 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/Parallel.h>
 #include <c10/cuda/CUDAStream.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAEvent.h>
 #include <vector>
 #include <limits>
 #include <cmath>
@@ -139,6 +139,11 @@ std::vector<torch::Tensor> mask_matching(
     // Get total pairwise cost -> (L,B,C,GT_out)
     torch::Tensor costs = costs2.sum(0);
 
+    const int dev_index = device.index();
+    auto producer = at::cuda::getCurrentCUDAStream(dev_index);
+    at::cuda::CUDAEvent costs_ready; 
+    costs_ready.record(producer);
+
     const int64_t L  = costs.size(0);
     const int64_t B  = costs.size(1);
     const int64_t C  = costs.size(2);
@@ -154,7 +159,6 @@ std::vector<torch::Tensor> mask_matching(
         .dtype(torch::kDouble)
         .device(torch::kCPU)
         .pinned_memory(true);
-    const int dev_index = device.index();
     const int64_t N = L * B;
 
     at::parallel_for(0, N, /*grain_size=*/1, [&](int64_t begin, int64_t end){
@@ -164,6 +168,9 @@ std::vector<torch::Tensor> mask_matching(
 
             at::cuda::CUDAStream stream = at::cuda::getStreamFromPool(/*high_priority=*/true, dev_index);
             at::cuda::CUDAStreamGuard guard(stream);
+
+            // Ensure costs is ready on this stream before any reads/conversions/copies
+            costs_ready.block(stream);
 
             // Take (C,GT) slice, ensure contiguous, copy to pinned host as double
             torch::Tensor slice = costs.index({l, b}).contiguous(); // (C,GT) on CUDA

@@ -219,7 +219,6 @@ def mask_matching_py(
     matched_tensor = torch.tensor(matched, device=logits.device, dtype=torch.long)
     return matches, layer_mask_mean, layer_dice_mean, matched_tensor
 
-@torch.no_grad
 def mask_matching_sampling_py(
     logits,         # (L,B,C,H,W) CUDA
     targets,        # (B,H_t,W_t) CUDA
