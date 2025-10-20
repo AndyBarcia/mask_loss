@@ -10,6 +10,207 @@
 #include "utils.cuh"
 #include "pw_sigmoid_dice.cuh"
 
+// This kernel fuses the pairwise sigmoid cross-entropy (BCE) and Dice reductions.
+// Computing both losses in a single pass avoids re-loading logits from global
+// memory and lets us share expensive intermediate values such as the sigmoid
+// probabilities.  The kernel first accumulates the per-logit BCE "base" term
+// that is independent of the ground-truth mask and the total probability mass.
+// It then iterates over each ground-truth mask to accumulate the remaining
+// class-specific terms and writes both losses to the output tensor.
+template <int C, int H, int W, int H_t, int W_t>
+__global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK)
+reduce_pairwise_sigmoid_dice_kernel(
+    const float* __restrict__ logits,           // shape (L, B, C, H, W)
+    const uint8_t* __restrict__ counts,         // shape (B, GT_total, H, W)
+    float* __restrict__ out,                    // shape (2, L, B, C, GT_out)
+    const int32_t* __restrict__ total_counts,   // shape (B, GT_total)
+    const int background_index,
+    const int GT_total,
+    const int GT_out,
+    const int B,
+    const int L,
+    const float smooth,
+    const float sigmoid_scale,
+    const float dice_scale
+) {
+    constexpr int TILE_H = 32;
+    constexpr int TILE_W = 32;
+    constexpr int NUM_WARPS = REDUCTION_THREADS_PER_BLOCK / 32;
+
+    __shared__ float s_logits[TILE_H * TILE_W];
+    __shared__ float s_warp_a[NUM_WARPS];
+    __shared__ float s_warp_b[NUM_WARPS];
+
+    const int l  = blockIdx.x;
+    const int b  = blockIdx.y;
+    const int ci = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const int stride_slice = L * B * C * GT_out;
+    const int base_offset = ((l * B + b) * C + ci) * GT_out;
+    float* out_bce  = out + base_offset;
+    float* out_dice = out + stride_slice + base_offset;
+
+    const int s = H_t / H;
+    const float N2 = static_cast<float>(s * s);
+    const float denom = static_cast<float>(H_t * W_t);
+
+    float thread_base = 0.f;
+    float thread_p_total = 0.f;
+
+    // Stage 1: iterate over the low-resolution logits to compute BCE terms that
+    // do not depend on the ground-truth masks.  We also accumulate the total
+    // sigmoid mass (p_total) that is later reused by every mask.
+    for (int ti = 0; ti < H; ti += TILE_H) {
+        for (int tj = 0; tj < W; tj += TILE_W) {
+            for (int idx = tid; idx < TILE_H * TILE_W; idx += REDUCTION_THREADS_PER_BLOCK) {
+                const int di = idx / TILE_W;
+                const int dj = idx % TILE_W;
+                const int i = ti + di;
+                const int j = tj + dj;
+                float Lij = 0.f;
+                if (i < H && j < W) {
+                    Lij = logits[(((l * B + b) * C + ci) * H + i) * W + j];
+                }
+                s_logits[idx] = Lij;
+            }
+            __syncthreads();
+
+            for (int idx = tid; idx < TILE_H * TILE_W; idx += REDUCTION_THREADS_PER_BLOCK) {
+                const float Lij = s_logits[idx];
+                const float maxL = Lij > 0.f ? Lij : 0.f;
+                const float absL = fabsf(Lij);
+                const float logexp = log1pf(__expf(-absL));
+                thread_base += N2 * (maxL + logexp);
+                const float p = 1.f / (1.f + __expf(-Lij));
+                thread_p_total += N2 * p;
+            }
+            __syncthreads();
+        }
+    }
+
+    float base_sum = thread_base;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        base_sum += __shfl_down_sync(0xffffffff, base_sum, off);
+    }
+    if ((tid & 31) == 0) {
+        s_warp_a[tid >> 5] = base_sum;
+    }
+    __syncthreads();
+    for (int sred = NUM_WARPS >> 1; sred > 0; sred >>= 1) {
+        if (tid < sred) {
+            s_warp_a[tid] += s_warp_a[tid + sred];
+        }
+        __syncthreads();
+    }
+    base_sum = (tid == 0) ? s_warp_a[0] : 0.f;
+    base_sum = __shfl_sync(0xffffffff, base_sum, 0);
+
+    float p_total = thread_p_total;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        p_total += __shfl_down_sync(0xffffffff, p_total, off);
+    }
+    if ((tid & 31) == 0) {
+        s_warp_a[tid >> 5] = p_total;
+    }
+    __syncthreads();
+    for (int sred = NUM_WARPS >> 1; sred > 0; sred >>= 1) {
+        if (tid < sred) {
+            s_warp_a[tid] += s_warp_a[tid + sred];
+        }
+        __syncthreads();
+    }
+    p_total = (tid == 0) ? s_warp_a[0] : 0.f;
+    p_total = __shfl_sync(0xffffffff, p_total, 0);
+
+    // Stage 2: iterate over each ground-truth mask, reusing the cached logits
+    // and shared sigmoid mass to finish the BCE and Dice computations.
+    for (int out_gt_idx = 0; out_gt_idx < GT_out; ++out_gt_idx) {
+        const int gt_actual = MAP_OUT_TO_ACTUAL(out_gt_idx, background_index);
+        const int32_t total_count = total_counts[b * GT_total + gt_actual];
+
+        if (total_count == 0) {
+            if (tid == 0) {
+                out_bce[out_gt_idx] = INFINITY;
+                out_dice[out_gt_idx] = INFINITY;
+            }
+            continue;
+        }
+
+        float thread_ce = 0.f;
+        float thread_intersection = 0.f;
+
+        // Pointer to the spatial counts for the current ground-truth mask at
+        // the down-sampled (H, W) resolution.
+        const uint8_t* gt_counts_base = counts + ((b * GT_total + gt_actual) * H) * W;
+
+        for (int ti = 0; ti < H; ti += TILE_H) {
+            for (int tj = 0; tj < W; tj += TILE_W) {
+                for (int idx = tid; idx < TILE_H * TILE_W; idx += REDUCTION_THREADS_PER_BLOCK) {
+                    const int di = idx / TILE_W;
+                    const int dj = idx % TILE_W;
+                    const int i = ti + di;
+                    const int j = tj + dj;
+                    float Lij = 0.f;
+                    if (i < H && j < W) {
+                        Lij = logits[(((l * B + b) * C + ci) * H + i) * W + j];
+                    }
+                    s_logits[idx] = Lij;
+                }
+                __syncthreads();
+
+                for (int idx = tid; idx < TILE_H * TILE_W; idx += REDUCTION_THREADS_PER_BLOCK) {
+                    const int di = idx / TILE_W;
+                    const int dj = idx % TILE_W;
+                    const int i = ti + di;
+                    const int j = tj + dj;
+                    if (i < H && j < W) {
+                        const float Lij = s_logits[idx];
+                        const float fn = static_cast<float>(gt_counts_base[i * W + j]);
+                        thread_ce += -Lij * fn;
+                        const float p = 1.f / (1.f + __expf(-Lij));
+                        thread_intersection += p * fn;
+                    }
+                }
+                __syncthreads();
+            }
+        }
+
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            thread_ce += __shfl_down_sync(0xffffffff, thread_ce, off);
+            thread_intersection += __shfl_down_sync(0xffffffff, thread_intersection, off);
+        }
+        if ((tid & 31) == 0) {
+            s_warp_a[tid >> 5] = thread_ce;
+            s_warp_b[tid >> 5] = thread_intersection;
+        }
+        __syncthreads();
+        for (int sred = NUM_WARPS >> 1; sred > 0; sred >>= 1) {
+            if (tid < sred) {
+                s_warp_a[tid] += s_warp_a[tid + sred];
+                s_warp_b[tid] += s_warp_b[tid + sred];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            const float ce_val = (base_sum + s_warp_a[0]) / denom * sigmoid_scale;
+            const float total_t = static_cast<float>(total_count);
+            const float dice = 1.f - (2.f * s_warp_b[0] + smooth) / (p_total + total_t + smooth);
+            out_bce[out_gt_idx] = ce_val;
+            out_dice[out_gt_idx] = dice * dice_scale;
+        }
+        __syncthreads();
+    }
+}
+
+// Host entry point that prepares intermediate buffers and launches the fused
+// reduction kernel.  The returned tensor is shaped as (2, L, B, C, GT_out)
+// where the first slice holds the BCE loss and the second slice holds the
+// Dice loss for each (level, batch, class, ground-truth) tuple.
 torch::Tensor pairwise_mask_loss_forward(
     const torch::Tensor& logits,
     const torch::Tensor& targets,
@@ -81,13 +282,12 @@ torch::Tensor pairwise_mask_loss_forward(
         return torch::zeros({L, B, C, 0}, logits.options().dtype(torch::kFloat32));
     }
 
-    // Launch reduction kernel only for the compacted GT_out entries
     auto out_accum = torch::zeros({2, L, B, C, GT_out}, logits.options().dtype(torch::kFloat32));
     {
         dim3 grid(L, B, C);
 
         auto static_launcher = [&](auto C_val, auto H_val, auto W_val, auto H_t_val, auto W_t_val) {
-            reduce_pairwise_sigmoid_kernel<
+            reduce_pairwise_sigmoid_dice_kernel<
                 decltype(C_val)::value, decltype(H_val)::value,
                 decltype(W_val)::value, decltype(H_t_val)::value,
                 decltype(W_t_val)::value>
@@ -99,8 +299,11 @@ torch::Tensor pairwise_mask_loss_forward(
                     static_cast<int32_t>(background_index),
                     GT_total,
                     GT_out,
-                    B, L,
-                    sigmoid_scale
+                    B,
+                    L,
+                    smooth,
+                    sigmoid_scale,
+                    dice_scale
                 );
         };
 
@@ -111,45 +314,7 @@ torch::Tensor pairwise_mask_loss_forward(
             std::make_tuple(std::integral_constant<int, 1024>{}), // H_t
             std::make_tuple(std::integral_constant<int, 1024>{}) // W_t
         );
-        // W_t is not needed by reduce_loss_kernel, so we only pass needed dims
         const auto runtime_dims = std::make_tuple(C, H, W, H_t, W_t);
-        dispatch_kernel(static_launcher, runtime_dims, supported_dims);
-    }
-
-    err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "CUDA error after reduce kernel: ", cudaGetErrorString(err));
-
-    // Launch reduction kernel only for the compacted GT_out entries
-    {
-        dim3 grid(GT_out, C, L*B);
-
-        // Create a pointer to the start of the second slice of out_accum
-        float* out_accum_ptr_offset = out_accum.data_ptr<float>() + L * B * C * GT_out;
-
-        auto static_launcher = [&](auto C_val, auto H_val, auto W_val, auto H_t_val) {
-            reduce_pairwise_dice_kernel<
-                decltype(C_val)::value, decltype(H_val)::value,
-                decltype(W_val)::value, decltype(H_t_val)::value>
-                <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
-                    logits.data_ptr<float>(),
-                    counts.data_ptr<uint8_t>(),
-                    out_accum_ptr_offset,
-                    total_counts.data_ptr<int32_t>(),
-                    GT_total,
-                    GT_out,
-                    B, L, smooth,
-                    background_index,
-                    dice_scale
-                );
-        };
-
-        const auto supported_dims = std::make_tuple(
-            std::make_tuple(std::integral_constant<int, 128>{}), // C
-            std::make_tuple(std::integral_constant<int, 256>{}),  // H
-            std::make_tuple(std::integral_constant<int, 256>{}),  // W
-            std::make_tuple(std::integral_constant<int, 1024>{}) // H_t
-        );
-        const auto runtime_dims = std::make_tuple(C, H, W, H_t);
         dispatch_kernel(static_launcher, runtime_dims, supported_dims);
     }
 
