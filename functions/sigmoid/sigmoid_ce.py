@@ -4,7 +4,7 @@ from torch.autograd import Function
 from einops import rearrange, einsum
 from torch.utils.checkpoint import checkpoint
 
-from .utils import (
+from ..utils import (
     calculate_uncertainty,
     point_sample,
     get_uncertain_point_coords_with_randomness,

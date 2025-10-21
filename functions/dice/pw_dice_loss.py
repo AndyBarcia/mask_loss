@@ -6,7 +6,7 @@ from einops import rearrange, einsum
 from torch.autograd import Function
 from torch.utils.checkpoint import checkpoint
 
-from .utils import point_sample, counts_per_cell_per_class
+from ..utils import point_sample, counts_per_cell_per_class
 
 try:
     import mask_loss

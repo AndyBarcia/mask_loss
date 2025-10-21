@@ -6,8 +6,8 @@ from einops import rearrange, einsum
 from torch.autograd import Function
 from torch.utils.checkpoint import checkpoint
 
-from .pw_sigmoid_ce import pairwise_sigmoid_cross_entropy_loss_py
-from .pw_dice import pairwise_dice_loss_py
+from ..sigmoid.pw_sigmoid_ce import pairwise_sigmoid_cross_entropy_loss_py
+from ..dice.pw_dice_loss import pairwise_dice_loss_py
 
 try:
     import mask_loss

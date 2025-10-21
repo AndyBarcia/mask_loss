@@ -1,7 +1,7 @@
 from .sigmoid_ce import SigmoidCELossFunction, sigmoid_cross_entropy_loss_efficient_py
 from .mc_sigmoid_ce import MultiClassSigmoidCELossFunction, multiclass_sigmoid_cross_entropy_loss_py
 
-from .dice import DiceLossFunction, dice_loss_efficient_py
+from .dice.dice_loss import DiceLossFunction, dice_loss_efficient_py
 from .mc_dice import MultiClassDiceLossFunction, multiclass_dice_loss_efficient_py
 
 

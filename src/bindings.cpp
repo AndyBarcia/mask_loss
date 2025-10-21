@@ -84,6 +84,13 @@ torch::Tensor mask_matching_backward(
     int64_t matched_count   = 0
 );
 
+torch::Tensor pairwise_label_loss_forward(
+    const torch::Tensor& logits,
+    const torch::Tensor& targets,
+    int64_t background_index = -1,
+    const float scale = 1.0f
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_sigmoid_ce_loss", &sigmoid_cross_entropy_forward, "Sigmoid Cross Entropy forward (CUDA)");
     m.def("backward_sigmoid_ce_loss", &sigmoid_cross_entropy_backward, "Sigmoid Cross Entropy backward (CUDA)");
@@ -94,5 +101,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("pairwise_mask_loss_forward", &pairwise_mask_loss_forward, "Dice+Sigmoid loss forward (CUDA)");
     m.def("mask_matching", &mask_matching, "Mask matching using OR-Tools (CUDA)");
     m.def("mask_matching_backward", &mask_matching_backward, "Mask matching backward (CUDA)");
+    m.def("forward_pw_label_loss", &pairwise_label_loss_forward, "Sigmoid Cross Entropy label forward (CUDA)");
 }
 

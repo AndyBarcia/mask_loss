@@ -1,197 +1,161 @@
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/native/cuda/KernelUtils.cuh>
+#include <c10/util/Half.h>
 #include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <vector>
 #include <cmath>
 
-#include "utils.h" // For CHECK_INPUT
+#include "utils.h"
+#include "utils.cuh"
 
-/**
- * @brief CUDA kernel to compute pairwise label loss.
- *
- * This kernel calculates the loss for each (batch, query, class) triplet.
- * It is designed to be launched with a 1D grid where each thread handles one
- * element of the output tensor.
- *
- * @tparam scalar_t The floating-point type of the tensors (e.g., float, half).
- * @tparam IS_FOCAL_LOSS A boolean template parameter to switch between binary
- *         cross-entropy (false) and focal loss (true) at compile time.
- * @param out Pointer to the output loss tensor of shape (B, Q, C).
- * @param logits Pointer to the input logits tensor of shape (B, Q, C).
- * @param built_target_classes Pointer to the pre-computed assigned target
- *        classes for each query, shape (B, Q). Value of -1 indicates ignore.
- * @param has_gt_in_item Pointer to a boolean tensor indicating if a ground
- *        truth class was present in the original targets for a batch item,
- *        shape (B, C).
- * @param B Batch size.
- * @param Q Number of queries.
- * @param C Number of classes.
- * @param total_elements Total number of elements in the output tensor (B * Q * C).
- * @param gamma The gamma parameter for focal loss.
- * @param alpha The alpha parameter for focal loss.
- */
-template <typename scalar_t, bool IS_FOCAL_LOSS>
-__global__ void pairwise_label_loss_forward_kernel(
-    scalar_t* __restrict__ out,
-    const scalar_t* __restrict__ logits,
-    const int64_t* __restrict__ built_target_classes,
-    const bool* __restrict__ has_gt_in_item,
-    const int B,
-    const int Q,
-    const int C,
-    const int total_elements,
-    const float gamma,
-    const float alpha
+// Kernel: for each (l,b,q) reduce across C once to get sum_neg,
+// then emit (optionally compacted) GT_out values using the one-hot identity:
+// BCE(one-hot(y)) = sum_c neg(z_c) - z_y, where
+// neg(z) = max(z,0) + log1p(exp(-|z|))
+template <int C>
+__global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK)
+reduce_pairwise_label_kernel(
+    const float* __restrict__ logits,      // (L, B, Q, C)
+    const int64_t* __restrict__ targets,   // (B, GT_total)
+    float* __restrict__ out,               // (L, B, Q, GT_out)
+    const int32_t background_index,        // fixed column to drop; set to GT_total if none
+    const int32_t GT_total,                // number of GT slots (columns in targets)
+    const int32_t GT_out,                  // GT_total - (background dropped ? 1 : 0)
+    const int32_t B,
+    const int32_t Q,
+    const int32_t L,
+    const float scale
 ) {
+    constexpr int NUM_WARPS = REDUCTION_THREADS_PER_BLOCK / 32;
+    __shared__ float s_warp[NUM_WARPS];
 
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total_elements) {
-        return;
+    const int l   = blockIdx.x;  // layer
+    const int b   = blockIdx.y;  // batch
+    const int qid = blockIdx.z;  // query
+    const int tid = threadIdx.x;
+
+    // Reduce across C to get sum_neg(l,b,q)
+    float thread_sum = 0.f;
+
+    // Stride across C by blockDim.x; template C is compile-time for efficient looping
+    for (int c = tid; c < C; c += REDUCTION_THREADS_PER_BLOCK) {
+        const float z = logits[(((l * B + b) * Q + qid) * C) + c];
+        const float maxL  = z > 0.f ? z : 0.f;
+        const float absL  = fabsf(z);
+        const float logex = log1pf(__expf(-absL));
+        thread_sum += (maxL + logex);
     }
 
-    // Deconstruct linear index `idx` to (b, q, c) coordinates
-    const int c = idx % C;          // This is the ground truth class for this loss calculation
-    const int q = (idx / C) % Q;
-    const int b = idx / (C * Q);
-
-    // Check if the current ground truth class `c` was present in the original
-    // targets for this batch item `b`.
-    const bool class_is_present = has_gt_in_item[b * C + c];
-
-    // If not present, the loss is infinity.
-    if (!class_is_present) {
-        out[idx] = INFINITY;
-        return;
+    // Warp reduce to a single value per block
+    float sum_neg = thread_sum;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum_neg += __shfl_down_sync(0xffffffff, sum_neg, off);
     }
-
-    // Get the logit corresponding to this (b, q, c) triplet.
-    const scalar_t logit = logits[idx];
-
-    // Get the ground truth class assigned to query `q` in batch `b`.
-    const int64_t assigned_target = built_target_classes[b * Q + q];
-
-    // Create the binary label `y`. y=1.0 if the query was assigned this class, else 0.0.
-    const scalar_t y = (assigned_target == c) ? 1.0f : 0.0f;
-
-    // --- Compute binary cross-entropy with logits (numerically stable) ---
-    const scalar_t max_val = fmaxf(logit, 0.0f);
-    const scalar_t bce_loss = max_val - logit * y + log1pf(expf(-fabsf(logit)));
-
-    scalar_t loss;
-    if (IS_FOCAL_LOSS) {
-        // --- Compute focal loss ---
-        const scalar_t p = 1.0f / (1.0f + expf(-logit)); // sigmoid
-        const scalar_t p_t = p * y + (1.0f - p) * (1.0f - y);
-        const scalar_t alpha_t = alpha * y + (1.0f - alpha) * (1.0f - y);
-        loss = alpha_t * powf(1.0f - p_t, gamma) * bce_loss;
-    } else {
-        // --- Loss is just the binary cross-entropy ---
-        loss = bce_loss;
+    if ((tid & 31) == 0) s_warp[tid >> 5] = sum_neg;
+    __syncthreads();
+    for (int s = NUM_WARPS >> 1; s > 0; s >>= 1) {
+        if (tid < s) s_warp[tid] += s_warp[tid + s];
+        __syncthreads();
     }
+    sum_neg = (tid == 0) ? s_warp[0] : 0.f;
+    // Broadcast to all threads in warp 0 (for symmetry; only tid==0 will write outputs)
+    sum_neg = __shfl_sync(0xffffffff, sum_neg, 0);
 
-    out[idx] = loss;
+    // For each output GT slot, write loss or +inf for padding ---
+    // We only need one writer (tid==0) since (l,b,q,*) are independent
+    if (tid == 0) {
+        const float invC = 1.f / static_cast<float>(C);
+
+        for (int out_gt_idx = 0; out_gt_idx < GT_out; ++out_gt_idx) {
+            const int gt_actual = MAP_OUT_TO_ACTUAL(out_gt_idx, background_index);
+            const int64_t y64   = targets[b * GT_total + gt_actual];
+
+            // Padding / invalid label -> +inf (do not apply scale, mirroring other kernel)
+            if (y64 < 0 || y64 >= static_cast<int64_t>(C)) {
+                out[(((l * B + b) * Q + qid) * GT_out) + out_gt_idx] = INFINITY;
+                continue;
+            }
+
+            const int y = static_cast<int>(y64);
+            const float z_pos = logits[(((l * B + b) * Q + qid) * C) + y];
+            float v = (sum_neg - z_pos) * invC;
+            out[(((l * B + b) * Q + qid) * GT_out) + out_gt_idx] = v * scale;
+        }
+    }
 }
 
-/**
- * @brief Forward pass for pairwise label loss.
- *
- * This C++ function acts as a wrapper that prepares tensors and launches the
- * CUDA kernel. It mimics the preprocessing logic from the Python implementation.
- */
 torch::Tensor pairwise_label_loss_forward(
-    const torch::Tensor& logits,
-    const torch::List<torch::Tensor>& targets,
-    const std::string& loss_type,
-    double focal_loss_gamma,
-    double focal_loss_alpha) {
-
+    const torch::Tensor& logits,   // (L,B,Q,C), float
+    const torch::Tensor& targets,  // (B,GT), int64 with -1 padding
+    int64_t background_index = -1, // drop column targets[:, background_index]
+    const float scale = 1.0f
+) {
     CHECK_INPUT(logits);
-    TORCH_CHECK(logits.dim() == 3, "Logits must have shape (B, Q, C)");
+    CHECK_INPUT(targets);
 
-    const int B = logits.size(0);
-    const int Q = logits.size(1);
-    const int C = logits.size(2);
+    TORCH_CHECK(logits.dim() == 4, "pairwise_label_loss_forward: logits must be (L,B,Q,C)");
+    TORCH_CHECK(targets.dim() == 2, "pairwise_label_loss_forward: targets must be (B,GT)");
 
-    TORCH_CHECK(
-        loss_type == "binary_cross_entropy" || loss_type == "focal_loss",
-        "Unsupported loss_type: '", loss_type, "'. Must be 'binary_cross_entropy' or 'focal_loss'.");
-    TORCH_CHECK(
-        targets.size() == B,
-        "Number of target tensors (", targets.size(), ") must match batch size (", B, ")");
+    const int L  = static_cast<int>(logits.size(0));
+    const int B  = static_cast<int>(logits.size(1));
+    const int Q  = static_cast<int>(logits.size(2));
+    const int C  = static_cast<int>(logits.size(3));
+    const int GT_total = static_cast<int>(targets.size(1));
 
-    const at::cuda::OptionalCUDAGuard device_guard(logits.device());
-    const auto device = logits.device();
-    const auto long_opts = torch::TensorOptions().dtype(torch::kLong).device(device);
-    const auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(device);
+    TORCH_CHECK(B == targets.size(0), "pairwise_label_loss_forward: batch size mismatch between logits and targets");
 
-    // `built_target_classes` stores the GT class index assigned to each query.
-    // A value of -1 serves as an ignore index for unassigned queries.
-    auto built_target_classes = torch::full({B, Q}, -1, long_opts);
+    // Determine whether to drop a fixed GT column across the batch
+    const bool drop_bg_col = (background_index >= 0 && background_index < GT_total);
+    if (background_index < 0) {
+        // Set to an invalid index so device-side MAP_OUT_TO_ACTUAL is a no-op
+        background_index = GT_total;
+    }
+    const int GT_out = GT_total - (drop_bg_col ? 1 : 0);
 
-    // `has_gt_in_item` tracks which GT classes were present in the original targets.
-    auto has_gt_in_item = torch::zeros({B, C}, bool_opts);
-
-    // This preprocessing loop is performed on the CPU for simplicity, as it involves
-    // iterating over a list and handling variable-sized tensors, which is complex
-    // to parallelize efficiently on the GPU. The results are then used on the device.
-    for (int i = 0; i < B; ++i) {
-        torch::Tensor t_i = targets[i].to(torch::kLong).to(device);
-        if (t_i.numel() == 0) {
-            continue;
-        }
-
-        // Validate that targets are valid class indices
-        TORCH_CHECK(
-            (t_i.min().item<int64_t>() >= 0) && (t_i.max().item<int64_t>() < C),
-            "Target class indices must be in the range [0, ", C - 1, "]");
-        
-        // Mark which GT classes are present in this batch item
-        has_gt_in_item.index_put_({i, t_i}, true);
-
-        // Assign the first N ground truths to the first N queries
-        int64_t num_to_assign = std::min((int64_t)t_i.numel(), (int64_t)Q);
-        if (num_to_assign > 0) {
-          built_target_classes.slice(0, i, i + 1)
-              .slice(1, 0, num_to_assign)
-              .copy_(t_i.slice(0, 0, num_to_assign));
-        }
+    // Edge case: nothing to compute
+    if (GT_out == 0) {
+        return torch::zeros({L, B, Q, 0}, logits.options().dtype(torch::kFloat32));
     }
 
-    auto out = torch::empty_like(logits);
-    const int64_t total_elements = out.numel();
-    if (total_elements == 0) {
-        return out;
-    }
+    // Ensure dtype/layout
+    auto logits_f = logits.contiguous().to(torch::kFloat32);
+    auto targets_i64 = targets.contiguous(); // keep int64
 
-    const int threads_per_block = 256;
-    const int num_blocks = (total_elements + threads_per_block - 1) / threads_per_block;
+    // Allocate output
+    auto out = torch::empty({L, B, Q, GT_out}, logits.options().dtype(torch::kFloat32));
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(logits.scalar_type(), "pairwise_label_loss_forward", [&] {
-        if (loss_type == "focal_loss") {
-            pairwise_label_loss_forward_kernel<scalar_t, true><<<num_blocks, threads_per_block>>>(
-                out.data_ptr<scalar_t>(),
-                logits.data_ptr<scalar_t>(),
-                built_target_classes.data_ptr<int64_t>(),
-                has_gt_in_item.data_ptr<bool>(),
-                B, Q, C, total_elements,
-                static_cast<float>(focal_loss_gamma),
-                static_cast<float>(focal_loss_alpha)
+    // Launch kernel: one block per (l,b,q), reduce across C
+    dim3 grid(L, B, Q);
+
+    auto static_launcher = [&](auto C_val) {
+        reduce_pairwise_label_kernel<decltype(C_val)::value>
+            <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
+                logits_f.data_ptr<float>(),
+                targets_i64.data_ptr<int64_t>(),
+                out.data_ptr<float>(),
+                static_cast<int32_t>(background_index),
+                static_cast<int32_t>(GT_total),
+                static_cast<int32_t>(GT_out),
+                static_cast<int32_t>(B),
+                static_cast<int32_t>(Q),
+                static_cast<int32_t>(L),
+                scale
             );
-        } else { // binary_cross_entropy
-            pairwise_label_loss_forward_kernel<scalar_t, false><<<num_blocks, threads_per_block>>>(
-                out.data_ptr<scalar_t>(),
-                logits.data_ptr<scalar_t>(),
-                built_target_classes.data_ptr<int64_t>(),
-                has_gt_in_item.data_ptr<bool>(),
-                B, Q, C, total_elements,
-                0.0f, // gamma (unused)
-                0.0f  // alpha (unused)
-            );
-        }
-    });
+    };
+
+    // Template-dispatch over C for performance (matches your style)
+    const auto supported_dims = std::make_tuple(
+        std::make_tuple(std::integral_constant<int, 128>{}) // C
+    );
+    const auto runtime_dims = std::make_tuple(C);
+    dispatch_kernel(static_launcher, runtime_dims, supported_dims);
 
     cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "CUDA error in pairwise_label_loss_forward: ", cudaGetErrorString(err));
+    TORCH_CHECK(err == cudaSuccess,
+                "CUDA error in pairwise_label_loss_forward kernel: ",
+                cudaGetErrorString(err));
 
     return out;
 }
