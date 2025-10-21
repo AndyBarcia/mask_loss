@@ -8,11 +8,14 @@
 #include <cmath>
 
 torch::Tensor pairwise_mask_loss_forward(
-    const torch::Tensor& logits, // (L,B,C,H,W) float CUDA
-    const torch::Tensor& targets, // (B,H_t,W_t) int64 (CPU or CUDA)
+    const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
+    const torch::Tensor& mask_targets,   // (B,H_t,W_t), int64
+    const torch::Tensor& cls_logits,     // (L,B,Q,C),   float
+    const torch::Tensor& cls_targets,    // (B,GT),      int64,
     const float smooth,
     const float sigmoid_scale = 1.0,
     const float dice_scale = 1.0,
+    const float cls_scale = 1.0f,
     int64_t background_index = -1
 );
 
@@ -109,35 +112,41 @@ static inline void hungarian_assignment(
 }
 
 std::vector<torch::Tensor> mask_matching(
-    const torch::Tensor& logits,         // (L,B,C,H,W) CUDA
-    const torch::Tensor& targets,        // (B,H_t,W_t) CUDA
+    const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
+    const torch::Tensor& mask_targets,   // (B,H_t,W_t), int64
+    const torch::Tensor& cls_logits,     // (L,B,Q,C),   float
+    const torch::Tensor& cls_targets,    // (B,GT),      int64,
     float   smooth,
     float   sigmoid_scale   = 1.0f,
     float   dice_scale      = 1.0f,
+    float   cls_scale       = 1.0f,
     int64_t background_index= -1,
     double  inf_thresh      = 1e30,
     int64_t num_masks       = -1
 ) {
-    TORCH_CHECK(logits.is_cuda(), "logits must be CUDA");
-    const auto device = logits.device();
-    const auto dtype  = logits.dtype();
+    TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
+    const auto device = mask_logits.device();
+    const auto dtype  = mask_logits.dtype();
 
-    // Get the mask and dice pairwise costs, shape {2, L, B, C, GT_out}
-    torch::Tensor costs2 = pairwise_mask_loss_forward(
-        logits, 
-        targets, 
+    // Get the mask, dice and cls pairwise costs, shape {3, L, B, C, GT_out}
+    torch::Tensor separate_costs = pairwise_mask_loss_forward(
+        mask_logits, 
+        mask_targets, 
+        cls_logits,
+        cls_targets,
         smooth, 
         sigmoid_scale, 
         dice_scale, 
+        cls_scale,
         background_index
     );
     TORCH_CHECK(
-        costs2.dim() == 5 && costs2.size(0) == 2,
-        "pairwise_sigmoid_dice_loss_forward must return {2,L,B,C,GT_out}"
+        separate_costs.dim() == 5 && separate_costs.size(0) == 3,
+        "pairwise_sigmoid_dice_loss_forward must return {3,L,B,C,GT_out}"
     );
 
     // Get total pairwise cost -> (L,B,C,GT_out)
-    torch::Tensor costs = costs2.sum(0);
+    torch::Tensor costs = separate_costs.sum(0);
 
     const int dev_index = device.index();
     auto producer = at::cuda::getCurrentCUDAStream(dev_index);
@@ -191,8 +200,9 @@ std::vector<torch::Tensor> mask_matching(
     torch::Tensor assigned = matches.ge(0);                       // (L,B,GT)
     const int64_t matched = assigned.sum().item<int64_t>();       // local matched GTs
 
-    torch::Tensor layer_mask_sum = torch::zeros({L}, device).to(costs2.dtype());
-    torch::Tensor layer_dice_sum = torch::zeros({L}, device).to(costs2.dtype());
+    torch::Tensor layer_mask_sum = torch::zeros({L}, device).to(separate_costs.dtype());
+    torch::Tensor layer_dice_sum = torch::zeros({L}, device).to(separate_costs.dtype());
+    torch::Tensor layer_cls_sum = torch::zeros({L}, device).to(separate_costs.dtype());
 
     if (matched > 0) {
         // idx: (N,3) with [l,b,g]
@@ -205,29 +215,33 @@ std::vector<torch::Tensor> mask_matching(
         torch::Tensor p_idx = matches.masked_select(assigned).to(torch::kLong);
 
         // Gather values
-        torch::Tensor sig_vals  = costs2.index({0, l_idx, b_idx, p_idx, g_idx});
-        torch::Tensor dice_vals = costs2.index({1, l_idx, b_idx, p_idx, g_idx});
+        torch::Tensor sig_vals  = separate_costs.index({0, l_idx, b_idx, p_idx, g_idx});
+        torch::Tensor dice_vals = separate_costs.index({1, l_idx, b_idx, p_idx, g_idx});
+        torch::Tensor cls_vals  = separate_costs.index({2, l_idx, b_idx, p_idx, g_idx});
 
         // Scatter-add into per-layer sums
         layer_mask_sum.index_add_(0, l_idx, sig_vals);
         layer_dice_sum.index_add_(0, l_idx, dice_vals);
+        layer_cls_sum.index_add_(0, l_idx, cls_vals);
     }
 
     // Normalization
     const double denom_val = (num_masks > 0) ? static_cast<double>(num_masks) : static_cast<double>(matched);
     const double safe_denom = (denom_val > 0.0) ? denom_val : 1.0;
 
-    torch::Tensor denom = torch::tensor({safe_denom}, device).to(costs2.dtype());
+    torch::Tensor denom = torch::tensor({safe_denom}, device).to(separate_costs.dtype());
     torch::Tensor layer_mask_mean = layer_mask_sum / denom;       // (L,)
     torch::Tensor layer_dice_mean = layer_dice_sum / denom;       // (L,)
+    torch::Tensor layer_cls_mean = layer_cls_sum / denom;         // (L,)
 
     layer_mask_mean = layer_mask_mean.to(dtype);
     layer_dice_mean = layer_dice_mean.to(dtype);
+    layer_cls_mean = layer_cls_mean.to(dtype);
 
     auto matched_tensor = torch::scalar_tensor(
         matched,
         torch::TensorOptions().dtype(torch::kLong).device(device)
     );
 
-    return { matches, layer_mask_mean, layer_dice_mean, matched_tensor };
+    return { matches, layer_mask_mean, layer_dice_mean, layer_cls_mean, matched_tensor };
 }

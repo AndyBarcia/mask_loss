@@ -64,12 +64,9 @@ def pairwise_label_loss_py(logits, targets, background_index=None, scale=1.0):
     _, GT = targets.shape
 
     # Optionally drop a fixed GT column across the batch
-    if background_index is not None:
+    if background_index is not None and background_index >= 0 and background_index < GT:
         assert GT > 0, "Cannot drop a column when GT == 0."
         bg = int(background_index)
-        if bg < 0:
-            bg += GT  # allow negative indexing
-        assert 0 <= bg < GT, "background_index out of range"
         keep = torch.cat([
             torch.arange(0, bg, device=device),
             torch.arange(bg + 1, GT, device=device)

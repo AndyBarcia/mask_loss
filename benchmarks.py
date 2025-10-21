@@ -84,7 +84,7 @@ class CUDAKernelTester:
         return output, total_cuda_time_ms, used_mem_mb
 
     def _check_correctness(self, tensor_cuda, tensor_python, label, atol, rtol):
-        """Checks if two tensors are close and prints detailed differences if they are not."""
+        """Checks if two tensors are close and prints detailed differences if they are not."""        
         are_close = torch.allclose(tensor_cuda, tensor_python.to(self.device), atol=atol, rtol=rtol)
         n_different_sign = (tensor_cuda.sign() != tensor_python.to(self.device).sign()).sum().item()
         n_different_inf = ((torch.isinf(tensor_cuda) != torch.isinf(tensor_python.to(self.device)))).sum().item()
@@ -282,22 +282,22 @@ class CUDAKernelTester:
             print(separator)
 
 
-def create_gaussian_blob_targets(B, C, Ht, Wt, device):
+def create_gaussian_blob_targets(B, Q, C, Ht, Wt, device):
     """
     Creates a target tensor with random Gaussian blobs representing different classes.
     """
     # Start with a background of class 0
-    targets = torch.zeros(B, Ht, Wt, dtype=torch.long, device=device)
+    torch.manual_seed(0)
+    mask_targets = torch.zeros(B, Ht, Wt, dtype=torch.long, device=device)
     
     # Generate blobs for each image in the batch
     for b in range(B):
         # Add a random number of blobs to each image
         num_blobs = torch.randint(10, 20, (1,)).item()
-        print("NUMBER OF BLOBS:", num_blobs)
         
         for _ in range(num_blobs):
-            # Assign a random class ID (1 to C-1, since 0 is background)
-            class_id = torch.randint(1, C, (1,)).item()
+            # Assign a random object ID (1 to Q-1, since 0 is background)
+            query_id = torch.randint(1, Q, (1,)).item()
             
             # Define random center and size for the Gaussian blob
             center_x = torch.randint(0, Wt, (1,)).item()
@@ -317,23 +317,57 @@ def create_gaussian_blob_targets(B, C, Ht, Wt, device):
             # Create a mask where the blob is most prominent
             mask = gaussian_blob > 0.5
             
+            # "Paint" the object ID onto the target tensor where the mask is true
+            mask_targets[b, mask] = query_id
+    
+    # Per-query class assignment; -1 means "no object for this query in this image"
+    max_num_blobs = mask_targets.max().item()
+    cls_targets = torch.full((B, max_num_blobs+1), -1, dtype=torch.long, device=device)
+
+    for b in range(B):
+        present_qids = mask_targets[b].unique()
+        present_qids = present_qids[present_qids > 0]  # exclude background
+        if present_qids.numel() > 0:
+            # Random classes in [0, C-1] for the queries that actually appear
+            rand_classes = torch.randint(0, C, (present_qids.numel(),), device=device)
+            cls_targets[b, present_qids] = rand_classes
+
+    return mask_targets, cls_targets
+
+def create_label_targets(B, C, device):
+    """
+    Creates a target tensor with random Gaussian blobs representing different classes.
+    """
+    # Start with a background of class 0
+    max_num_blobs = 30
+    targets = torch.zeros(B, max_num_blobs, dtype=torch.long, device=device)
+    
+    # Generate blobs for each image in the batch
+    for b in range(B):
+        # Add a random number of blobs to each image
+        num_blobs = torch.randint(10, max_num_blobs-1, (1,)).item()
+        
+        for i in range(num_blobs):
+            # Assign a random class ID (1 to C-1, since 0 is background)
+            class_id = torch.randint(1, C, (1,)).item()            
             # "Paint" the class ID onto the target tensor where the mask is true
-            targets[b, mask] = class_id
+            targets[b, i] = class_id
             
     return targets
 
 def test_sigmoid_ce_loss():
     """Test the CUDA implementation of sigmoid cross-entropy loss"""
-    B, C, H, W = 16, 128, 256, 256
+    L, B, C, H, W = 1, 1, 128, 256, 256
     H_t, W_t = 1024, 1024
     
     input_creators = {
-        "logits": lambda device, dtype: torch.randn(B, C, H, W, device=device, dtype=dtype),
+        "logits": lambda device, dtype: torch.randn(L, B, C, H, W, device=device, dtype=dtype),
         "targets": lambda device, dtype: create_gaussian_blob_targets(B, C, H_t, W_t, device),
         "num_masks": 5,
+        "scale": 1.0,
     }
     
-    arg_order = ["logits", "targets", "num_masks"]
+    arg_order = ["logits", "targets", "num_masks", "scale"]
     
     tester = CUDAKernelTester(
         cuda_function=SigmoidCELossFunction.apply,
@@ -367,38 +401,16 @@ def test_pw_sigmoid_ce_loss():
     
     tester.run()
 
-def test_mc_sigmoid_ce_loss():
-    """Test the CUDA implementation of sigmoid cross-entropy loss"""
-    B, C, K, H, W = 1, 8, 256, 64, 64
-    H_t, W_t = 512, 512
-    
-    input_creators = {
-        "logits": lambda device, dtype: torch.randn(B, C, H, W, device=device, dtype=dtype),
-        "targets": lambda device, dtype: torch.randint(0, K-1, (B, H_t, W_t), device=device, dtype=torch.uint8),
-        "class_mapping": lambda device, dtype: torch.randint(0, C-1, (B, K,), device=device, dtype=torch.long),
-    }
-    
-    arg_order = ["logits", "targets", "class_mapping"]
-    
-    tester = CUDAKernelTester(
-        cuda_function=MultiClassSigmoidCELossFunction.apply,
-        python_function=multiclass_sigmoid_cross_entropy_loss_py,
-        input_creators=input_creators,
-        arg_order=arg_order
-    )
-    
-    tester.run()
-
 def test_dice_loss():
     """Test the CUDA implementation of sigmoid dice loss"""
-    B, C, H, W = 16, 133, 256, 256
+    L, B, C, H, W = 1, 1, 133, 256, 256
     H_t, W_t = 1024, 1024
     
     input_creators = {
-        "logits": lambda device, dtype: torch.randn(B, C, H, W, device=device, dtype=dtype),
+        "logits": lambda device, dtype: torch.randn(L, B, C, H, W, device=device, dtype=dtype),
         #"targets": lambda device, dtype: torch.randint(0, C, (B, H_t, W_t), device=device, dtype=torch.long),
         "targets": lambda device, dtype: create_gaussian_blob_targets(B, C, H_t, W_t, device),
-        "smooth": 1e-6,
+        "smooth": 1.0,
         "num_masks": 1
     }
     
@@ -415,14 +427,14 @@ def test_dice_loss():
 
 def test_pw_dice_loss():
     """Test the CUDA implementation of sigmoid cross-entropy loss"""
-    L, B, C, H, W = 1, 1, 128, 256, 256
+    L, B, C, H, W = 1, 2, 128, 256, 256
     H_t, W_t = 1024, 1024
 
     input_creators = {
         "logits": lambda device, dtype: torch.randn(L, B, C, H, W, device=device, dtype=dtype),
         "targets": lambda device, dtype: create_gaussian_blob_targets(B, C, H_t, W_t, device),
         "smooth": 1.0,
-        "background_index": 0,
+        "background_index": 1,
         "scale": 1.0
     }
     
@@ -437,43 +449,56 @@ def test_pw_dice_loss():
     
     tester.run()
 
-def test_mc_dice_loss():
-    """Test the CUDA implementation of sigmoid dice loss"""
-    B, C, K, H, W = 16, 256, 16, 64, 64
-    H_t, W_t = 512, 512
-    
+def test_pw_label_loss():
+    """Test the CUDA implementation of sigmoid cross-entropy loss"""
+    L, B, Q, C = 10, 16, 300, 128
+
     input_creators = {
-        "logits": lambda device, dtype: torch.randn(B, C, H, W, device=device, dtype=dtype),
-        "targets": lambda device, dtype: torch.randint(0, K-1, (B, H_t, W_t), device=device, dtype=torch.uint8),
-        "class_mapping": lambda device, dtype: torch.randint(0, C-1, (K,), device=device, dtype=torch.long),
+        "logits": lambda device, dtype: torch.randn(L, B, Q, C, device=device, dtype=dtype),
+        "targets": lambda device, dtype: create_label_targets(B, C, device),
+        "background_index": 0,
+        "scale": 1.0
     }
     
-    arg_order = ["logits", "targets", "class_mapping"]
+    arg_order = ["logits", "targets", "background_index", "scale"]
     
     tester = CUDAKernelTester(
-        cuda_function=MultiClassDiceLossFunction.apply,
-        python_function=multiclass_dice_loss_py,
+        cuda_function=PairwiseSigmoidCELossFunction.apply,
+        python_function=pairwise_label_loss_py,
         input_creators=input_creators,
         arg_order=arg_order
     )
     
-    tester.run()
+    tester.run() 
 
 def test_pw_mask_loss():
     """Test the CUDA implementation of pairwise mask loss"""
-    L, B, C, H, W = 1, 1, 128, 256, 256
+    L, B, Q, C, H, W = 1, 2, 128, 128, 256, 256
     H_t, W_t = 1024, 1024
 
     input_creators = {
-        "logits": lambda device, dtype: torch.randn(L, B, C, H, W, device=device, dtype=dtype),
-        "targets": lambda device, dtype: create_gaussian_blob_targets(B, C, H_t, W_t, device),
+        "mask_logits": lambda device, dtype: torch.randn(L, B, Q, H, W, device=device, dtype=dtype),
+        "mask_targets": lambda device, dtype: create_gaussian_blob_targets(B, Q, C, H_t, W_t, device)[0],
+        "cls_logits": lambda device, dtype: torch.randn(L, B, Q, C, device=device, dtype=dtype),
+        "cls_targets": lambda device, dtype: create_gaussian_blob_targets(B, Q, C, H_t, W_t, device)[1],
         "smooth": 1.0,
         "sigmoid_scale": 1.0,
         "dice_scale": 1.0,
-        "background_index": -1
+        "cls_scale": 1.0,
+        "background_index": 0
     }
     
-    arg_order = ["logits", "targets", "smooth", "sigmoid_scale", "dice_scale", "background_index"]
+    arg_order = [
+        "mask_logits", 
+        "mask_targets", 
+        "cls_logits",
+        "cls_targets",
+        "smooth", 
+        "sigmoid_scale", 
+        "dice_scale", 
+        "cls_scale",
+        "background_index"
+    ]
     
     tester = CUDAKernelTester(
         cuda_function=PairwiseMaskLossFunction.apply,
@@ -486,25 +511,40 @@ def test_pw_mask_loss():
 
 def test_mask_matching():
     """Test the CUDA implementation of mask matching"""
-    L, B, C, H, W = 1, 1, 128, 256, 256
+    L, B, Q, C, H, W = 1, 1, 128, 128, 256, 256
     H_t, W_t = 1024, 1024
 
     input_creators = {
-        "logits": lambda device, dtype: torch.randn(L, B, C, H, W, device=device, dtype=dtype),
-        "targets": lambda device, dtype: create_gaussian_blob_targets(B, C, H_t, W_t, device),
+        "mask_logits": lambda device, dtype: torch.randn(L, B, Q, H, W, device=device, dtype=dtype),
+        "mask_targets": lambda device, dtype: create_gaussian_blob_targets(B, Q, C, H_t, W_t, device)[0],
+        "cls_logits": lambda device, dtype: torch.randn(L, B, Q, C, device=device, dtype=dtype),
+        "cls_targets": lambda device, dtype: create_gaussian_blob_targets(B, Q, C, H_t, W_t, device)[1],
         "smooth": 1.0,
         "sigmoid_scale": 1.0,
         "dice_scale": 1.0,
-        "background_index": -1,
+        "cls_scale": 1.0,
+        "background_index": 0,
         "inf_thresh": 1e30,
-        "num_masks": None
+        "num_masks": 0
     }
     
-    arg_order = ["logits", "targets", "smooth", "sigmoid_scale", "dice_scale", "background_index", "inf_thresh", "num_masks"]
+    arg_order = [
+        "mask_logits", 
+        "mask_targets", 
+        "cls_logits",
+        "cls_targets",
+        "smooth", 
+        "sigmoid_scale", 
+        "dice_scale", 
+        "cls_scale",
+        "background_index",
+        "inf_thresh",
+        "num_masks"
+    ]
     
     tester = CUDAKernelTester(
         cuda_function=MaskMatchingFunction.apply,
-        python_function=mask_matching,
+        python_function=mask_matching_py,
         input_creators=input_creators,
         arg_order=arg_order
     )
@@ -512,5 +552,5 @@ def test_mask_matching():
     tester.run()
 
 if __name__ == "__main__":
-    #test_pw_mask_loss()
-    test_mask_matching()
+    test_pw_mask_loss()
+    #test_pw_sigmoid_ce_loss()

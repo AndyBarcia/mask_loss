@@ -51,37 +51,47 @@ torch::Tensor pairwise_dice_loss_forward(
 );
 
 torch::Tensor pairwise_mask_loss_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
+    const torch::Tensor& mask_targets,   // (B,H_t,W_t), int64
+    const torch::Tensor& cls_logits,     // (L,B,Q,C),   float
+    const torch::Tensor& cls_targets,    // (B,GT),      int64,
     const float smooth,
     const float sigmoid_scale = 1.0,
     const float dice_scale = 1.0,
+    const float cls_scale = 1.0f,
     int64_t background_index = -1
 );
 
 std::vector<torch::Tensor> mask_matching(
-    const torch::Tensor& logits,         // (L,B,C,H,W) CUDA
-    const torch::Tensor& targets,        // (B,H_t,W_t) CUDA
+    const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
+    const torch::Tensor& mask_targets,   // (B,H_t,W_t), int64
+    const torch::Tensor& cls_logits,     // (L,B,Q,C),   float
+    const torch::Tensor& cls_targets,    // (B,GT),      int64,
     float   smooth,
     float   sigmoid_scale   = 1.0f,
     float   dice_scale      = 1.0f,
+    float   cls_scale       = 1.0f,
     int64_t background_index= -1,
     double  inf_thresh      = 1e30,
     int64_t num_masks       = -1
 );
 
-torch::Tensor mask_matching_backward(
+std::vector<torch::Tensor> mask_matching_backward(
     const torch::Tensor& grad_layer_mask_mean,
     const torch::Tensor& grad_layer_dice_mean,
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& grad_layer_cls_mean,
+    const torch::Tensor& mask_logits,
+    const torch::Tensor& mask_targets,
+    const torch::Tensor& cls_logits,
+    const torch::Tensor& cls_targets,
     const torch::Tensor& matches,
-    float   smooth,
-    float   sigmoid_scale   = 1.0f,
-    float   dice_scale      = 1.0f,
-    int64_t background_index= -1,
-    int64_t num_masks       = -1,
-    int64_t matched_count   = 0
+    const float smooth,
+    const float sigmoid_scale,
+    const float dice_scale,
+    const float cls_scale,
+    const int64_t background_index,
+    const int64_t num_masks,
+    const int64_t matched_count
 );
 
 torch::Tensor pairwise_label_loss_forward(

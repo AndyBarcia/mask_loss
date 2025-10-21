@@ -8,6 +8,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ..sigmoid.pw_sigmoid_ce import pairwise_sigmoid_cross_entropy_loss_py
 from ..dice.pw_dice_loss import pairwise_dice_loss_py
+from ..label.pw_label_loss import pairwise_label_loss_py
 
 try:
     import mask_loss
@@ -19,53 +20,70 @@ class PairwiseMaskLossFunction(Function):
     @staticmethod
     def forward(
         ctx, 
-        logits, 
-        targets,
+        mask_logits,         # (L,B,Q,H,W)
+        mask_targets,        # (B,H_t,W_t)
+        cls_logits,          # (L,B,Q,C)
+        cls_targets,         # (B,GT)
         smooth,
         sigmoid_scale,
         dice_scale,
+        cls_scale,
         background_index, 
     ):
-        L, B, C, h, w = logits.shape
-        B_t, H_t, W_t = targets.shape
+        L, B, C, h, w = mask_logits.shape
+        B_t, H_t, W_t = mask_targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
         
-        logits = logits.contiguous().float()
-        targets = targets.contiguous()
+        mask_logits = mask_logits.contiguous().float()
+        mask_targets = mask_targets.contiguous()
+        cls_logits = cls_logits.contiguous().float()
+        cls_targets = cls_targets.contiguous()
         output = mask_loss.pairwise_mask_loss_forward(
-            logits, 
-            targets,
+            mask_logits, 
+            mask_targets,
+            cls_logits,
+            cls_targets,
             smooth if smooth is not None else 1.0,
             sigmoid_scale if sigmoid_scale is not None else 1.0,
             dice_scale if dice_scale is not None else 1.0,
+            cls_scale if cls_scale is not None else 1.0,
             background_index if background_index is not None else -1,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return None, None, None, None, None, None
+        return (None,)*9
 
 
 def pairwise_mask_loss_py(
-    logits,         # (L,B,C,H,W) CUDA
-    targets,        # (B,H_t,W_t) CUDA
+    mask_logits,         # (L,B,Q,H,W)
+    mask_targets,        # (B,H_t,W_t)
+    cls_logits,          # (L,B,Q,C)
+    cls_targets,         # (B,GT)
     smooth,
     sigmoid_scale   = 1.0,
     dice_scale      = 1.0,
+    cls_scale       = 1.0,
     background_index= -1,
 ):
     sigmoid_cost = pairwise_sigmoid_cross_entropy_loss_py(
-        logits, 
-        targets, 
+        mask_logits, 
+        mask_targets, 
         background_index,
         sigmoid_scale, 
     )  # (L,B,C,GT_out)
     dice_cost = pairwise_dice_loss_py(
-        logits, 
-        targets, 
+        mask_logits, 
+        mask_targets, 
         smooth,
         background_index,
         dice_scale
     )  # (L,B,C,GT_out)
-    return torch.stack([sigmoid_cost, dice_cost], dim=0)  # (2,L,B,C,GT_out)
+    cls_cost = pairwise_label_loss_py(
+        cls_logits,
+        cls_targets,
+        background_index=background_index,
+        scale=cls_scale
+    ) # (L,B,C,GT_out)
+    return torch.stack([sigmoid_cost, dice_cost, cls_cost], dim=0)  # (3,L,B,C,GT_out)

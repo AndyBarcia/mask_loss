@@ -10,6 +10,21 @@
 #include "utils.cuh"
 #include "pw_sigmoid_dice.cuh"
 
+template <int C>
+__global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK)
+reduce_pairwise_label_kernel(
+    const float* __restrict__ logits,      // (L, B, Q, C)
+    const int64_t* __restrict__ targets,   // (B, GT_total)
+    float* __restrict__ out,               // (L, B, Q, GT_out)
+    const int32_t background_index,        // fixed column to drop; set to GT_total if none
+    const int32_t GT_total,                // number of GT slots (columns in targets)
+    const int32_t GT_out,                  // GT_total - (background dropped ? 1 : 0)
+    const int32_t B,
+    const int32_t Q,
+    const int32_t L,
+    const float scale
+);
+
 // This kernel fuses the pairwise sigmoid cross-entropy (BCE) and Dice reductions.
 // Computing both losses in a single pass avoids re-loading logits from global
 // memory and lets us share expensive intermediate values such as the sigmoid
@@ -208,35 +223,46 @@ reduce_pairwise_sigmoid_dice_kernel(
 }
 
 // Host entry point that prepares intermediate buffers and launches the fused
-// reduction kernel.  The returned tensor is shaped as (2, L, B, C, GT_out)
+// reduction kernel.  The returned tensor is shaped as (2, L, B, Q, GT_out)
 // where the first slice holds the BCE loss and the second slice holds the
 // Dice loss for each (level, batch, class, ground-truth) tuple.
 torch::Tensor pairwise_mask_loss_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
+    const torch::Tensor& mask_targets,   // (B,H_t,W_t), int64
+    const torch::Tensor& cls_logits,     // (L,B,Q,C),   float
+    const torch::Tensor& cls_targets,    // (B,GT),      int64,
     const float smooth,
     const float sigmoid_scale = 1.0,
     const float dice_scale = 1.0,
+    const float cls_scale = 1.0f,
     int64_t background_index = -1
 ) {
-    CHECK_INPUT(logits);
-    CHECK_INPUT(targets);
+    CHECK_INPUT(mask_logits);
+    CHECK_INPUT(mask_targets);
+    CHECK_INPUT(cls_logits);
+    CHECK_INPUT(cls_targets);
 
-    const int L = logits.size(0);
-    const int B = logits.size(1);
-    const int C = logits.size(2);
-    const int H = logits.size(3);
-    const int W = logits.size(4);
-    const int H_t = targets.size(1);
-    const int W_t = targets.size(2);
+    TORCH_CHECK(mask_logits.dim() == 5, "mask_logits must be (L,B,Q,H,W)");
+    TORCH_CHECK(mask_targets.dim() == 3, "mask_targets must be (B,H_t,W_t)");
+    TORCH_CHECK(cls_logits.dim()  == 4, "cls_logits must be (L,B,Q,C)");
+    TORCH_CHECK(cls_targets.dim() == 2, "cls_targets must be (B,GT)");
 
-    // Automatically compute GT_total from the max value in targets
-    torch::Tensor targets_max_tensor = targets.max();
-    const int64_t GT_total_64 = targets_max_tensor.item<int64_t>() + 1;
+    const int L = mask_logits.size(0);
+    const int B = mask_logits.size(1);
+    const int Q = mask_logits.size(2);
+    const int H = mask_logits.size(3);
+    const int W = mask_logits.size(4);
+    const int H_t = mask_targets.size(1);
+    const int W_t = mask_targets.size(2);
+    const int C = cls_logits.size(3);
+
+    // Automatically compute GT_total from the max value in mask_targets
+    torch::Tensor mask_targets_max_tensor = mask_targets.max();
+    const int64_t GT_total_64 = mask_targets_max_tensor.item<int64_t>() + 1;
     const int GT_total = static_cast<int>(GT_total_64);
 
     // Intermediate tensor to store counts of GT_total labels per low-res block
-    auto counts = torch::zeros({B, GT_total, H, W}, logits.options().dtype(torch::kUInt8));
+    auto counts = torch::zeros({B, GT_total, H, W}, mask_logits.options().dtype(torch::kUInt8));
 
     // Launch count kernel (counts for ALL GT labels)
     {
@@ -248,7 +274,7 @@ torch::Tensor pairwise_mask_loss_forward(
                 decltype(H_val)::value, decltype(W_val)::value,
                 decltype(H_t_val)::value, decltype(W_t_val)::value>
                 <<<grid, block>>>(
-                    targets.data_ptr<int64_t>(),
+                    mask_targets.data_ptr<int64_t>(),
                     counts.data_ptr<uint8_t>(),
                     B, GT_total
                 );
@@ -277,14 +303,14 @@ torch::Tensor pairwise_mask_loss_forward(
     }
     const int GT_out = GT_total - (skip_class ? 1 : 0);
 
-    // If no classes left to evaluate (edge case), return an empty tensor of shape (B,C,0)
+    // If no classes left to evaluate (edge case), return an empty tensor of shape (B,Q,0)
     if (GT_out == 0) {
-        return torch::zeros({L, B, C, 0}, logits.options().dtype(torch::kFloat32));
+        return torch::zeros({L, B, Q, 0}, mask_logits.options().dtype(torch::kFloat32));
     }
 
-    auto out_accum = torch::zeros({2, L, B, C, GT_out}, logits.options().dtype(torch::kFloat32));
+    auto out_accum = torch::zeros({3, L, B, Q, GT_out}, mask_logits.options().dtype(torch::kFloat32));
     {
-        dim3 grid(L, B, C);
+        dim3 grid(L, B, Q);
 
         auto static_launcher = [&](auto C_val, auto H_val, auto W_val, auto H_t_val, auto W_t_val) {
             reduce_pairwise_sigmoid_dice_kernel<
@@ -292,7 +318,7 @@ torch::Tensor pairwise_mask_loss_forward(
                 decltype(W_val)::value, decltype(H_t_val)::value,
                 decltype(W_t_val)::value>
                 <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
-                    logits.data_ptr<float>(),
+                    mask_logits.data_ptr<float>(),
                     counts.data_ptr<uint8_t>(),
                     out_accum.data_ptr<float>(),
                     total_counts.data_ptr<int32_t>(),
@@ -308,18 +334,46 @@ torch::Tensor pairwise_mask_loss_forward(
         };
 
         const auto supported_dims = std::make_tuple(
-            std::make_tuple(std::integral_constant<int, 128>{}), // C
+            std::make_tuple(std::integral_constant<int, 128>{}),  // Q
             std::make_tuple(std::integral_constant<int, 256>{}),  // H
             std::make_tuple(std::integral_constant<int, 256>{}),  // W
             std::make_tuple(std::integral_constant<int, 1024>{}), // H_t
-            std::make_tuple(std::integral_constant<int, 1024>{}) // W_t
+            std::make_tuple(std::integral_constant<int, 1024>{})  // W_t
         );
-        const auto runtime_dims = std::make_tuple(C, H, W, H_t, W_t);
+        const auto runtime_dims = std::make_tuple(Q, H, W, H_t, W_t);
         dispatch_kernel(static_launcher, runtime_dims, supported_dims);
     }
 
     err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after reduce kernel: ", cudaGetErrorString(err));
+
+    {
+        auto cls_out = out_accum.data_ptr<float>() + (2 * L * B * Q * GT_out);
+        dim3 grid(L, B, Q);
+
+        auto static_launcher = [&](auto C_val) {
+            reduce_pairwise_label_kernel<decltype(C_val)::value>
+                <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
+                    cls_logits.data_ptr<float>(),
+                    cls_targets.data_ptr<int64_t>(),
+                    cls_out,
+                    static_cast<int32_t>(background_index),
+                    GT_total,
+                    GT_out,
+                    B,
+                    Q,
+                    L,
+                    cls_scale
+                );
+        };
+        const auto supported_dims = std::make_tuple(
+            std::make_tuple(std::integral_constant<int, 128>{}) // C
+        );
+        const auto runtime_dims = std::make_tuple(C);
+        dispatch_kernel(static_launcher, runtime_dims, supported_dims);
+    }
+    err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "CUDA error after class reduce kernel: ", cudaGetErrorString(err));
 
     return out_accum;
 }
