@@ -110,7 +110,7 @@ def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None, scale=1.0):
     N2 = s * s
 
     if num_masks is None:
-        num_masks = float(L * B * C)
+        num_masks = float(B * C)
 
     device = logits.device
     targets_long = targets.long().to(device)
@@ -157,7 +157,7 @@ def sigmoid_cross_entropy_loss_sampling_py(
     assert H_t % h == 0 and W_t % w == 0, "High-res dims must be integer multiples of low-res dims"
 
     if num_masks is None:
-        num_masks = float(L * B * C)
+        num_masks = float(B * C)
 
     device = logits.device
     dtype = logits.dtype
@@ -194,3 +194,91 @@ def sigmoid_cross_entropy_loss_sampling_py(
     P = sampled_logits.shape[-1]
     per_class_loss = per_point_loss.sum(dim=1).reshape(L, B, C)
     return per_class_loss.sum(dim=(1, 2)) / (num_masks * float(P)) * scale
+
+
+def focal_cross_entropy_loss_py(
+    logits, targets, num_masks=None, scale=1.0, gamma: float = 2.0
+):
+    """Efficient count-based sigmoid focal loss with per-(B,C) inverse-frequency weighting.
+
+    For each (b, c) mask:
+        alpha_pos[b,c] = M_bc / (M_bc + N_bc)   # M_bc = # negatives for that mask
+        alpha_neg[b,c] = N_bc / (M_bc + N_bc)   # N_bc = # positives for that mask
+
+    This makes small-area masks emphasize positives; large-area masks emphasize negatives.
+
+    Args:
+        logits: (L, B, C, h, w)
+        targets: (B, H_t, W_t) with int labels in [0, C-1]
+        num_masks: normalization factor over (L * B * C); defaults to L*B*C
+        scale: extra scalar multiplier
+        gamma: focal modulation exponent
+
+    Returns:
+        (L,) tensor: mean focal loss for each level
+    """
+    L, B, C, h, w = logits.shape
+    if L == 0:
+        return logits.new_zeros((0,))
+    B_t, H_t, W_t = targets.shape
+    assert B == B_t, "Batch size mismatch"
+    assert H_t % h == 0 and W_t % w == 0, "High-res dims must be integer multiples of low-res dims"
+
+    sH = H_t // h
+    sW = W_t // w
+    if sH != sW:
+        raise ValueError("This implementation assumes equal scale factor for height and width (square blocks)")
+    s = sH
+    N2 = s * s  # high-res pixels per low-res location
+
+    if num_masks is None:
+        num_masks = float(L * B * C)
+
+    device, dtype = logits.device, logits.dtype
+
+    # One-hot targets at high resolution: (B, C, H_t, W_t)
+    targets_long = targets.long().to(device)
+    onehot = F.one_hot(targets_long, num_classes=C).permute(0, 3, 1, 2).to(dtype=dtype)
+
+    # Count positives per (B, C, h*w) low-res block
+    Bc = onehot.reshape(B * C, 1, H_t, W_t)
+    unf = F.unfold(Bc, kernel_size=(s, s), stride=(s, s))  # (B*C, s*s, h*w)
+    unf = unf.reshape(B, C, s * s, h * w)
+    pos_counts = unf.sum(dim=2)                 # (B, C, h*w)
+    neg_counts = N2 - pos_counts                # (B, C, h*w)
+
+    # Per-(B,C) totals across spatial locations
+    pos_tot_bc = pos_counts.sum(dim=-1)         # (B, C)
+    neg_tot_bc = neg_counts.sum(dim=-1)         # (B, C)
+    denom_bc = (pos_tot_bc + neg_tot_bc).clamp(min=1.0)  # equals H_t*W_t
+
+    # Per-(B,C) inverse-frequency alphas
+    alpha_pos_bc = (neg_tot_bc / denom_bc).to(dtype=dtype)  # M/(M+N)
+    alpha_neg_bc = (pos_tot_bc / denom_bc).to(dtype=dtype)  # N/(M+N)
+
+    alpha_pos_bc = alpha_pos_bc.clamp(max=0.5)
+    alpha_neg_bc = alpha_neg_bc.clamp(min=0.5)
+
+    # Broadcast alphas to (1, B, C, 1) to apply across L and spatial
+    alpha_pos_bc = alpha_pos_bc.unsqueeze(0).unsqueeze(-1)  # (1, B, C, 1)
+    alpha_neg_bc = alpha_neg_bc.unsqueeze(0).unsqueeze(-1)  # (1, B, C, 1)
+
+    # Flatten logits over spatial
+    L_flat = logits.reshape(L, B, C, h * w)
+
+    # Stable BCE pieces
+    ce_pos = F.softplus(-L_flat)   # -log(sigmoid(z))
+    ce_neg = F.softplus(L_flat)    # -log(1 - sigmoid(z))
+
+    # Focal modulation
+    p = torch.sigmoid(L_flat)
+    mod_pos = (1.0 - p) ** gamma
+    mod_neg = p ** gamma
+
+    # Apply counts, per-(B,C) alphas, and focal modulation
+    loss_pos = alpha_pos_bc * mod_pos * ce_pos * pos_counts.unsqueeze(0)
+    loss_neg = alpha_neg_bc * mod_neg * ce_neg * neg_counts.unsqueeze(0)
+    loss_block = loss_pos + loss_neg  # (L, B, C, h*w)
+
+    # Same normalization as original
+    return loss_block.sum(dim=(1, 2, 3)) / (num_masks * H_t * W_t) * scale

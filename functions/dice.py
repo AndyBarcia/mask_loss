@@ -68,7 +68,7 @@ def dice_loss_inefficient_py(logits, targets, smooth=1e-6, num_masks=None, scale
     assert B == B_t, "Batch size mismatch"
 
     if num_masks is None:
-        num_masks = float(L * B * C)
+        num_masks = float(B * C)
 
     # Upsample logits to high-res (nearest)
     logits_up = F.interpolate(
@@ -127,7 +127,7 @@ def dice_loss_py(logits, targets, smooth=1e-6, num_masks=None, scale=1.0):
     N2 = s * s  # number of high-res pixels per low-res pixel
 
     if num_masks is None:
-        num_masks = float(L * B * C)
+        num_masks = float(B * C)
 
     device = logits.device
     targets_long = targets.long().to(device)
