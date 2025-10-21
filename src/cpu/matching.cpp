@@ -6,6 +6,7 @@
 #include <vector>
 #include <limits>
 #include <cmath>
+#include <tuple>
 
 torch::Tensor pairwise_mask_loss_forward(
     const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
@@ -17,6 +18,19 @@ torch::Tensor pairwise_mask_loss_forward(
     const float dice_scale = 1.0,
     const float cls_scale = 1.0f,
     int64_t background_index = -1
+);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mask_matching_unmatched_forward(
+    const torch::Tensor& mask_logits,
+    const torch::Tensor& cls_logits,
+    const torch::Tensor& unmatched_mask,
+    const float smooth,
+    const float sigmoid_scale,
+    const float dice_scale,
+    const float cls_scale,
+    const float area_scale,
+    const bool force_unmatched_masks,
+    const bool force_unmatched_class
 );
 
 static inline void hungarian_assignment(
@@ -122,7 +136,9 @@ std::vector<torch::Tensor> mask_matching(
     float   cls_scale       = 1.0f,
     int64_t background_index= -1,
     double  inf_thresh      = 1e30,
-    int64_t num_masks       = -1
+    int64_t num_masks       = -1,
+    bool    force_unmatched_class_to_background = false,
+    bool    force_unmatched_masks_to_empty      = false
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
     const auto device = mask_logits.device();
@@ -225,14 +241,73 @@ std::vector<torch::Tensor> mask_matching(
         layer_cls_sum.index_add_(0, l_idx, cls_vals);
     }
 
-    // Normalization
-    const double denom_val = (num_masks > 0) ? static_cast<double>(num_masks) : static_cast<double>(matched);
-    const double safe_denom = (denom_val > 0.0) ? denom_val : 1.0;
+    const int64_t total_queries = L * B * C;
+    const int64_t unmatched_queries = std::max<int64_t>(0, total_queries - matched);
 
-    torch::Tensor denom = torch::tensor({safe_denom}, device).to(separate_costs.dtype());
-    torch::Tensor layer_mask_mean = layer_mask_sum / denom;       // (L,)
-    torch::Tensor layer_dice_mean = layer_dice_sum / denom;       // (L,)
-    torch::Tensor layer_cls_mean = layer_cls_sum / denom;         // (L,)
+    torch::Tensor matched_pred = torch::zeros({L, B, C}, matches.options().dtype(torch::kBool));
+    if (matched > 0) {
+        torch::Tensor idx = assigned.nonzero();
+        if (idx.size(0) > 0) {
+            auto l_idx = idx.select(1, 0);
+            auto b_idx = idx.select(1, 1);
+            auto p_idx = matches.masked_select(assigned).to(torch::kLong);
+            matched_pred.index_put_({l_idx, b_idx, p_idx}, true);
+        }
+    }
+
+    torch::Tensor unmatched_mask = matched_pred.logical_not();
+
+    if (unmatched_queries > 0 && (force_unmatched_masks_to_empty || force_unmatched_class_to_background)) {
+        float area_scale = 1.0f;
+        if (force_unmatched_masks_to_empty) {
+            const int64_t H = mask_logits.size(3);
+            const int64_t W = mask_logits.size(4);
+            const int64_t H_t = mask_targets.size(1);
+            const int64_t W_t = mask_targets.size(2);
+            TORCH_CHECK(H > 0 && W > 0, "mask logits must have positive spatial size");
+            TORCH_CHECK(H_t % H == 0 && W_t % W == 0, "Target resolution must be integer multiples of mask resolution");
+            const int64_t scale_h = H_t / H;
+            const int64_t scale_w = W_t / W;
+            TORCH_CHECK(scale_h == scale_w, "Target downsample factors must be equal in both dimensions");
+            area_scale = static_cast<float>(scale_h * scale_w);
+        }
+
+        auto unmatched_contig = unmatched_mask.contiguous();
+        auto unmatched_contrib = mask_matching_unmatched_forward(
+            mask_logits,
+            cls_logits,
+            unmatched_contig,
+            smooth,
+            sigmoid_scale,
+            dice_scale,
+            cls_scale,
+            area_scale,
+            force_unmatched_masks_to_empty,
+            force_unmatched_class_to_background
+        );
+
+        layer_mask_sum += std::get<0>(unmatched_contrib).to(layer_mask_sum.dtype());
+        layer_dice_sum += std::get<1>(unmatched_contrib).to(layer_dice_sum.dtype());
+        layer_cls_sum += std::get<2>(unmatched_contrib).to(layer_cls_sum.dtype());
+    }
+
+    // Normalization
+    int64_t mask_norm = (num_masks > 0)
+        ? num_masks
+        : matched + (force_unmatched_masks_to_empty ? unmatched_queries : 0);
+    if (mask_norm <= 0) mask_norm = 1;
+
+    int64_t cls_norm = (num_masks > 0)
+        ? num_masks
+        : matched + (force_unmatched_class_to_background ? unmatched_queries : 0);
+    if (cls_norm <= 0) cls_norm = 1;
+
+    const double mask_denom = static_cast<double>(mask_norm);
+    const double cls_denom  = static_cast<double>(cls_norm);
+
+    torch::Tensor layer_mask_mean = layer_mask_sum / mask_denom;       // (L,)
+    torch::Tensor layer_dice_mean = layer_dice_sum / mask_denom;       // (L,)
+    torch::Tensor layer_cls_mean = layer_cls_sum / cls_denom;          // (L,)
 
     layer_mask_mean = layer_mask_mean.to(dtype);
     layer_dice_mean = layer_dice_mean.to(dtype);

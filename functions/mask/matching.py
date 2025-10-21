@@ -29,7 +29,9 @@ class MaskMatchingFunction(Function):
         cls_scale,
         background_index, 
         inf_thresh,
-        num_masks
+        num_masks,
+        force_unmatched_class_to_background=False,
+        force_unmatched_masks_to_empty=False,
     ):
         L, B, C, h, w = mask_logits.shape
         B_t, H_t, W_t = mask_targets.shape
@@ -47,6 +49,8 @@ class MaskMatchingFunction(Function):
         background_index_val = int(background_index if background_index is not None else -1)
         inf_thresh_val = float(inf_thresh if inf_thresh is not None else 1e30)
         num_masks_val = int(num_masks if num_masks is not None else -1)
+        force_unmatched_cls = bool(force_unmatched_class_to_background)
+        force_unmatched_masks = bool(force_unmatched_masks_to_empty)
 
         matches, layer_mask_mean, layer_dice_mean, layer_cls_mean, matched = mask_loss.mask_matching(
             mask_logits,
@@ -60,10 +64,12 @@ class MaskMatchingFunction(Function):
             background_index_val,
             inf_thresh_val,
             num_masks_val,
+            force_unmatched_cls,
+            force_unmatched_masks,
         )
 
         ctx.save_for_backward(
-            mask_logits.detach(), 
+            mask_logits.detach(),
             mask_targets.detach(),
             cls_logits.detach(),
             cls_targets.detach(),
@@ -77,6 +83,8 @@ class MaskMatchingFunction(Function):
         ctx.background_index = background_index_val
         ctx.num_masks = num_masks_val
         ctx.matched = int(matched.item()) if matched.numel() > 0 else 0
+        ctx.force_unmatched_cls = force_unmatched_cls
+        ctx.force_unmatched_masks = force_unmatched_masks
 
         return matches, layer_mask_mean, layer_dice_mean, layer_cls_mean, matched
 
@@ -96,6 +104,8 @@ class MaskMatchingFunction(Function):
         cls_scale = ctx.cls_scale
         background_index = ctx.background_index
         num_masks = ctx.num_masks
+        force_unmatched_cls = ctx.force_unmatched_cls
+        force_unmatched_masks = ctx.force_unmatched_masks
 
         grad_layer_mask_mean = grad_layer_mask_mean.contiguous()
         grad_layer_dice_mean = grad_layer_dice_mean.contiguous()
@@ -117,9 +127,25 @@ class MaskMatchingFunction(Function):
             background_index,
             num_masks,
             ctx.matched,
+            force_unmatched_cls,
+            force_unmatched_masks,
         )
 
-        return grad_mask_logits, None, grad_cls_logits, None, None, None, None, None, None, None, None
+        return (
+            grad_mask_logits,
+            None,
+            grad_cls_logits,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 def mask_matching_py(
     mask_logits,         # (L,B,Q,H,W)
@@ -133,6 +159,8 @@ def mask_matching_py(
     background_index= -1,
     inf_thresh      = 1e30,
     num_masks       = None,
+    force_unmatched_class_to_background=False,
+    force_unmatched_masks_to_empty=False,
 ):
     L, B, C, H, W = mask_logits.shape
 
@@ -226,13 +254,55 @@ def mask_matching_py(
         layer_dice_sum.index_add_(0, l_idx, dice_vals)
         layer_cls_sum.index_add_(0, l_idx, cls_vals)
 
-    denom = float(num_masks) if (num_masks is not None and num_masks > 0) else float(matched)
-    if denom <= 0:
-        denom = 1.0
+    total_queries = L * B * C
+    unmatched_queries = total_queries - matched
 
-    layer_mask_mean = layer_mask_sum / denom          # (L,)
-    layer_dice_mean = layer_dice_sum / denom          # (L,)
-    layer_cls_mean = layer_cls_sum / denom            # (L,)
+    if (force_unmatched_masks_to_empty or force_unmatched_class_to_background) and total_queries > 0:
+        assigned_pred = torch.zeros((L, B, C), device=mask_logits.device, dtype=torch.bool)
+        if matched > 0:
+            assigned_pred[l_idx, b_idx, p_idx] = True
+        unmatched_mask = (~assigned_pred).to(mask_logits.dtype)
+
+        if force_unmatched_masks_to_empty and unmatched_queries > 0:
+            bce = F.binary_cross_entropy_with_logits(
+                mask_logits,
+                torch.zeros_like(mask_logits),
+                reduction="none",
+            )
+            mask_loss_per = bce.mean(dim=(-1, -2)) * sigmoid_scale
+            layer_mask_sum += (mask_loss_per * unmatched_mask).sum(dim=(1, 2))
+
+            probs = mask_logits.sigmoid()
+            H_t, W_t = mask_targets.shape[1:]
+            scale_h = H_t // H
+            scale_w = W_t // W
+            area_scale = float(scale_h * scale_w)
+            p_sum_up = probs.sum(dim=(-1, -2)) * area_scale
+            dice_loss = dice_scale * (p_sum_up / (p_sum_up + smooth))
+            layer_dice_sum += (dice_loss * unmatched_mask).sum(dim=(1, 2))
+
+        if force_unmatched_class_to_background and unmatched_queries > 0:
+            cls_bce = F.binary_cross_entropy_with_logits(
+                cls_logits,
+                torch.zeros_like(cls_logits),
+                reduction="none",
+            )
+            cls_loss = cls_bce.mean(dim=-1) * cls_scale
+            layer_cls_sum += (cls_loss * unmatched_mask).sum(dim=(1, 2))
+
+    mask_count = matched + (unmatched_queries if force_unmatched_masks_to_empty else 0)
+    cls_count = matched + (unmatched_queries if force_unmatched_class_to_background else 0)
+
+    if num_masks is not None and num_masks > 0:
+        mask_denom = float(num_masks)
+        cls_denom = float(num_masks)
+    else:
+        mask_denom = float(mask_count) if mask_count > 0 else 1.0
+        cls_denom = float(cls_count) if cls_count > 0 else 1.0
+
+    layer_mask_mean = layer_mask_sum / mask_denom          # (L,)
+    layer_dice_mean = layer_dice_sum / mask_denom          # (L,)
+    layer_cls_mean = layer_cls_sum / cls_denom            # (L,)
 
     # Return exactly like the C++ ext now does
     matched_tensor = torch.tensor(matched, device=mask_logits.device, dtype=torch.long)

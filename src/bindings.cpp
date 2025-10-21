@@ -73,7 +73,9 @@ std::vector<torch::Tensor> mask_matching(
     float   cls_scale       = 1.0f,
     int64_t background_index= -1,
     double  inf_thresh      = 1e30,
-    int64_t num_masks       = -1
+    int64_t num_masks       = -1,
+    bool    force_unmatched_class_to_background = false,
+    bool    force_unmatched_masks_to_empty      = false
 );
 
 std::vector<torch::Tensor> mask_matching_backward(
@@ -91,7 +93,9 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float cls_scale,
     const int64_t background_index,
     const int64_t num_masks,
-    const int64_t matched_count
+    const int64_t matched_count,
+    const bool force_unmatched_class_to_background,
+    const bool force_unmatched_masks_to_empty
 );
 
 torch::Tensor pairwise_label_loss_forward(
