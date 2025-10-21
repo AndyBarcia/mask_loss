@@ -15,6 +15,10 @@ inline __device__ float softplusf(float x) {
     return log1pf(expf(-abs_x)) + fmaxf(x, 0.0f);
 }
 
+// Each block processes a single (layer, batch, query) tuple and accumulates the
+// requested unmatched-query losses directly into per-layer sums. By templating
+// on the two enforcement flags we allow the compiler to drop any unused code
+// paths and shared-memory allocations.
 template <bool ForceMasks, bool ForceClass>
 __global__ void unmatched_forward_kernel(
     const float* __restrict__ mask_logits,
@@ -126,6 +130,10 @@ __global__ void unmatched_forward_kernel(
 
 } // namespace
 
+// Launches the CUDA kernel that integrates unmatched-query penalties into the
+// per-layer loss accumulators. The mask target height/width are used to deduce
+// the number of target pixels represented by a single predicted pixel when we
+// enforce empty masks.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mask_matching_unmatched_forward(
     const torch::Tensor& mask_logits,
     const torch::Tensor& cls_logits,
@@ -134,7 +142,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mask_matching_unmatched_
     const float sigmoid_scale,
     const float dice_scale,
     const float cls_scale,
-    const float area_scale,
+    const int64_t target_H,
+    const int64_t target_W,
     const bool force_unmatched_masks,
     const bool force_unmatched_class
 ) {
@@ -175,7 +184,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mask_matching_unmatched_
     const float sigmoid_scale_val = sigmoid_scale;
     const float dice_scale_val = dice_scale;
     const float cls_scale_val = cls_scale;
-    const float area_scale_val = area_scale;
+    float area_scale_val = 1.0f;
 
     const int device_index = mask_logits.device().index();
     auto stream = at::cuda::getCurrentCUDAStream(device_index);
@@ -192,6 +201,18 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mask_matching_unmatched_
     float* cls_sum_ptr = layer_cls_sum.data_ptr<float>();
     int64_t C = 0;
 
+    if (force_unmatched_masks) {
+        TORCH_CHECK(target_H > 0 && target_W > 0, "mask targets must have positive spatial size");
+        TORCH_CHECK(H > 0 && W > 0, "mask logits must have positive spatial size");
+        TORCH_CHECK(target_H % H == 0 && target_W % W == 0,
+                    "Target resolution must be integer multiples of mask resolution");
+        const int64_t scale_h = target_H / H;
+        const int64_t scale_w = target_W / W;
+        TORCH_CHECK(scale_h == scale_w,
+                    "Target downsample factors must be equal in both dimensions");
+        area_scale_val = static_cast<float>(scale_h * scale_w);
+    }
+
     if (force_unmatched_class) {
         TORCH_CHECK(cls_logits.dim() == 4, "cls_logits must have shape (L,B,Q,C)");
         TORCH_CHECK(cls_logits.size(0) == L && cls_logits.size(1) == B && cls_logits.size(2) == Q,
@@ -202,6 +223,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mask_matching_unmatched_
     }
 
     if (force_unmatched_masks && force_unmatched_class) {
+        // Mask enforcement needs two shared-memory buffers (softplus + sigmoid)
+        // and the class term needs one.
         shared_elems = 3;
         unmatched_forward_kernel<true, true><<<grid, threads, shared_elems * threads * sizeof(float), stream.stream()>>>(
             mask_ptr,

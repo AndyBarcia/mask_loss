@@ -20,6 +20,11 @@ torch::Tensor pairwise_mask_loss_forward(
     int64_t background_index = -1
 );
 
+// Computes unmatched-query penalties on CUDA for the mask, dice, and
+// classification objectives. Only enabled portions of the loss are evaluated
+// by the kernel, allowing us to skip any temporary tensor materialization for
+// disabled terms. The caller provides the mask target spatial size so the
+// kernel can infer the scale factor between prediction logits and targets.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mask_matching_unmatched_forward(
     const torch::Tensor& mask_logits,
     const torch::Tensor& cls_logits,
@@ -28,7 +33,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mask_matching_unmatched_
     const float sigmoid_scale,
     const float dice_scale,
     const float cls_scale,
-    const float area_scale,
+    const int64_t target_H,
+    const int64_t target_W,
     const bool force_unmatched_masks,
     const bool force_unmatched_class
 );
@@ -258,21 +264,9 @@ std::vector<torch::Tensor> mask_matching(
     torch::Tensor unmatched_mask = matched_pred.logical_not();
 
     if (unmatched_queries > 0 && (force_unmatched_masks_to_empty || force_unmatched_class_to_background)) {
-        float area_scale = 1.0f;
-        if (force_unmatched_masks_to_empty) {
-            const int64_t H = mask_logits.size(3);
-            const int64_t W = mask_logits.size(4);
-            const int64_t H_t = mask_targets.size(1);
-            const int64_t W_t = mask_targets.size(2);
-            TORCH_CHECK(H > 0 && W > 0, "mask logits must have positive spatial size");
-            TORCH_CHECK(H_t % H == 0 && W_t % W == 0, "Target resolution must be integer multiples of mask resolution");
-            const int64_t scale_h = H_t / H;
-            const int64_t scale_w = W_t / W;
-            TORCH_CHECK(scale_h == scale_w, "Target downsample factors must be equal in both dimensions");
-            area_scale = static_cast<float>(scale_h * scale_w);
-        }
-
         auto unmatched_contig = unmatched_mask.contiguous();
+        // Accumulate the unmatched contributions on device so we avoid
+        // instantiating zero tensors or reshaping the logits in Python.
         auto unmatched_contrib = mask_matching_unmatched_forward(
             mask_logits,
             cls_logits,
@@ -281,7 +275,8 @@ std::vector<torch::Tensor> mask_matching(
             sigmoid_scale,
             dice_scale,
             cls_scale,
-            area_scale,
+            mask_targets.size(1),
+            mask_targets.size(2),
             force_unmatched_masks_to_empty,
             force_unmatched_class_to_background
         );
