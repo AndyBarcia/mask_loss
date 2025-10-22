@@ -33,7 +33,7 @@ __global__ void mask_matching_forward_kernel(
     const int64_t H,
     const int64_t W,
     const int64_t C,
-    const int64_t GT,
+    const int64_t GT_out,
     const float smooth,
     const float sigmoid_scale,
     const float dice_scale,
@@ -54,7 +54,7 @@ __global__ void mask_matching_forward_kernel(
 
     if (gt_index >= 0) {
         if (threadIdx.x == 0) {
-            const int64_t base = pred_index * GT + gt_index;
+            const int64_t base = pred_index * GT_out + gt_index;
             atomicAdd(layer_mask_sum + l, separate_costs[base]);
             atomicAdd(layer_dice_sum + l, separate_costs[base + term_stride]);
             atomicAdd(layer_cls_sum + l, separate_costs[base + (term_stride << 1)]);
@@ -145,10 +145,10 @@ __global__ void mask_matching_forward_kernel(
 // Launches the CUDA kernel that integrates both matched and unmatched query
 // losses into the per-layer accumulators and applies normalization.
 std::vector<torch::Tensor> mask_matching_forward(
-    const torch::Tensor& mask_logits,
-    const torch::Tensor& cls_logits,
-    const torch::Tensor& separate_costs,
-    const torch::Tensor& pred_to_gt,
+    const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
+    const torch::Tensor& cls_logits,     // (L,B,Q,C),   float
+    const torch::Tensor& separate_costs, // (3,L,B,C,GT_out)
+    const torch::Tensor& pred_to_gt,     // (L,B,Q)
     const float smooth,
     const float sigmoid_scale,
     const float dice_scale,
@@ -171,7 +171,7 @@ std::vector<torch::Tensor> mask_matching_forward(
 
     TORCH_CHECK(mask_logits.dim() == 5, "mask_logits must have shape (L,B,Q,H,W)");
     TORCH_CHECK(separate_costs.dim() == 5 && separate_costs.size(0) == 3,
-        "separate_costs must have shape (3,L,B,Q,GT)");
+        "separate_costs must have shape (3,L,B,Q,GT_out)");
     TORCH_CHECK(pred_to_gt.sizes().equals({mask_logits.size(0), mask_logits.size(1), mask_logits.size(2)}),
         "pred_to_gt must have shape (L,B,Q)");
 
@@ -188,7 +188,7 @@ std::vector<torch::Tensor> mask_matching_forward(
     const int64_t Q = mask_logits.size(2);
     const int64_t H = mask_logits.size(3);
     const int64_t W = mask_logits.size(4);
-    const int64_t GT = separate_costs_contig.size(4);
+    const int64_t GT_out = separate_costs_contig.size(4);
     const int threads = 256;
     int shared_elems = 0;
 
@@ -240,7 +240,7 @@ std::vector<torch::Tensor> mask_matching_forward(
         cls_ptr = cls_contig.data_ptr<float>();
     }
 
-    const int64_t term_stride = L * B * Q * GT;
+    const int64_t term_stride = L * B * Q * GT_out;
 
     if (force_unmatched_masks && force_unmatched_class) {
         shared_elems = 3;
@@ -258,7 +258,7 @@ std::vector<torch::Tensor> mask_matching_forward(
             H,
             W,
             C,
-            GT,
+            GT_out,
             smooth_val,
             sigmoid_scale_val,
             dice_scale_val,
@@ -282,7 +282,7 @@ std::vector<torch::Tensor> mask_matching_forward(
             H,
             W,
             C,
-            GT,
+            GT_out,
             smooth_val,
             sigmoid_scale_val,
             dice_scale_val,
@@ -306,7 +306,7 @@ std::vector<torch::Tensor> mask_matching_forward(
             H,
             W,
             C,
-            GT,
+            GT_out,
             smooth_val,
             sigmoid_scale_val,
             dice_scale_val,
@@ -330,7 +330,7 @@ std::vector<torch::Tensor> mask_matching_forward(
             H,
             W,
             C,
-            GT,
+            GT_out,
             smooth_val,
             sigmoid_scale_val,
             dice_scale_val,

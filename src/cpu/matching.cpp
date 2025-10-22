@@ -12,7 +12,7 @@ torch::Tensor pairwise_mask_loss_forward(
     const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
     const torch::Tensor& mask_targets,   // (B,H_t,W_t), int64
     const torch::Tensor& cls_logits,     // (L,B,Q,C),   float
-    const torch::Tensor& cls_targets,    // (B,GT),      int64,
+    const torch::Tensor& cls_targets,    // (B,GT_total), int64,
     const float smooth,
     const float sigmoid_scale = 1.0,
     const float dice_scale = 1.0,
@@ -23,10 +23,10 @@ torch::Tensor pairwise_mask_loss_forward(
 // Computes matched and unmatched query losses on CUDA and returns the per-layer
 // means together with the number of matched ground truths.
 std::vector<torch::Tensor> mask_matching_forward(
-    const torch::Tensor& mask_logits,
-    const torch::Tensor& cls_logits,
-    const torch::Tensor& separate_costs,
-    const torch::Tensor& pred_to_gt,
+    const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
+    const torch::Tensor& cls_logits,     // (L,B,Q,C),   float
+    const torch::Tensor& separate_costs, // (3,L,B,C,GT_out)
+    const torch::Tensor& pred_to_gt,     // (L,B,Q)
     const float smooth,
     const float sigmoid_scale,
     const float dice_scale,
@@ -39,20 +39,20 @@ std::vector<torch::Tensor> mask_matching_forward(
 );
 
 static inline void hungarian_assignment(
-    const double* cost,  // in (Q, GT)
+    const double* cost,  // in (Q, GT_out)
     int64_t Q,
-    int64_t GT,
+    int64_t GT_out,
     double inf_thresh,
-    long* gt_to_pred_out, // out (GT,)
+    long* gt_to_pred_out, // out (GT_out,)
     long* pred_to_gt_out // out (Q,)
 ) {
-    // Keep only GT columns that have at least one finite (< inf_thresh) cost
+    // Keep only GT_out columns that have at least one finite (< inf_thresh) cost
     std::vector<int64_t> valid_cols;
-    valid_cols.reserve(GT);
-    for (int64_t j = 0; j < GT; ++j) {
+    valid_cols.reserve(GT_out);
+    for (int64_t j = 0; j < GT_out; ++j) {
         bool ok = false;
         for (int64_t i = 0; i < Q; ++i) {
-            const double v = cost[i * GT + j];
+            const double v = cost[i * GT_out + j];
             if (std::isfinite(v) && v < inf_thresh) { ok = true; break; }
         }
         if (ok) valid_cols.push_back(j);
@@ -86,15 +86,15 @@ static inline void hungarian_assignment(
 
         do {
             used[j0] = 1;
-            const int64_t i0    = p[j0];               // which GT row (1..M)
-            const int64_t col_i = valid_cols[i0 - 1];  // original GT column index
+            const int64_t i0    = p[j0];               // which GT_out row (1..M)
+            const int64_t col_i = valid_cols[i0 - 1];  // original GT_out column index
 
             double  delta = std::numeric_limits<double>::infinity();
             int64_t j1    = 0;
 
             for (int64_t j = 1; j <= Q; ++j) if (!used[j]) {
-                // NOTE the transpose here: row = prediction (j-1), col = GT (col_i)
-                const double raw = cost[(j - 1) * GT + col_i];
+                // NOTE the transpose here: row = prediction (j-1), col = GT_out (col_i)
+                const double raw = cost[(j - 1) * GT_out + col_i];
                 const double cij = (std::isfinite(raw) && raw < inf_thresh) ? raw : BIG;
 
                 const double cur = cij - u[i0] - v[j];
@@ -119,15 +119,15 @@ static inline void hungarian_assignment(
         } while (j0 != 0);
     }
 
-    // Convert prediction->GT (p) into GT->prediction for only valid GT columns
-    std::vector<long> row_to_pred(M, -1); // index by GT-row (0..M-1)
+    // Convert prediction->GT_out (p) into GT_out->prediction for only valid GT_out columns
+    std::vector<long> row_to_pred(M, -1); // index by GT_out-row (0..M-1)
     for (int64_t j = 1; j <= Q; ++j) {
         const int64_t i = p[j];           // 0..M
         if (i > 0) row_to_pred[i - 1] = static_cast<long>(j - 1);
     }
     for (int64_t i = 0; i < M; ++i) {
         const int64_t col = valid_cols[i];
-        gt_to_pred_out[col] = row_to_pred[i]; // invalid GT columns stay -1
+        gt_to_pred_out[col] = row_to_pred[i]; // invalid GT_out columns stay -1
         pred_to_gt_out[row_to_pred[i]] = col; // unmatched Q columns stay -1
     }
 }
@@ -136,7 +136,7 @@ std::vector<torch::Tensor> mask_matching(
     const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
     const torch::Tensor& mask_targets,   // (B,H_t,W_t), int64
     const torch::Tensor& cls_logits,     // (L,B,Q,C),   float
-    const torch::Tensor& cls_targets,    // (B,GT),      int64,
+    const torch::Tensor& cls_targets,    // (B,GT_total),int64,
     float   smooth,
     float   sigmoid_scale   = 1.0f,
     float   dice_scale      = 1.0f,
@@ -150,7 +150,7 @@ std::vector<torch::Tensor> mask_matching(
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
     const auto device = mask_logits.device();
 
-    // Get the mask, dice and cls pairwise costs, shape {3, L, B, C, GT_out}
+    // Get the mask, dice and cls pairwise costs, shape (3, L, B, C, GT_out)
     torch::Tensor separate_costs = pairwise_mask_loss_forward(
         mask_logits, 
         mask_targets, 
@@ -178,11 +178,11 @@ std::vector<torch::Tensor> mask_matching(
     const int64_t L  = costs.size(0);
     const int64_t B  = costs.size(1);
     const int64_t Q  = costs.size(2);
-    const int64_t GT = costs.size(3);
+    const int64_t GT_out = costs.size(3);
 
-    // Allocate dense output (L,B,GT) on CPU (filled with -1), then copy to CUDA
+    // Allocate dense output (L,B,GT_out) on CPU (filled with -1), then copy to CUDA
     auto cpu_i64 = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU);
-    torch::Tensor gt_to_pred_cpu = torch::full({L, B, GT}, -1, cpu_i64);
+    torch::Tensor gt_to_pred_cpu = torch::full({L, B, GT_out}, -1, cpu_i64);
     torch::Tensor pred_to_gt_cpu = torch::full({L, B, Q}, -1, cpu_i64);
 
     // Parallel over all (L*B) slices. Each thread uses its own CUDA stream
@@ -205,18 +205,18 @@ std::vector<torch::Tensor> mask_matching(
             // Ensure costs is ready on this stream before any reads/conversions/copies
             costs_ready.block(stream);
 
-            // Take (Q,GT) slice, ensure contiguous, copy to pinned host as double
-            torch::Tensor slice = costs.index({l, b}).contiguous(); // (Q,GT) on CUDA
+            // Take (Q,GT_out) slice, ensure contiguous, copy to pinned host as double
+            torch::Tensor slice = costs.index({l, b}).contiguous(); // (Q,GT_out) on CUDA
 
-            torch::Tensor host = torch::empty({Q, GT}, pinned_opts);
+            torch::Tensor host = torch::empty({Q, GT_out}, pinned_opts);
             host.copy_(slice.to(torch::kDouble), /*non_blocking=*/true);
             stream.synchronize();
 
-            auto* gt_to_pred_ptr_lb = gt_to_pred_ptr + ((l * B) + b) * GT;
+            auto* gt_to_pred_ptr_lb = gt_to_pred_ptr + ((l * B) + b) * GT_out;
             auto* pred_to_gt_ptr_lb = pred_to_gt_ptr + ((l * B) + b) * Q;
             hungarian_assignment(
                 host.data_ptr<double>(), 
-                Q, GT, inf_thresh, 
+                Q, GT_out, inf_thresh, 
                 gt_to_pred_ptr_lb,
                 pred_to_gt_ptr_lb
             );

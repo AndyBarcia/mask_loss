@@ -230,7 +230,7 @@ torch::Tensor pairwise_mask_loss_forward(
     const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
     const torch::Tensor& mask_targets,   // (B,H_t,W_t), int64
     const torch::Tensor& cls_logits,     // (L,B,Q,C),   float
-    const torch::Tensor& cls_targets,    // (B,GT),      int64,
+    const torch::Tensor& cls_targets,    // (B,GT_total),  int64,
     const float smooth,
     const float sigmoid_scale = 1.0,
     const float dice_scale = 1.0,
@@ -255,11 +255,7 @@ torch::Tensor pairwise_mask_loss_forward(
     const int H_t = mask_targets.size(1);
     const int W_t = mask_targets.size(2);
     const int C = cls_logits.size(3);
-
-    // Automatically compute GT_total from the max value in mask_targets
-    torch::Tensor mask_targets_max_tensor = mask_targets.max();
-    const int64_t GT_total_64 = mask_targets_max_tensor.item<int64_t>() + 1;
-    const int GT_total = static_cast<int>(GT_total_64);
+    const int GT_total = cls_targets.size(1);
 
     // Intermediate tensor to store counts of GT_total labels per low-res block
     auto counts = torch::zeros({B, GT_total, H, W}, mask_logits.options().dtype(torch::kUInt8));

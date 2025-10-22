@@ -92,7 +92,7 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float sigmoid_scale,
     const float dice_scale,
     const float cls_scale,
-    const int64_t background_index,
+    int64_t background_index,
     const int64_t num_masks,
     const int64_t matched_count,
     const bool force_unmatched_class_to_background,
