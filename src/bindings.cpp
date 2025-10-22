@@ -75,7 +75,9 @@ std::vector<torch::Tensor> mask_matching(
     double  inf_thresh      = 1e30,
     int64_t num_masks       = -1,
     bool    force_unmatched_class_to_background = false,
-    bool    force_unmatched_masks_to_empty      = false
+    bool    force_unmatched_masks_to_empty      = false,
+    int64_t topk_matches    = 1,
+    int64_t strategy_id     = 0
 );
 
 std::vector<torch::Tensor> mask_matching_backward(

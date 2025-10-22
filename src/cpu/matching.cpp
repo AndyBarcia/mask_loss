@@ -1,3 +1,4 @@
+
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/Parallel.h>
@@ -7,6 +8,9 @@
 #include <limits>
 #include <cmath>
 #include <tuple>
+#include <algorithm>
+#include <numeric>
+#include <utility>
 
 torch::Tensor pairwise_mask_loss_forward(
     const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
@@ -38,79 +42,102 @@ std::vector<torch::Tensor> mask_matching_forward(
     const bool force_unmatched_class
 );
 
-static inline void hungarian_assignment(
-    const double* cost,  // in (Q, GT_out)
-    int64_t Q,
+enum class MatchingStrategy : int64_t {
+    GlobalHungarian = 0,
+    RoundHungarian = 1,
+    Greedy = 2,
+    PseudoGreedy = 3,
+};
+
+struct ColumnRef {
+    int64_t actual;
+};
+
+static inline double big_from(double x) {
+    if (!std::isfinite(x) || x <= 0.0) {
+        return 1e15;
+    }
+    double b = x * 0.5;
+    if (!std::isfinite(b) || b < 1e6) {
+        b = 1e15;
+    }
+    if (b > 1e290) {
+        b = 1e290;
+    }
+    return b;
+}
+
+static void hungarian_assign(
+    const double* cost,
+    const std::vector<int64_t>& pred_indices,
+    const std::vector<ColumnRef>& columns,
     int64_t GT_out,
     double inf_thresh,
-    long* pred_to_gt_out // out (Q,)
+    double BIG,
+    std::vector<int64_t>& assignment_out
 ) {
-    // Keep only GT_out columns that have at least one finite (< inf_thresh) cost
-    std::vector<int64_t> valid_cols;
-    valid_cols.reserve(GT_out);
-    for (int64_t j = 0; j < GT_out; ++j) {
-        bool ok = false;
-        for (int64_t i = 0; i < Q; ++i) {
-            const double v = cost[i * GT_out + j];
-            if (std::isfinite(v) && v < inf_thresh) { ok = true; break; }
-        }
-        if (ok) valid_cols.push_back(j);
+    const int64_t num_preds = static_cast<int64_t>(pred_indices.size());
+    const int64_t M = static_cast<int64_t>(columns.size());
+
+    assignment_out.assign(num_preds, -1);
+
+    if (M == 0 || num_preds == 0) {
+        return;
     }
-    const int64_t M = static_cast<int64_t>(valid_cols.size());
-    // Nothing to assign; return immediately
-    if (M == 0) return;
 
-    TORCH_CHECK(M <= Q, "Hungarian requires #valid GTs (", M, ") <= #preds (", Q, ").");
+    if (num_preds < M) {
+        return;
+    }
 
-    // Large finite fallback cost for masked/invalid pairs
-    auto big_from = [&](double x)->double {
-        if (!std::isfinite(x) || x <= 0) return 1e15;
-        double b = x * 0.5;
-        if (!std::isfinite(b) || b < 1e6) b = 1e15;
-        if (b > 1e290) b = 1e290;
-        return b;
-    };
-    const double BIG = big_from(inf_thresh);
-
-    // Hungarian on a rectangular M (rows = valid GTs) × Q (cols = preds) matrix
-    std::vector<double> u(M + 1, 0.0), v(Q + 1, 0.0);
-    std::vector<int64_t> p(Q + 1, 0), way(Q + 1, 0);
+    std::vector<double> u(M + 1, 0.0), v(num_preds + 1, 0.0);
+    std::vector<int64_t> p(num_preds + 1, 0), way(num_preds + 1, 0);
 
     for (int64_t i = 1; i <= M; ++i) {
         p[0] = i;
         int64_t j0 = 0;
 
-        std::vector<double> minv(Q + 1, std::numeric_limits<double>::infinity());
-        std::vector<char>   used(Q + 1, 0);
+        std::vector<double> minv(num_preds + 1, std::numeric_limits<double>::infinity());
+        std::vector<char> used(num_preds + 1, 0);
 
         do {
             used[j0] = 1;
-            const int64_t i0    = p[j0];               // which GT_out row (1..M)
-            const int64_t col_i = valid_cols[i0 - 1];  // original GT_out column index
+            const int64_t i0 = p[j0];
+            const ColumnRef& col = columns[i0 - 1];
 
-            double  delta = std::numeric_limits<double>::infinity();
-            int64_t j1    = 0;
+            double delta = std::numeric_limits<double>::infinity();
+            int64_t j1 = 0;
 
-            for (int64_t j = 1; j <= Q; ++j) if (!used[j]) {
-                // NOTE the transpose here: row = prediction (j-1), col = GT_out (col_i)
-                const double raw = cost[(j - 1) * GT_out + col_i];
+            for (int64_t j = 1; j <= num_preds; ++j) {
+                if (used[j]) {
+                    continue;
+                }
+                const int64_t pred_idx = pred_indices[j - 1];
+                const double raw = cost[pred_idx * GT_out + col.actual];
                 const double cij = (std::isfinite(raw) && raw < inf_thresh) ? raw : BIG;
-
                 const double cur = cij - u[i0] - v[j];
-                if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
-                if (minv[j] < delta) { delta = minv[j]; j1 = j; }
+                if (cur < minv[j]) {
+                    minv[j] = cur;
+                    way[j] = j0;
+                }
+                if (minv[j] < delta) {
+                    delta = minv[j];
+                    j1 = j;
+                }
             }
 
             TORCH_CHECK(std::isfinite(delta), "Hungarian: no augmenting path found; check costs/inf_thresh.");
 
-            for (int64_t j = 0; j <= Q; ++j) {
-                if (used[j]) { u[p[j]] += delta; v[j] -= delta; }
-                else          { minv[j] -= delta; }
+            for (int64_t j = 0; j <= num_preds; ++j) {
+                if (used[j]) {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    minv[j] -= delta;
+                }
             }
             j0 = j1;
         } while (p[j0] != 0);
 
-        // Augment along the alternating path
         do {
             const int64_t j1 = way[j0];
             p[j0] = p[j1];
@@ -118,15 +145,362 @@ static inline void hungarian_assignment(
         } while (j0 != 0);
     }
 
-    // Convert prediction->GT_out (p) into GT_out->prediction for only valid GT_out columns
-    std::vector<long> row_to_pred(M, -1); // index by GT_out-row (0..M-1)
-    for (int64_t j = 1; j <= Q; ++j) {
-        const int64_t i = p[j];           // 0..M
-        if (i > 0) row_to_pred[i - 1] = static_cast<long>(j - 1);
+    std::vector<int64_t> row_to_pred(M, -1);
+    for (int64_t j = 1; j <= num_preds; ++j) {
+        const int64_t i = p[j];
+        if (i > 0) {
+            row_to_pred[i - 1] = j - 1;
+        }
     }
     for (int64_t i = 0; i < M; ++i) {
-        const int64_t col = valid_cols[i];
-        pred_to_gt_out[row_to_pred[i]] = col; // unmatched Q columns stay -1
+        const int64_t pred_pos = row_to_pred[i];
+        if (pred_pos >= 0) {
+            assignment_out[pred_pos] = i;
+        }
+    }
+}
+
+static void greedy_assign_predictions(
+    const double* cost,
+    const std::vector<int64_t>& preds,
+    const std::vector<int64_t>& valid_cols,
+    double inf_thresh,
+    std::vector<int64_t>& capacities,
+    int64_t GT_out,
+    std::vector<int64_t>& pred_to_gt
+) {
+    for (int64_t idx = 0; idx < static_cast<int64_t>(preds.size()); ++idx) {
+        const int64_t q = preds[idx];
+        if (pred_to_gt[q] >= 0) {
+            continue;
+        }
+        double best_cost = std::numeric_limits<double>::infinity();
+        int64_t best_gt = -1;
+        for (int64_t actual : valid_cols) {
+            if (capacities[actual] <= 0) {
+                continue;
+            }
+            const double c = cost[q * GT_out + actual];
+            if (!std::isfinite(c) || c >= inf_thresh) {
+                continue;
+            }
+            if (c < best_cost) {
+                best_cost = c;
+                best_gt = actual;
+            }
+        }
+        if (best_gt >= 0) {
+            pred_to_gt[q] = best_gt;
+            if (capacities[best_gt] > 0) {
+                capacities[best_gt] -= 1;
+            }
+        }
+    }
+}
+
+static void global_hungarian_assign(
+    const double* cost,
+    int64_t Q,
+    int64_t GT_out,
+    double inf_thresh,
+    int64_t topk,
+    const std::vector<int64_t>& valid_cols,
+    double BIG,
+    std::vector<int64_t>& pred_to_gt
+) {
+    if (topk <= 0) {
+        return;
+    }
+    std::vector<int64_t> all_preds(Q);
+    std::iota(all_preds.begin(), all_preds.end(), 0);
+
+    std::vector<ColumnRef> columns;
+    columns.reserve(valid_cols.size() * static_cast<size_t>(topk));
+    for (int64_t rep = 0; rep < topk && static_cast<int64_t>(columns.size()) < Q; ++rep) {
+        for (int64_t actual : valid_cols) {
+            columns.push_back({actual});
+            if (static_cast<int64_t>(columns.size()) >= Q) {
+                break;
+            }
+        }
+    }
+
+    if (columns.empty()) {
+        return;
+    }
+
+    std::vector<int64_t> assignment;
+    hungarian_assign(cost, all_preds, columns, GT_out, inf_thresh, BIG, assignment);
+
+    for (int64_t idx = 0; idx < static_cast<int64_t>(assignment.size()); ++idx) {
+        const int64_t col_idx = assignment[idx];
+        if (col_idx < 0) {
+            continue;
+        }
+        const int64_t q = all_preds[idx];
+        const int64_t actual = columns[col_idx].actual;
+        const double c = cost[q * GT_out + actual];
+        if (!std::isfinite(c) || c >= inf_thresh) {
+            continue;
+        }
+        pred_to_gt[q] = actual;
+    }
+}
+
+static void round_hungarian_assign(
+    const double* cost,
+    int64_t Q,
+    int64_t GT_out,
+    double inf_thresh,
+    int64_t topk,
+    const std::vector<int64_t>& valid_cols,
+    double BIG,
+    std::vector<int64_t>& pred_to_gt
+) {
+    if (topk <= 0) {
+        return;
+    }
+
+    std::vector<int64_t> capacities(GT_out, 0);
+    for (int64_t actual : valid_cols) {
+        capacities[actual] = topk;
+    }
+
+    std::vector<int64_t> remaining_preds(Q);
+    std::iota(remaining_preds.begin(), remaining_preds.end(), 0);
+
+    for (int64_t round_idx = 0; round_idx < topk; ++round_idx) {
+        std::vector<ColumnRef> columns;
+        for (int64_t actual : valid_cols) {
+            if (capacities[actual] > 0) {
+                columns.push_back({actual});
+            }
+        }
+
+        if (columns.empty() || remaining_preds.empty()) {
+            break;
+        }
+
+        if (static_cast<int64_t>(columns.size()) > static_cast<int64_t>(remaining_preds.size())) {
+            columns.resize(remaining_preds.size());
+        }
+
+        if (columns.empty()) {
+            break;
+        }
+
+        std::vector<int64_t> assignment;
+        hungarian_assign(cost, remaining_preds, columns, GT_out, inf_thresh, BIG, assignment);
+
+        std::vector<int64_t> next_preds;
+        next_preds.reserve(remaining_preds.size());
+
+        for (int64_t idx = 0; idx < static_cast<int64_t>(remaining_preds.size()); ++idx) {
+            const int64_t q = remaining_preds[idx];
+            const int64_t col_idx = assignment[idx];
+            if (col_idx >= 0) {
+                const int64_t actual = columns[col_idx].actual;
+                const double c = cost[q * GT_out + actual];
+                if (!std::isfinite(c) || c >= inf_thresh) {
+                    next_preds.push_back(q);
+                    continue;
+                }
+                pred_to_gt[q] = actual;
+                if (capacities[actual] > 0) {
+                    capacities[actual] -= 1;
+                }
+            } else {
+                next_preds.push_back(q);
+            }
+        }
+
+        remaining_preds.swap(next_preds);
+        if (remaining_preds.empty()) {
+            break;
+        }
+    }
+}
+
+static void greedy_assign_all(
+    const double* cost,
+    int64_t Q,
+    int64_t GT_out,
+    double inf_thresh,
+    int64_t topk,
+    const std::vector<int64_t>& valid_cols,
+    std::vector<int64_t>& pred_to_gt
+) {
+    if (topk <= 0) {
+        return;
+    }
+
+    std::vector<int64_t> capacities(GT_out, 0);
+    for (int64_t actual : valid_cols) {
+        capacities[actual] = topk;
+    }
+
+    std::vector<int64_t> preds(Q);
+    std::iota(preds.begin(), preds.end(), 0);
+    greedy_assign_predictions(cost, preds, valid_cols, inf_thresh, capacities, GT_out, pred_to_gt);
+}
+
+static void pseudo_greedy_assign(
+    const double* cost,
+    int64_t Q,
+    int64_t GT_out,
+    double inf_thresh,
+    int64_t topk,
+    const std::vector<int64_t>& valid_cols,
+    double BIG,
+    std::vector<int64_t>& pred_to_gt
+) {
+    if (topk <= 0) {
+        return;
+    }
+
+    std::vector<int64_t> capacities(GT_out, 0);
+    for (int64_t actual : valid_cols) {
+        capacities[actual] = topk;
+    }
+
+    std::vector<int64_t> all_preds(Q);
+    std::iota(all_preds.begin(), all_preds.end(), 0);
+
+    std::vector<ColumnRef> columns;
+    columns.reserve(valid_cols.size());
+    for (int64_t actual : valid_cols) {
+        columns.push_back({actual});
+        if (static_cast<int64_t>(columns.size()) >= Q) {
+            break;
+        }
+    }
+
+    if (!columns.empty()) {
+        std::vector<int64_t> assignment;
+        hungarian_assign(cost, all_preds, columns, GT_out, inf_thresh, BIG, assignment);
+        for (int64_t idx = 0; idx < static_cast<int64_t>(assignment.size()); ++idx) {
+            const int64_t col_idx = assignment[idx];
+            if (col_idx < 0) {
+                continue;
+            }
+            const int64_t q = all_preds[idx];
+            const int64_t actual = columns[col_idx].actual;
+            const double c = cost[q * GT_out + actual];
+            if (!std::isfinite(c) || c >= inf_thresh) {
+                continue;
+            }
+            pred_to_gt[q] = actual;
+            if (capacities[actual] > 0) {
+                capacities[actual] -= 1;
+            }
+        }
+    }
+
+    std::vector<int64_t> remaining;
+    remaining.reserve(Q);
+    for (int64_t q = 0; q < Q; ++q) {
+        if (pred_to_gt[q] < 0) {
+            remaining.push_back(q);
+        }
+    }
+
+    if (!remaining.empty()) {
+        greedy_assign_predictions(cost, remaining, valid_cols, inf_thresh, capacities, GT_out, pred_to_gt);
+    }
+}
+
+static void assign_predictions_for_slice(
+    const double* cost,
+    int64_t Q,
+    int64_t GT_out,
+    double inf_thresh,
+    int64_t topk,
+    MatchingStrategy strategy,
+    long* pred_to_gt_out,
+    long* pred_round_out
+) {
+    std::vector<int64_t> pred_to_gt_vec(Q, -1);
+    std::vector<int64_t> pred_round_vec(Q, -1);
+
+    if (Q == 0 || GT_out == 0 || topk == 0) {
+        for (int64_t q = 0; q < Q; ++q) {
+            pred_to_gt_out[q] = -1;
+            pred_round_out[q] = -1;
+        }
+        return;
+    }
+
+    std::vector<int64_t> valid_cols;
+    valid_cols.reserve(GT_out);
+    for (int64_t gt = 0; gt < GT_out; ++gt) {
+        bool ok = false;
+        for (int64_t q = 0; q < Q; ++q) {
+            const double v = cost[q * GT_out + gt];
+            if (std::isfinite(v) && v < inf_thresh) {
+                ok = true;
+                break;
+            }
+        }
+        if (ok) {
+            valid_cols.push_back(gt);
+        }
+    }
+
+    if (!valid_cols.empty()) {
+        const double BIG = big_from(inf_thresh);
+        switch (strategy) {
+            case MatchingStrategy::GlobalHungarian:
+                global_hungarian_assign(cost, Q, GT_out, inf_thresh, topk, valid_cols, BIG, pred_to_gt_vec);
+                break;
+            case MatchingStrategy::RoundHungarian:
+                round_hungarian_assign(cost, Q, GT_out, inf_thresh, topk, valid_cols, BIG, pred_to_gt_vec);
+                break;
+            case MatchingStrategy::Greedy:
+                greedy_assign_all(cost, Q, GT_out, inf_thresh, topk, valid_cols, pred_to_gt_vec);
+                break;
+            case MatchingStrategy::PseudoGreedy:
+                pseudo_greedy_assign(cost, Q, GT_out, inf_thresh, topk, valid_cols, BIG, pred_to_gt_vec);
+                break;
+        }
+    }
+
+    std::vector<std::vector<std::pair<double, int64_t>>> per_gt(GT_out);
+    for (int64_t q = 0; q < Q; ++q) {
+        int64_t gt = pred_to_gt_vec[q];
+        if (gt < 0 || gt >= GT_out) {
+            continue;
+        }
+        const double c = cost[q * GT_out + gt];
+        if (!std::isfinite(c) || c >= inf_thresh) {
+            pred_to_gt_vec[q] = -1;
+            continue;
+        }
+        per_gt[gt].emplace_back(c, q);
+    }
+
+    for (int64_t gt = 0; gt < GT_out; ++gt) {
+        auto& entries = per_gt[gt];
+        if (entries.empty()) {
+            continue;
+        }
+        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+            if (a.first == b.first) {
+                return a.second < b.second;
+            }
+            return a.first < b.first;
+        });
+        int64_t round_idx = 0;
+        for (const auto& entry : entries) {
+            if (round_idx >= topk) {
+                break;
+            }
+            pred_round_vec[entry.second] = round_idx++;
+        }
+    }
+
+    for (int64_t q = 0; q < Q; ++q) {
+        pred_to_gt_out[q] = pred_to_gt_vec[q];
+        pred_round_out[q] = pred_round_vec[q];
     }
 }
 
@@ -143,20 +517,26 @@ std::vector<torch::Tensor> mask_matching(
     double  inf_thresh      = 1e30,
     int64_t num_masks       = -1,
     bool    force_unmatched_class_to_background = false,
-    bool    force_unmatched_masks_to_empty      = false
+    bool    force_unmatched_masks_to_empty      = false,
+    int64_t topk_matches    = 1,
+    int64_t strategy_id     = 0
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
     const auto device = mask_logits.device();
 
+    TORCH_CHECK(topk_matches >= 0, "K must be non-negative");
+    TORCH_CHECK(strategy_id >= 0 && strategy_id <= 3, "Invalid matching strategy id");
+    MatchingStrategy strategy = static_cast<MatchingStrategy>(strategy_id);
+
     // Get the mask, dice and cls pairwise costs, shape (3, L, B, C, GT_out)
     torch::Tensor separate_costs = pairwise_mask_loss_forward(
-        mask_logits, 
-        mask_targets, 
+        mask_logits,
+        mask_targets,
         cls_logits,
         cls_targets,
-        smooth, 
-        sigmoid_scale, 
-        dice_scale, 
+        smooth,
+        sigmoid_scale,
+        dice_scale,
         cls_scale,
         background_index
     );
@@ -170,7 +550,7 @@ std::vector<torch::Tensor> mask_matching(
 
     const int dev_index = device.index();
     auto producer = at::cuda::getCurrentCUDAStream(dev_index);
-    at::cuda::CUDAEvent costs_ready; 
+    at::cuda::CUDAEvent costs_ready;
     costs_ready.record(producer);
 
     const int64_t L  = costs.size(0);
@@ -178,11 +558,10 @@ std::vector<torch::Tensor> mask_matching(
     const int64_t Q  = costs.size(2);
     const int64_t GT_out = costs.size(3);
 
-    // Allocate dense output (L,B,GT_out) on CPU (filled with -1), then copy to CUDA
     auto cpu_i64 = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU);
     torch::Tensor pred_to_gt_cpu = torch::full({L, B, Q}, -1, cpu_i64);
+    torch::Tensor pred_round_cpu = torch::full({L, B, Q}, -1, cpu_i64);
 
-    // Parallel over all (L*B) slices. Each thread uses its own CUDA stream
     auto pinned_opts = torch::TensorOptions()
         .dtype(torch::kDouble)
         .device(torch::kCPU)
@@ -190,6 +569,8 @@ std::vector<torch::Tensor> mask_matching(
     const int64_t N = L * B;
 
     auto* pred_to_gt_ptr = pred_to_gt_cpu.data_ptr<long>();
+    auto* pred_round_ptr = pred_round_cpu.data_ptr<long>();
+
     at::parallel_for(0, N, /*grain_size=*/1, [&](int64_t begin, int64_t end){
         for (int64_t t = begin; t < end; ++t) {
             const int64_t l = t / B;
@@ -198,27 +579,31 @@ std::vector<torch::Tensor> mask_matching(
             at::cuda::CUDAStream stream = at::cuda::getStreamFromPool(/*high_priority=*/true, dev_index);
             at::cuda::CUDAStreamGuard guard(stream);
 
-            // Ensure costs is ready on this stream before any reads/conversions/copies
             costs_ready.block(stream);
 
-            // Take (Q,GT_out) slice, ensure contiguous, copy to pinned host as double
-            torch::Tensor slice = costs.index({l, b}).contiguous(); // (Q,GT_out) on CUDA
+            torch::Tensor slice = costs.index({l, b}).contiguous();
 
             torch::Tensor host = torch::empty({Q, GT_out}, pinned_opts);
             host.copy_(slice.to(torch::kDouble), /*non_blocking=*/true);
             stream.synchronize();
 
             auto* pred_to_gt_ptr_lb = pred_to_gt_ptr + ((l * B) + b) * Q;
-            hungarian_assignment(
-                host.data_ptr<double>(), 
-                Q, GT_out, inf_thresh, 
-                pred_to_gt_ptr_lb
+            auto* pred_round_ptr_lb = pred_round_ptr + ((l * B) + b) * Q;
+            assign_predictions_for_slice(
+                host.data_ptr<double>(),
+                Q,
+                GT_out,
+                inf_thresh,
+                topk_matches,
+                strategy,
+                pred_to_gt_ptr_lb,
+                pred_round_ptr_lb
             );
         }
     });
 
-    // Convert matches to CUDA
     torch::Tensor pred_to_gt = pred_to_gt_cpu.to(device, /*non_blocking=*/false);
+    torch::Tensor pred_round = pred_round_cpu.to(device, /*non_blocking=*/false);
 
     auto losses = mask_matching_forward(
         mask_logits,
@@ -240,5 +625,5 @@ std::vector<torch::Tensor> mask_matching(
     torch::Tensor layer_dice_mean = losses[1];
     torch::Tensor layer_cls_mean = losses[2];
 
-    return { pred_to_gt, layer_mask_mean, layer_dice_mean, layer_cls_mean };
+    return { pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean };
 }

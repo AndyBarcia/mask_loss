@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.autograd import Function
@@ -27,16 +28,18 @@ class MaskMatchingFunction(Function):
         sigmoid_scale,
         dice_scale,
         cls_scale,
-        background_index, 
+        background_index,
         inf_thresh,
         num_masks,
         force_unmatched_class_to_background,
         force_unmatched_masks_to_empty,
+        K=1,
+        assignment_strategy="global",
     ):
         L, B, C, h, w = mask_logits.shape
         B_t, H_t, W_t = mask_targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
-        
+
         mask_logits = mask_logits.contiguous().float()
         mask_targets = mask_targets.contiguous()
         cls_logits = cls_logits.contiguous().float()
@@ -49,10 +52,31 @@ class MaskMatchingFunction(Function):
         background_index_val = int(background_index if background_index is not None else -1)
         inf_thresh_val = float(inf_thresh if inf_thresh is not None else 1e30)
         num_masks_val = int(num_masks if num_masks is not None else -1)
-        force_unmatched_cls = bool(force_unmatched_class_to_background if force_unmatched_class_to_background is not None else False)
-        force_unmatched_masks = bool(force_unmatched_masks_to_empty if force_unmatched_masks_to_empty is not None else False)
+        force_unmatched_cls = bool(
+            force_unmatched_class_to_background if force_unmatched_class_to_background is not None else False
+        )
+        force_unmatched_masks = bool(
+            force_unmatched_masks_to_empty if force_unmatched_masks_to_empty is not None else False
+        )
 
-        pred_to_gt, layer_mask_mean, layer_dice_mean, layer_cls_mean = mask_loss.mask_matching(
+        strategy_map = {
+            "global": 0,
+            "round": 1,
+            "greedy": 2,
+            "pseudo_greedy": 3,
+        }
+
+        if assignment_strategy not in strategy_map:
+            raise ValueError(
+                f"Unknown assignment_strategy '{assignment_strategy}'."
+                f" Expected one of {sorted(strategy_map.keys())}"
+            )
+
+        K_val = int(K if K is not None else 1)
+        if K_val < 0:
+            raise ValueError("K must be non-negative")
+
+        pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean = mask_loss.mask_matching(
             mask_logits,
             mask_targets,
             cls_logits,
@@ -66,6 +90,8 @@ class MaskMatchingFunction(Function):
             num_masks_val,
             force_unmatched_cls,
             force_unmatched_masks,
+            K_val,
+            strategy_map[assignment_strategy],
         )
 
         ctx.save_for_backward(
@@ -85,15 +111,15 @@ class MaskMatchingFunction(Function):
         ctx.force_unmatched_cls = force_unmatched_cls
         ctx.force_unmatched_masks = force_unmatched_masks
 
-        return pred_to_gt, layer_mask_mean, layer_dice_mean, layer_cls_mean
+        return pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean
 
     @staticmethod
-    def backward(ctx, _, grad_layer_mask_mean, grad_layer_dice_mean, grad_layer_cls_mean):
+    def backward(ctx, _, __, grad_layer_mask_mean, grad_layer_dice_mean, grad_layer_cls_mean):
         (
-            mask_logits, 
+            mask_logits,
             mask_targets,
             cls_logits,
-            cls_targets, 
+            cls_targets,
             pred_to_gt
         ) = ctx.saved_tensors
         smooth = ctx.smooth
@@ -142,6 +168,8 @@ class MaskMatchingFunction(Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 def mask_matching_py(
@@ -158,8 +186,21 @@ def mask_matching_py(
     num_masks       = None,
     force_unmatched_class_to_background=False,
     force_unmatched_masks_to_empty=False,
+    K=1,
+    assignment_strategy="global",
 ):
     L, B, C, H, W = mask_logits.shape
+    inf_thresh_val = float(inf_thresh if inf_thresh is not None else 1e30)
+    K_val = int(K if K is not None else 1)
+    if K_val < 0:
+        raise ValueError("K must be non-negative")
+
+    strategy_map = {"global", "round", "greedy", "pseudo_greedy"}
+    if assignment_strategy not in strategy_map:
+        raise ValueError(
+            f"Unknown assignment_strategy '{assignment_strategy}'."
+            f" Expected one of {sorted(strategy_map)}"
+        )
 
     # Pairwise costs: (3,L,B,C,GT_out)
     costs = pairwise_mask_loss_py(
@@ -184,48 +225,152 @@ def mask_matching_py(
         dtype=torch.int64,
         device=mask_logits.device,
     ) # (L,B,Q)
+    pred_round = torch.full_like(pred_to_gt, -1)
 
-    # Large finite fallback for masked pairs
-    if math.isfinite(inf_thresh) and inf_thresh > 0:
-        BIG = max(1e6, min(1e290, inf_thresh * 0.5))
-    else:
-        BIG = 1e15
+    def _big_from(threshold: float) -> float:
+        if not math.isfinite(threshold) or threshold <= 0.0:
+            return 1e15
+        big = threshold * 0.5
+        if not math.isfinite(big) or big < 1e6:
+            big = 1e15
+        if big > 1e290:
+            big = 1e290
+        return big
+
+    def _assign_predictions_numpy(cost_np: np.ndarray):
+        Q, GT_out = cost_np.shape
+        pred_to_gt_np = np.full(Q, -1, dtype=np.int64)
+        pred_round_np = np.full(Q, -1, dtype=np.int64)
+        if Q == 0 or GT_out == 0 or K_val == 0:
+            return pred_to_gt_np, pred_round_np
+
+        valid_cols = [
+            gt for gt in range(GT_out)
+            if np.any(np.isfinite(cost_np[:, gt]) & (cost_np[:, gt] < inf_thresh_val))
+        ]
+        if not valid_cols:
+            return pred_to_gt_np, pred_round_np
+
+        BIG = _big_from(inf_thresh_val)
+
+        def hungarian(columns, preds):
+            if not columns or not preds:
+                return {}
+            sub = np.full((len(columns), len(preds)), BIG, dtype=np.float64)
+            for ri, actual in enumerate(columns):
+                vals = cost_np[:, actual]
+                for ci, q in enumerate(preds):
+                    v = vals[q]
+                    if np.isfinite(v) and v < inf_thresh_val:
+                        sub[ri, ci] = v
+            row_ind, col_ind = linear_sum_assignment(sub)
+            matches = {}
+            for r, c in zip(row_ind, col_ind):
+                if sub[r, c] >= BIG:
+                    continue
+                matches[preds[c]] = columns[r]
+            return matches
+
+        if assignment_strategy == "global":
+            columns = []
+            for rep in range(K_val):
+                if len(columns) >= Q:
+                    break
+                for actual in valid_cols:
+                    columns.append(actual)
+                    if len(columns) >= Q:
+                        break
+            matches = hungarian(columns, list(range(Q)))
+            for q, actual in matches.items():
+                pred_to_gt_np[q] = actual
+
+        elif assignment_strategy == "round":
+            capacities = {gt: K_val for gt in valid_cols}
+            remaining = list(range(Q))
+            for _ in range(K_val):
+                active = [gt for gt in valid_cols if capacities[gt] > 0]
+                if not active or not remaining:
+                    break
+                if len(active) > len(remaining):
+                    active = active[:len(remaining)]
+                matches = hungarian(active, remaining)
+                matched = set()
+                for q, actual in matches.items():
+                    if capacities[actual] <= 0:
+                        continue
+                    pred_to_gt_np[q] = actual
+                    capacities[actual] -= 1
+                    matched.add(q)
+                remaining = [q for q in remaining if q not in matched]
+
+        elif assignment_strategy == "greedy":
+            capacities = {gt: K_val for gt in valid_cols}
+            for q in range(Q):
+                best_gt = -1
+                best_cost = math.inf
+                for actual in valid_cols:
+                    if capacities[actual] <= 0:
+                        continue
+                    v = cost_np[q, actual]
+                    if np.isfinite(v) and v < inf_thresh_val and v < best_cost:
+                        best_cost = v
+                        best_gt = actual
+                if best_gt >= 0:
+                    pred_to_gt_np[q] = best_gt
+                    capacities[best_gt] -= 1
+
+        elif assignment_strategy == "pseudo_greedy":
+            capacities = {gt: K_val for gt in valid_cols}
+            base_cols = valid_cols[:min(len(valid_cols), Q)]
+            matches = hungarian(base_cols, list(range(Q)))
+            for q, actual in matches.items():
+                if capacities[actual] <= 0:
+                    continue
+                pred_to_gt_np[q] = actual
+                capacities[actual] -= 1
+
+            for q in range(Q):
+                if pred_to_gt_np[q] >= 0:
+                    continue
+                best_gt = -1
+                best_cost = math.inf
+                for actual in valid_cols:
+                    if capacities[actual] <= 0:
+                        continue
+                    v = cost_np[q, actual]
+                    if np.isfinite(v) and v < inf_thresh_val and v < best_cost:
+                        best_cost = v
+                        best_gt = actual
+                if best_gt >= 0:
+                    pred_to_gt_np[q] = best_gt
+                    capacities[best_gt] -= 1
+
+        for actual in valid_cols:
+            assigned = [
+                q for q in range(Q)
+                if pred_to_gt_np[q] == actual
+                and np.isfinite(cost_np[q, actual])
+                and cost_np[q, actual] < inf_thresh_val
+            ]
+            assigned.sort(key=lambda q: (cost_np[q, actual], q))
+            for round_idx, q in enumerate(assigned):
+                if round_idx >= K_val:
+                    break
+                pred_round_np[q] = round_idx
+
+        return pred_to_gt_np, pred_round_np
 
     for l in range(L):
         for b in range(B):
             # C x GT
             cm = costs[l, b]  # stays on CUDA
-
-            # Columns (GTs) that have at least one finite, < inf_thresh entry
-            finite = torch.isfinite(cm) & (cm < inf_thresh)  # C x GT (bool)
-            valid_cols = torch.nonzero(finite.any(dim=0), as_tuple=False).squeeze(1)  # (M,)
-            M = int(valid_cols.numel())
-            if M == 0:
-                continue  # no valid GTs here
-
-            if C < M:
-                raise RuntimeError(
-                    f"Hungarian requires #preds >= #valid GTs, got C={C}, M={M}"
-                )
-
-            # Build (C x M) submatrix with BIG where invalid
-            sub = cm[:, valid_cols]  # C x M
-            sub = torch.where(
-                (torch.isfinite(sub) & (sub < inf_thresh)),
-                sub,
-                torch.as_tensor(BIG, dtype=sub.dtype, device=sub.device),
+            assign_gt_np, assign_round_np = _assign_predictions_numpy(
+                cm.detach().cpu().to(torch.float64).numpy()
             )
-
-            # Solve on (M x C): rows = valid GTs, cols = predictions
-            sub_np = sub.transpose(0, 1).to(torch.float64).detach().cpu().numpy()  # (M,C)
-            row_ind, col_ind = linear_sum_assignment(sub_np, maximize=False)  # len = M
-
-            # Write back: GT_out index -> predicted row index
-            # row_ind indexes valid GT rows (0..M-1) -> map back to original GT column ids
-            for r, c in zip(row_ind.tolist(), col_ind.tolist()):
-                gt_col = int(valid_cols[r].item())  # original GT column
-                pred_row = int(c)                   # prediction row (0..C-1)
-                pred_to_gt[l, b, pred_row] = gt_col
+            assign_gt = torch.from_numpy(assign_gt_np).to(pred_to_gt.device)
+            assign_round = torch.from_numpy(assign_round_np).to(pred_round.device)
+            pred_to_gt[l, b] = assign_gt
+            pred_round[l, b] = assign_round
 
     # Aggregate losses using assignments
     assigned = pred_to_gt.ge(0) # (L,B,Q)
@@ -300,7 +445,7 @@ def mask_matching_py(
     layer_dice_mean = layer_dice_sum / mask_denom  # (L,)
     layer_cls_mean = layer_cls_sum / cls_denom     # (L,)
 
-    return pred_to_gt, layer_mask_mean, layer_dice_mean, layer_cls_mean
+    return pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean
 
 def mask_matching_sampling_py(
     mask_logits,         # (L,B,Q,H,W)
