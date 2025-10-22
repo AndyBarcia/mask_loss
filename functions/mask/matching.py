@@ -44,8 +44,8 @@ class MaskMatchingFunction(Function):
         num_masks,
         force_unmatched_class_to_background,
         force_unmatched_masks_to_empty,
-        K=1,
-        assignment_strategy="global",
+        K,
+        assignment_strategy,
     ):
         """Run the forward pass of the matching op.
 
@@ -106,6 +106,8 @@ class MaskMatchingFunction(Function):
         force_unmatched_masks = bool(
             force_unmatched_masks_to_empty if force_unmatched_masks_to_empty is not None else False
         )
+
+        assignment_strategy = assignment_strategy if assignment_strategy is not None else "global"
 
         strategy_map = {
             "global": 0,
