@@ -62,6 +62,8 @@ torch::Tensor pairwise_mask_loss_forward(
     int64_t background_index = -1
 );
 
+// Hybrid mask matcher front-end.  Returns ``{pred_to_gt, pred_round,
+// layer_mask_mean, layer_dice_mean, layer_cls_mean}``.
 std::vector<torch::Tensor> mask_matching(
     const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
     const torch::Tensor& mask_targets,   // (B,H_t,W_t), int64

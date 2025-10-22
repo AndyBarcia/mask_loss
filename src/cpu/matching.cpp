@@ -67,6 +67,16 @@ static inline double big_from(double x) {
     return b;
 }
 
+// Run the Hungarian algorithm on the specified rows/columns of the cost matrix.
+//
+// Arguments:
+//   cost           : Pointer to the flattened (Q x GT_out) cost matrix.
+//   pred_indices   : Indices of the predictions to consider (rows in ``cost``).
+//   columns        : Column references that identify the GT indices to expose.
+//   GT_out         : Number of columns in the original cost matrix.
+//   inf_thresh     : Values >= threshold are treated as masked (set to ``BIG``).
+//   BIG            : Finite substitute for infinity used to skip invalid pairs.
+//   assignment_out : Output vector mapping ``pred_indices`` to column slots.
 static void hungarian_assign(
     const double* cost,
     const std::vector<int64_t>& pred_indices,
@@ -160,6 +170,11 @@ static void hungarian_assign(
     }
 }
 
+// Helper that assigns a set of predictions greedily while respecting per-GT
+// capacities.  Any prediction already matched is skipped.
+//
+// Arguments mirror ``greedy_assign_all`` but allow re-use for the pseudo greedy
+// tail where only a subset of predictions remains.
 static void greedy_assign_predictions(
     const double* cost,
     const std::vector<int64_t>& preds,
@@ -202,6 +217,10 @@ static void greedy_assign_predictions(
 // every valid ground-truth column.  The duplication provides `topk` slots per
 // GT so the solver can select the best detections globally while respecting
 // the per-ground-truth budget.
+// Global Hungarian strategy: materialise up to ``topk`` duplicates of each
+// valid ground-truth column and run a single assignment.  This exposes the best
+// ``topk`` detections per ground truth without imposing round-by-round
+// structure.
 static void global_hungarian_assign(
     const double* cost,
     int64_t Q,
@@ -254,6 +273,9 @@ static void global_hungarian_assign(
 // Perform K Hungarian rounds.  Each round exposes each ground truth at most
 // once, consumes any matched detections, and therefore mimics the multi-round
 // matching used by DETR-style approaches.
+// Round-based Hungarian strategy: run ``topk`` independent rounds.  Each round
+// exposes each ground truth once, consumes matched predictions, and therefore
+// mirrors the multi-stage assigners used by DETR derivatives.
 static void round_hungarian_assign(
     const double* cost,
     int64_t Q,
@@ -330,6 +352,8 @@ static void round_hungarian_assign(
 
 // Pure greedy assignment that picks the available ground truth with the
 // lowest cost for every detection.  Capacities enforce the per-GT budget.
+// Pure greedy strategy: visit every detection in order and pick the available
+// ground truth with the lowest cost.  Capacities implement the ``topk`` budget.
 static void greedy_assign_all(
     const double* cost,
     int64_t Q,
@@ -356,6 +380,8 @@ static void greedy_assign_all(
 // Hybrid strategy: run one Hungarian round to secure the best global matches
 // and assign the rest greedily.  This mirrors the "pseudo greedy" matching
 // used in several DETR follow-ups.
+// Pseudo-greedy strategy: execute one global Hungarian round to secure the
+// best matches and then greedily fill the remaining capacity.
 static void pseudo_greedy_assign(
     const double* cost,
     int64_t Q,
@@ -421,6 +447,17 @@ static void pseudo_greedy_assign(
     }
 }
 
+// Assign predictions for a single (layer, batch) slice.
+//
+// Args:
+//   cost          : Pointer to the (Q x GT_out) cost matrix for the slice.
+//   Q             : Number of detections/queries.
+//   GT_out        : Number of ground truths after padding.
+//   inf_thresh    : Infinity threshold passed by the user.
+//   topk          : K budget (max assignments per ground truth).
+//   strategy      : Matching strategy selected by the caller.
+//   pred_to_gt_out: Output buffer ``(Q,)`` receiving the GT index per query.
+//   pred_round_out: Output buffer ``(Q,)`` receiving the round/order index.
 static void assign_predictions_for_slice(
     const double* cost,
     int64_t Q,
@@ -518,6 +555,25 @@ static void assign_predictions_for_slice(
     }
 }
 
+// CPU-side orchestrator used by the CUDA extension to run the hybrid matcher.
+//
+// Args:
+//   mask_logits / mask_targets / cls_logits / cls_targets:
+//       Decoder predictions and ground truth tensors.  See bindings for shapes.
+//   smooth / sigmoid_scale / dice_scale / cls_scale:
+//       Loss hyper-parameters mirroring the Python API.
+//   background_index:
+//       Index of the background class in ``cls_targets`` (or -1 to disable).
+//   inf_thresh:
+//       Threshold for treating costs as ``+inf`` (ignored by the matcher).
+//   num_masks:
+//       Optional normalisation denominator for the per-layer loss means.
+//   force_unmatched_class_to_background / force_unmatched_masks_to_empty:
+//       Flags that control whether unmatched queries contribute supervision.
+//   topk_matches:
+//       Maximum number of detections that can be paired with each ground truth.
+//   strategy_id:
+//       Integer identifier selecting the matching strategy.
 std::vector<torch::Tensor> mask_matching(
     const torch::Tensor& mask_logits,    // (L,B,Q,H,W), float
     const torch::Tensor& mask_targets,   // (B,H_t,W_t), int64

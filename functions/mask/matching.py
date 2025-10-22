@@ -17,9 +17,20 @@ except ImportError:
     print("Run: pip3 install --no-build-isolation .")
 
 class MaskMatchingFunction(Function):
+    """Autograd bridge for the CUDA/C++ hybrid matching kernels.
+
+    The ``forward`` and ``backward`` implementations are thin wrappers over the
+    compiled extension.  They perform basic validation / defaulting of the
+    Python arguments and expose a clean ``torch.autograd.Function`` interface.
+
+    ``MaskMatchingFunction`` is intentionally minimal so that all behavioural
+    documentation (matching rounds, loss aggregation, etc.) can live alongside
+    the reference Python implementation below.  Still, we document every input
+    to make it easy for readers to map the signature to the kernels.
+    """
     @staticmethod
     def forward(
-        ctx, 
+        ctx,
         mask_logits,         # (L,B,Q,H,W)
         mask_targets,        # (B,H_t,W_t)
         cls_logits,          # (L,B,Q,C)
@@ -36,6 +47,43 @@ class MaskMatchingFunction(Function):
         K=1,
         assignment_strategy="global",
     ):
+        """Run the forward pass of the matching op.
+
+        Args:
+            ctx: Autograd context used to stash tensors for the backward pass.
+            mask_logits (Tensor): Raw mask predictions with shape ``(L, B, Q, H, W)``.
+                ``L`` is the number of decoder layers, ``B`` the batch size,
+                ``Q`` the number of queries and ``H x W`` the mask resolution.
+            mask_targets (Tensor): Integer tensor ``(B, H_t, W_t)`` containing
+                per-pixel ground-truth instance identifiers.
+            cls_logits (Tensor): Classification logits ``(L, B, Q, C)`` where
+                ``C`` is the number of categories (including background).
+            cls_targets (Tensor): Ground-truth class labels ``(B, GT)`` where
+                ``GT`` is the maximum number of instances per image.
+            smooth (float): Additive smoothing constant used by the dice loss.
+            sigmoid_scale (float): Scalar multiplier for the sigmoid/BCE cost.
+            dice_scale (float): Scalar multiplier applied to the dice cost.
+            cls_scale (float): Scalar multiplier applied to the class cost.
+            background_index (int): Index in ``cls_targets`` that represents
+                the background class. ``-1`` disables background forcing.
+            inf_thresh (float): Threshold above which costs are treated as
+                ``+inf`` and therefore ignored by the assignment step.
+            num_masks (int): Optional normalisation denominator for the mask
+                and dice losses. ``-1`` or ``None`` fall back to the number of
+                (matched) elements.
+            force_unmatched_class_to_background (bool): Whether unmatched
+                predictions should contribute a background classification loss.
+            force_unmatched_masks_to_empty (bool): Whether unmatched predictions
+                should be trained towards an empty mask.
+            K (int): Maximum number of detections that can be matched to the
+                same ground truth (hybrid matching "top-k" budget).
+            assignment_strategy (str): Name of the matching strategy.  One of
+                ``{"global", "round", "greedy", "pseudo_greedy"}``.
+        Returns:
+            Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: ``pred_to_gt``
+                assignments, ``pred_round`` rank indices, and the per-layer
+                mask, dice, and classification loss means.
+        """
         L, B, C, h, w = mask_logits.shape
         B_t, H_t, W_t = mask_targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
@@ -115,6 +163,7 @@ class MaskMatchingFunction(Function):
 
     @staticmethod
     def backward(ctx, _, __, grad_layer_mask_mean, grad_layer_dice_mean, grad_layer_cls_mean):
+        """Backpropagate the gradients through the CUDA extension."""
         (
             mask_logits,
             mask_targets,
@@ -189,6 +238,35 @@ def mask_matching_py(
     K=1,
     assignment_strategy="global",
 ):
+    """Reference Python implementation of :func:`mask_matching`.
+
+    This function mirrors the CUDA extension in pure Python/Numpy so it can be
+    used for debugging or in environments where the extension is not available.
+
+    Args:
+        mask_logits (Tensor): Decoder mask logits ``(L, B, Q, H, W)``.
+        mask_targets (Tensor): Ground-truth mask indices ``(B, H_t, W_t)``.
+        cls_logits (Tensor): Decoder class logits ``(L, B, Q, C)``.
+        cls_targets (Tensor): Ground-truth class labels ``(B, GT)``.
+        smooth (float): Dice smoothing constant.
+        sigmoid_scale (float): Weight applied to the sigmoid/BCE cost.
+        dice_scale (float): Weight applied to the dice cost.
+        cls_scale (float): Weight applied to the classification cost.
+        background_index (int): Background class index or ``-1`` to disable.
+        inf_thresh (float): Costs equal/above this value are ignored.
+        num_masks (Optional[int]): Optional denominator for loss averaging.
+        force_unmatched_class_to_background (bool): If ``True`` enforce
+            background classification for unmatched predictions.
+        force_unmatched_masks_to_empty (bool): If ``True`` supervise unmatched
+            predictions towards empty masks.
+        K (int): Maximum number of detections per ground truth.
+        assignment_strategy (str): Strategy identifier (see below).
+
+    Returns:
+        Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: The same values exposed
+        by the CUDA extension: ``pred_to_gt``, ``pred_round``, and the per-layer
+        averaged losses.
+    """
     L, B, C, H, W = mask_logits.shape
     inf_thresh_val = float(inf_thresh if inf_thresh is not None else 1e30)
     K_val = int(K if K is not None else 1)
@@ -228,6 +306,7 @@ def mask_matching_py(
     pred_round = torch.full_like(pred_to_gt, -1)
 
     def _big_from(threshold: float) -> float:
+        """Return a large finite number used when masking invalid costs."""
         if not math.isfinite(threshold) or threshold <= 0.0:
             return 1e15
         big = threshold * 0.5
@@ -238,6 +317,16 @@ def mask_matching_py(
         return big
 
     def _assign_predictions_numpy(cost_np: np.ndarray):
+        """Solve the matching problem on a ``(Q, GT_out)`` cost matrix.
+
+        Args:
+            cost_np (np.ndarray): Dense cost matrix for a single layer/batch
+                slice, already transferred to host memory.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: ``pred_to_gt`` and ``pred_round``
+                arrays encoding the best assignments and round indices.
+        """
         Q, GT_out = cost_np.shape
         pred_to_gt_np = np.full(Q, -1, dtype=np.int64)
         pred_round_np = np.full(Q, -1, dtype=np.int64)
@@ -254,6 +343,7 @@ def mask_matching_py(
         BIG = _big_from(inf_thresh_val)
 
         def hungarian(columns, preds):
+            """Execute the Hungarian algorithm on a sub-problem."""
             if not columns or not preds:
                 return {}
             sub = np.full((len(columns), len(preds)), BIG, dtype=np.float64)
