@@ -43,7 +43,6 @@ static inline void hungarian_assignment(
     int64_t Q,
     int64_t GT_out,
     double inf_thresh,
-    long* gt_to_pred_out, // out (GT_out,)
     long* pred_to_gt_out // out (Q,)
 ) {
     // Keep only GT_out columns that have at least one finite (< inf_thresh) cost
@@ -127,7 +126,6 @@ static inline void hungarian_assignment(
     }
     for (int64_t i = 0; i < M; ++i) {
         const int64_t col = valid_cols[i];
-        gt_to_pred_out[col] = row_to_pred[i]; // invalid GT_out columns stay -1
         pred_to_gt_out[row_to_pred[i]] = col; // unmatched Q columns stay -1
     }
 }
@@ -182,7 +180,6 @@ std::vector<torch::Tensor> mask_matching(
 
     // Allocate dense output (L,B,GT_out) on CPU (filled with -1), then copy to CUDA
     auto cpu_i64 = torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU);
-    torch::Tensor gt_to_pred_cpu = torch::full({L, B, GT_out}, -1, cpu_i64);
     torch::Tensor pred_to_gt_cpu = torch::full({L, B, Q}, -1, cpu_i64);
 
     // Parallel over all (L*B) slices. Each thread uses its own CUDA stream
@@ -192,7 +189,6 @@ std::vector<torch::Tensor> mask_matching(
         .pinned_memory(true);
     const int64_t N = L * B;
 
-    auto* gt_to_pred_ptr = gt_to_pred_cpu.data_ptr<long>();
     auto* pred_to_gt_ptr = pred_to_gt_cpu.data_ptr<long>();
     at::parallel_for(0, N, /*grain_size=*/1, [&](int64_t begin, int64_t end){
         for (int64_t t = begin; t < end; ++t) {
@@ -212,19 +208,16 @@ std::vector<torch::Tensor> mask_matching(
             host.copy_(slice.to(torch::kDouble), /*non_blocking=*/true);
             stream.synchronize();
 
-            auto* gt_to_pred_ptr_lb = gt_to_pred_ptr + ((l * B) + b) * GT_out;
             auto* pred_to_gt_ptr_lb = pred_to_gt_ptr + ((l * B) + b) * Q;
             hungarian_assignment(
                 host.data_ptr<double>(), 
                 Q, GT_out, inf_thresh, 
-                gt_to_pred_ptr_lb,
                 pred_to_gt_ptr_lb
             );
         }
     });
 
     // Convert matches to CUDA
-    torch::Tensor gt_to_pred = gt_to_pred_cpu.to(device, /*non_blocking=*/false);
     torch::Tensor pred_to_gt = pred_to_gt_cpu.to(device, /*non_blocking=*/false);
 
     auto losses = mask_matching_forward(
@@ -243,12 +236,9 @@ std::vector<torch::Tensor> mask_matching(
         force_unmatched_class_to_background
     );
 
-    TORCH_CHECK(losses.size() == 4, "mask_matching_forward must return four tensors");
-
     torch::Tensor layer_mask_mean = losses[0];
     torch::Tensor layer_dice_mean = losses[1];
     torch::Tensor layer_cls_mean = losses[2];
-    torch::Tensor matched_tensor = losses[3];
 
-    return { gt_to_pred, pred_to_gt, layer_mask_mean, layer_dice_mean, layer_cls_mean, matched_tensor };
+    return { pred_to_gt, layer_mask_mean, layer_dice_mean, layer_cls_mean };
 }

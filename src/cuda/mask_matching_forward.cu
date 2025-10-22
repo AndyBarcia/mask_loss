@@ -342,19 +342,19 @@ std::vector<torch::Tensor> mask_matching_forward(
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    const int64_t matched_gt = pred_to_gt_contig.ge(0).sum().item<int64_t>();
+    const int64_t matched_dts = pred_to_gt_contig.ge(0).sum().item<int64_t>();
     const int64_t unmatched_pred = pred_to_gt_contig.lt(0).sum().item<int64_t>();
 
     int64_t mask_norm = (num_masks > 0)
         ? num_masks
-        : matched_gt + (force_unmatched_masks ? unmatched_pred : 0);
+        : matched_dts + (force_unmatched_masks ? unmatched_pred : 0);
     if (mask_norm <= 0) {
         mask_norm = 1;
     }
 
     int64_t cls_norm = (num_masks > 0)
         ? num_masks
-        : matched_gt + (force_unmatched_class ? unmatched_pred : 0);
+        : matched_dts + (force_unmatched_class ? unmatched_pred : 0);
     if (cls_norm <= 0) {
         cls_norm = 1;
     }
@@ -371,11 +371,6 @@ std::vector<torch::Tensor> mask_matching_forward(
     layer_dice_mean = layer_dice_mean.to(out_dtype);
     layer_cls_mean = layer_cls_mean.to(out_dtype);
 
-    auto matched_tensor = torch::scalar_tensor(
-        matched_gt,
-        torch::TensorOptions().dtype(torch::kLong).device(mask_logits.device())
-    );
-
-    return { layer_mask_mean, layer_dice_mean, layer_cls_mean, matched_tensor };
+    return { layer_mask_mean, layer_dice_mean, layer_cls_mean };
 }
 

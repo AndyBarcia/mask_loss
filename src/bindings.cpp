@@ -86,7 +86,6 @@ std::vector<torch::Tensor> mask_matching_backward(
     const torch::Tensor& mask_targets,
     const torch::Tensor& cls_logits,
     const torch::Tensor& cls_targets,
-    const torch::Tensor& gt_to_pred,
     const torch::Tensor& pred_to_gt,
     const float smooth,
     const float sigmoid_scale,
@@ -94,7 +93,6 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float cls_scale,
     int64_t background_index,
     const int64_t num_masks,
-    const int64_t matched_count,
     const bool force_unmatched_class_to_background,
     const bool force_unmatched_masks_to_empty
 );
