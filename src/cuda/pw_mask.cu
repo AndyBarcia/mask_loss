@@ -32,12 +32,12 @@ reduce_pairwise_label_kernel(
 // that is independent of the ground-truth mask and the total probability mass.
 // It then iterates over each ground-truth mask to accumulate the remaining
 // class-specific terms and writes both losses to the output tensor.
-template <int C, int H, int W, int H_t, int W_t>
+template <int Q, int H, int W, int H_t, int W_t>
 __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK)
 reduce_pairwise_sigmoid_dice_kernel(
-    const float* __restrict__ logits,           // shape (L, B, C, H, W)
+    const float* __restrict__ logits,           // shape (L, B, Q, H, W)
     const uint8_t* __restrict__ counts,         // shape (B, GT_total, H, W)
-    float* __restrict__ out,                    // shape (2, L, B, C, GT_out)
+    float* __restrict__ out,                    // shape (2, L, B, Q, GT_out)
     const int32_t* __restrict__ total_counts,   // shape (B, GT_total)
     const int background_index,
     const int GT_total,
@@ -61,8 +61,8 @@ reduce_pairwise_sigmoid_dice_kernel(
     const int ci = blockIdx.z;
     const int tid = threadIdx.x;
 
-    const int stride_slice = L * B * C * GT_out;
-    const int base_offset = ((l * B + b) * C + ci) * GT_out;
+    const int stride_slice = L * B * Q * GT_out;
+    const int base_offset = ((l * B + b) * Q + ci) * GT_out;
     float* out_bce  = out + base_offset;
     float* out_dice = out + stride_slice + base_offset;
 
@@ -85,7 +85,7 @@ reduce_pairwise_sigmoid_dice_kernel(
                 const int j = tj + dj;
                 float Lij = 0.f;
                 if (i < H && j < W) {
-                    Lij = logits[(((l * B + b) * C + ci) * H + i) * W + j];
+                    Lij = logits[(((l * B + b) * Q + ci) * H + i) * W + j];
                 }
                 s_logits[idx] = Lij;
             }
@@ -170,7 +170,7 @@ reduce_pairwise_sigmoid_dice_kernel(
                     const int j = tj + dj;
                     float Lij = 0.f;
                     if (i < H && j < W) {
-                        Lij = logits[(((l * B + b) * C + ci) * H + i) * W + j];
+                        Lij = logits[(((l * B + b) * Q + ci) * H + i) * W + j];
                     }
                     s_logits[idx] = Lij;
                 }
