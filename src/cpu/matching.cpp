@@ -20,24 +20,20 @@ torch::Tensor pairwise_mask_loss_forward(
     int64_t background_index = -1
 );
 
-// Computes unmatched-query penalties on CUDA for the mask, dice, and
-// classification objectives. Only enabled portions of the loss are evaluated
-// by the kernel, allowing us to skip any temporary tensor materialization for
-// disabled terms. The caller provides the mask target spatial size so the
-// kernel can infer the scale factor between prediction logits and targets.
-void mask_matching_unmatched_forward(
+// Computes matched and unmatched query losses on CUDA and returns the per-layer
+// means together with the number of matched ground truths.
+std::vector<torch::Tensor> mask_matching_forward(
     const torch::Tensor& mask_logits,
     const torch::Tensor& cls_logits,
-    const torch::Tensor& unassigned_pred,
-    const torch::Tensor& layer_mask_sum,
-    const torch::Tensor& layer_dice_sum,
-    const torch::Tensor& layer_cls_sum,
+    const torch::Tensor& separate_costs,
+    const torch::Tensor& pred_to_gt,
     const float smooth,
     const float sigmoid_scale,
     const float dice_scale,
     const float cls_scale,
     const int64_t target_H,
     const int64_t target_W,
+    const int64_t num_masks,
     const bool force_unmatched_masks,
     const bool force_unmatched_class
 );
@@ -153,7 +149,6 @@ std::vector<torch::Tensor> mask_matching(
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
     const auto device = mask_logits.device();
-    const auto dtype  = mask_logits.dtype();
 
     // Get the mask, dice and cls pairwise costs, shape {3, L, B, C, GT_out}
     torch::Tensor separate_costs = pairwise_mask_loss_forward(
@@ -232,85 +227,28 @@ std::vector<torch::Tensor> mask_matching(
     torch::Tensor gt_to_pred = gt_to_pred_cpu.to(device, /*non_blocking=*/false);
     torch::Tensor pred_to_gt = pred_to_gt_cpu.to(device, /*non_blocking=*/false);
 
-    // Aggregate per-layer sigmoid/dice using assignments
-    torch::Tensor assigned_gt = gt_to_pred.ge(0); // (L,B,GT)
-    const int64_t matched_gt = assigned_gt.sum().item<int64_t>(); // local matched_gt GTs
-
-    torch::Tensor layer_mask_sum = torch::zeros({L}, device).to(separate_costs.dtype());
-    torch::Tensor layer_dice_sum = torch::zeros({L}, device).to(separate_costs.dtype());
-    torch::Tensor layer_cls_sum = torch::zeros({L}, device).to(separate_costs.dtype());
-
-    if (matched_gt > 0) {
-        // idx: (N,3) with [l,b,g]
-        torch::Tensor idx = assigned_gt.nonzero(); // CUDA int64
-        auto l_idx = idx.select(1, 0);
-        auto b_idx = idx.select(1, 1);
-        auto g_idx = idx.select(1, 2);
-
-        // p: (N,) prediction rows
-        torch::Tensor p_idx = gt_to_pred.masked_select(assigned_gt).to(torch::kLong);
-
-        // Gather values
-        torch::Tensor sig_vals  = separate_costs.index({0, l_idx, b_idx, p_idx, g_idx});
-        torch::Tensor dice_vals = separate_costs.index({1, l_idx, b_idx, p_idx, g_idx});
-        torch::Tensor cls_vals  = separate_costs.index({2, l_idx, b_idx, p_idx, g_idx});
-
-        // Scatter-add into per-layer sums
-        layer_mask_sum.index_add_(0, l_idx, sig_vals);
-        layer_dice_sum.index_add_(0, l_idx, dice_vals);
-        layer_cls_sum.index_add_(0, l_idx, cls_vals);
-    }
-
-    // Process unmatched queries.
-    torch::Tensor unassigned_pred = pred_to_gt.eq(-1); // (L,B,Q)
-    const int64_t unmatched_pred = unassigned_pred.sum().item<int64_t>(); // local unmatched detections
-
-    // If neccesary, include the loss of the unmatched queries.
-    if (unmatched_pred > 0 && (force_unmatched_masks_to_empty || force_unmatched_class_to_background)) {
-        mask_matching_unmatched_forward(
-            mask_logits,
-            cls_logits,
-            unassigned_pred,
-            layer_mask_sum,
-            layer_dice_sum,
-            layer_cls_sum,
-            smooth,
-            sigmoid_scale,
-            dice_scale,
-            cls_scale,
-            mask_targets.size(1),
-            mask_targets.size(2),
-            force_unmatched_masks_to_empty,
-            force_unmatched_class_to_background
-        );
-    }
-
-    // Normalization
-    int64_t mask_norm = (num_masks > 0)
-        ? num_masks
-        : matched_gt + (force_unmatched_masks_to_empty ? unmatched_pred : 0);
-    if (mask_norm <= 0) mask_norm = 1;
-
-    int64_t cls_norm = (num_masks > 0)
-        ? num_masks
-        : matched_gt + (force_unmatched_class_to_background ? unmatched_pred : 0);
-    if (cls_norm <= 0) cls_norm = 1;
-
-    const double mask_denom = static_cast<double>(mask_norm);
-    const double cls_denom  = static_cast<double>(cls_norm);
-
-    torch::Tensor layer_mask_mean = layer_mask_sum / mask_denom;       // (L,)
-    torch::Tensor layer_dice_mean = layer_dice_sum / mask_denom;       // (L,)
-    torch::Tensor layer_cls_mean = layer_cls_sum / cls_denom;          // (L,)
-
-    layer_mask_mean = layer_mask_mean.to(dtype);
-    layer_dice_mean = layer_dice_mean.to(dtype);
-    layer_cls_mean = layer_cls_mean.to(dtype);
-
-    auto matched_tensor = torch::scalar_tensor(
-        matched_gt,
-        torch::TensorOptions().dtype(torch::kLong).device(device)
+    auto losses = mask_matching_forward(
+        mask_logits,
+        cls_logits,
+        separate_costs,
+        pred_to_gt,
+        smooth,
+        sigmoid_scale,
+        dice_scale,
+        cls_scale,
+        mask_targets.size(1),
+        mask_targets.size(2),
+        num_masks,
+        force_unmatched_masks_to_empty,
+        force_unmatched_class_to_background
     );
+
+    TORCH_CHECK(losses.size() == 4, "mask_matching_forward must return four tensors");
+
+    torch::Tensor layer_mask_mean = losses[0];
+    torch::Tensor layer_dice_mean = losses[1];
+    torch::Tensor layer_cls_mean = losses[2];
+    torch::Tensor matched_tensor = losses[3];
 
     return { gt_to_pred, pred_to_gt, layer_mask_mean, layer_dice_mean, layer_cls_mean, matched_tensor };
 }

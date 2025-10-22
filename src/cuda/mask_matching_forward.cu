@@ -13,15 +13,17 @@ inline __device__ float softplusf(float x) {
     return log1pf(expf(-abs_x)) + fmaxf(x, 0.0f);
 }
 
-// Each block processes a single (layer, batch, query) tuple and accumulates the
-// requested unmatched-query losses directly into per-layer sums. By templating
-// on the two enforcement flags we allow the compiler to drop any unused code
-// paths and shared-memory allocations.
+// Each block processes a single (layer, batch, query) tuple. Matched queries
+// directly accumulate their pre-computed losses into the per-layer sums while
+// unmatched queries, when requested, evaluate their penalties on the fly. By
+// templating on the two enforcement flags we allow the compiler to drop any
+// unused code paths and shared-memory allocations for unmatched processing.
 template <bool ForceMasks, bool ForceClass>
-__global__ void unmatched_forward_kernel(
+__global__ void mask_matching_forward_kernel(
     const float* __restrict__ mask_logits,
     const float* __restrict__ cls_logits,
-    const uint8_t* __restrict__ unmatched_flags,
+    const float* __restrict__ separate_costs,
+    const int64_t* __restrict__ pred_to_gt,
     float* __restrict__ layer_mask_sum,
     float* __restrict__ layer_dice_sum,
     float* __restrict__ layer_cls_sum,
@@ -31,11 +33,13 @@ __global__ void unmatched_forward_kernel(
     const int64_t H,
     const int64_t W,
     const int64_t C,
+    const int64_t GT,
     const float smooth,
     const float sigmoid_scale,
     const float dice_scale,
     const float cls_scale,
-    const float area_scale
+    const float area_scale,
+    const int64_t term_stride
 ) {
     const int64_t q = blockIdx.x;
     const int64_t b = blockIdx.y;
@@ -46,7 +50,19 @@ __global__ void unmatched_forward_kernel(
     }
 
     const int64_t pred_index = ((l * B) + b) * Q + q;
-    if (!unmatched_flags[pred_index]) {
+    const int64_t gt_index = pred_to_gt[pred_index];
+
+    if (gt_index >= 0) {
+        if (threadIdx.x == 0) {
+            const int64_t base = pred_index * GT + gt_index;
+            atomicAdd(layer_mask_sum + l, separate_costs[base]);
+            atomicAdd(layer_dice_sum + l, separate_costs[base + term_stride]);
+            atomicAdd(layer_cls_sum + l, separate_costs[base + (term_stride << 1)]);
+        }
+        return;
+    }
+
+    if (!(ForceMasks || ForceClass)) {
         return;
     }
 
@@ -126,44 +142,45 @@ __global__ void unmatched_forward_kernel(
     }
 }
 
-// Launches the CUDA kernel that integrates unmatched-query penalties into the
-// per-layer loss accumulators. The mask target height/width are used to deduce
-// the number of target pixels represented by a single predicted pixel when we
-// enforce empty masks.
-void mask_matching_unmatched_forward(
+// Launches the CUDA kernel that integrates both matched and unmatched query
+// losses into the per-layer accumulators and applies normalization.
+std::vector<torch::Tensor> mask_matching_forward(
     const torch::Tensor& mask_logits,
     const torch::Tensor& cls_logits,
-    const torch::Tensor& unassigned_pred,
-    const torch::Tensor& layer_mask_sum,
-    const torch::Tensor& layer_dice_sum,
-    const torch::Tensor& layer_cls_sum,
+    const torch::Tensor& separate_costs,
+    const torch::Tensor& pred_to_gt,
     const float smooth,
     const float sigmoid_scale,
     const float dice_scale,
     const float cls_scale,
     const int64_t target_H,
     const int64_t target_W,
+    const int64_t num_masks,
     const bool force_unmatched_masks,
     const bool force_unmatched_class
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
-    TORCH_CHECK(unassigned_pred.is_cuda(), "unassigned_pred must be CUDA");
-    TORCH_CHECK(mask_logits.device() == unassigned_pred.device(), "mask_logits and unassigned_pred must be on the same device");
+    TORCH_CHECK(separate_costs.is_cuda(), "separate_costs must be CUDA");
+    TORCH_CHECK(pred_to_gt.is_cuda(), "pred_to_gt must be CUDA");
+    TORCH_CHECK(mask_logits.device() == separate_costs.device(), "mask_logits and separate_costs must be on the same device");
+    TORCH_CHECK(mask_logits.device() == pred_to_gt.device(), "mask_logits and pred_to_gt must be on the same device");
     if (force_unmatched_class) {
         TORCH_CHECK(cls_logits.is_cuda(), "cls_logits must be CUDA when forcing unmatched class loss");
         TORCH_CHECK(cls_logits.device() == mask_logits.device(), "cls_logits and mask_logits must be on the same device");
     }
 
-    if (!force_unmatched_masks && !force_unmatched_class) {
-        return;
-    }
-
     TORCH_CHECK(mask_logits.dim() == 5, "mask_logits must have shape (L,B,Q,H,W)");
-    TORCH_CHECK(unassigned_pred.sizes().equals({mask_logits.size(0), mask_logits.size(1), mask_logits.size(2)}),
-        "unassigned_pred must have shape (L,B,Q)");
+    TORCH_CHECK(separate_costs.dim() == 5 && separate_costs.size(0) == 3,
+        "separate_costs must have shape (3,L,B,Q,GT)");
+    TORCH_CHECK(pred_to_gt.sizes().equals({mask_logits.size(0), mask_logits.size(1), mask_logits.size(2)}),
+        "pred_to_gt must have shape (L,B,Q)");
+
+    TORCH_CHECK(separate_costs.dtype() == torch::kFloat32,
+        "separate_costs must be float32");
 
     auto mask_logits_contig = mask_logits.contiguous();
-    auto unmatched_contig = unassigned_pred.to(torch::kUInt8).contiguous();
+    auto separate_costs_contig = separate_costs.contiguous();
+    auto pred_to_gt_contig = pred_to_gt.to(torch::kLong).contiguous();
     torch::Tensor cls_contig;
 
     const int64_t L = mask_logits.size(0);
@@ -171,6 +188,7 @@ void mask_matching_unmatched_forward(
     const int64_t Q = mask_logits.size(2);
     const int64_t H = mask_logits.size(3);
     const int64_t W = mask_logits.size(4);
+    const int64_t GT = separate_costs_contig.size(4);
     const int threads = 256;
     int shared_elems = 0;
 
@@ -184,15 +202,21 @@ void mask_matching_unmatched_forward(
     auto stream = at::cuda::getCurrentCUDAStream(device_index);
 
     const float* mask_ptr = mask_logits_contig.data_ptr<float>();
+    const float* separate_ptr = separate_costs_contig.data_ptr<float>();
+    const int64_t* pred_to_gt_ptr = pred_to_gt_contig.data_ptr<int64_t>();
+
+    auto sums_opts = separate_costs_contig.options();
+    torch::Tensor layer_mask_sum = torch::zeros({L}, sums_opts);
+    torch::Tensor layer_dice_sum = torch::zeros({L}, sums_opts);
+    torch::Tensor layer_cls_sum = torch::zeros({L}, sums_opts);
+
     float* mask_sum_ptr = layer_mask_sum.data_ptr<float>();
     float* dice_sum_ptr = layer_dice_sum.data_ptr<float>();
-
-    const uint8_t* unmatched_ptr = unmatched_contig.data_ptr<uint8_t>();
+    float* cls_sum_ptr = layer_cls_sum.data_ptr<float>();
 
     dim3 grid(Q, B, L);
 
     const float* cls_ptr = nullptr;
-    float* cls_sum_ptr = layer_cls_sum.data_ptr<float>();
     int64_t C = 0;
 
     if (force_unmatched_masks) {
@@ -216,14 +240,15 @@ void mask_matching_unmatched_forward(
         cls_ptr = cls_contig.data_ptr<float>();
     }
 
+    const int64_t term_stride = L * B * Q * GT;
+
     if (force_unmatched_masks && force_unmatched_class) {
-        // Mask enforcement needs two shared-memory buffers (softplus + sigmoid)
-        // and the class term needs one.
         shared_elems = 3;
-        unmatched_forward_kernel<true, true><<<grid, threads, shared_elems * threads * sizeof(float), stream.stream()>>>(
+        mask_matching_forward_kernel<true, true><<<grid, threads, shared_elems * threads * sizeof(float), stream.stream()>>>(
             mask_ptr,
             cls_ptr,
-            unmatched_ptr,
+            separate_ptr,
+            pred_to_gt_ptr,
             mask_sum_ptr,
             dice_sum_ptr,
             cls_sum_ptr,
@@ -233,41 +258,23 @@ void mask_matching_unmatched_forward(
             H,
             W,
             C,
+            GT,
             smooth_val,
             sigmoid_scale_val,
             dice_scale_val,
             cls_scale_val,
-            area_scale_val
+            area_scale_val,
+            term_stride
         );
     } else if (force_unmatched_masks) {
         shared_elems = 2;
-        unmatched_forward_kernel<true, false><<<grid, threads, shared_elems * threads * sizeof(float), stream.stream()>>>(
+        mask_matching_forward_kernel<true, false><<<grid, threads, shared_elems * threads * sizeof(float), stream.stream()>>>(
             mask_ptr,
-            nullptr,
-            unmatched_ptr,
+            cls_ptr,
+            separate_ptr,
+            pred_to_gt_ptr,
             mask_sum_ptr,
             dice_sum_ptr,
-            nullptr,
-            L,
-            B,
-            Q,
-            H,
-            W,
-            0,
-            smooth_val,
-            sigmoid_scale_val,
-            dice_scale_val,
-            cls_scale_val,
-            area_scale_val
-        );
-    } else if (force_unmatched_class) {
-        shared_elems = 1;
-        unmatched_forward_kernel<false, true><<<grid, threads, shared_elems * threads * sizeof(float), stream.stream()>>>(
-            nullptr,
-            cls_ptr,
-            unmatched_ptr,
-            nullptr,
-            nullptr,
             cls_sum_ptr,
             L,
             B,
@@ -275,14 +282,100 @@ void mask_matching_unmatched_forward(
             H,
             W,
             C,
+            GT,
             smooth_val,
             sigmoid_scale_val,
             dice_scale_val,
             cls_scale_val,
-            area_scale_val
+            area_scale_val,
+            term_stride
+        );
+    } else if (force_unmatched_class) {
+        shared_elems = 1;
+        mask_matching_forward_kernel<false, true><<<grid, threads, shared_elems * threads * sizeof(float), stream.stream()>>>(
+            mask_ptr,
+            cls_ptr,
+            separate_ptr,
+            pred_to_gt_ptr,
+            mask_sum_ptr,
+            dice_sum_ptr,
+            cls_sum_ptr,
+            L,
+            B,
+            Q,
+            H,
+            W,
+            C,
+            GT,
+            smooth_val,
+            sigmoid_scale_val,
+            dice_scale_val,
+            cls_scale_val,
+            area_scale_val,
+            term_stride
+        );
+    } else {
+        shared_elems = 0;
+        mask_matching_forward_kernel<false, false><<<grid, threads, 0, stream.stream()>>>(
+            mask_ptr,
+            cls_ptr,
+            separate_ptr,
+            pred_to_gt_ptr,
+            mask_sum_ptr,
+            dice_sum_ptr,
+            cls_sum_ptr,
+            L,
+            B,
+            Q,
+            H,
+            W,
+            C,
+            GT,
+            smooth_val,
+            sigmoid_scale_val,
+            dice_scale_val,
+            cls_scale_val,
+            area_scale_val,
+            term_stride
         );
     }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const int64_t matched_gt = pred_to_gt_contig.ge(0).sum().item<int64_t>();
+    const int64_t unmatched_pred = pred_to_gt_contig.lt(0).sum().item<int64_t>();
+
+    int64_t mask_norm = (num_masks > 0)
+        ? num_masks
+        : matched_gt + (force_unmatched_masks ? unmatched_pred : 0);
+    if (mask_norm <= 0) {
+        mask_norm = 1;
+    }
+
+    int64_t cls_norm = (num_masks > 0)
+        ? num_masks
+        : matched_gt + (force_unmatched_class ? unmatched_pred : 0);
+    if (cls_norm <= 0) {
+        cls_norm = 1;
+    }
+
+    const double mask_denom = static_cast<double>(mask_norm);
+    const double cls_denom = static_cast<double>(cls_norm);
+
+    torch::Tensor layer_mask_mean = layer_mask_sum / mask_denom;
+    torch::Tensor layer_dice_mean = layer_dice_sum / mask_denom;
+    torch::Tensor layer_cls_mean = layer_cls_sum / cls_denom;
+
+    auto out_dtype = mask_logits.dtype();
+    layer_mask_mean = layer_mask_mean.to(out_dtype);
+    layer_dice_mean = layer_dice_mean.to(out_dtype);
+    layer_cls_mean = layer_cls_mean.to(out_dtype);
+
+    auto matched_tensor = torch::scalar_tensor(
+        matched_gt,
+        torch::TensorOptions().dtype(torch::kLong).device(mask_logits.device())
+    );
+
+    return { layer_mask_mean, layer_dice_mean, layer_cls_mean, matched_tensor };
 }
 
