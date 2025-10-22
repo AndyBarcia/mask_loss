@@ -272,6 +272,11 @@ def mask_matching_py(
             return matches
 
         if assignment_strategy == "global":
+            # Duplicate each valid ground-truth column up to K times and run
+            # a *single* Hungarian assignment.  The duplication effectively
+            # exposes K independent "slots" per ground truth so that the
+            # solver can pick the K lowest-cost detections for every GT in one
+            # pass while still respecting the global optimality property.
             columns = []
             for rep in range(K_val):
                 if len(columns) >= Q:
@@ -285,6 +290,11 @@ def mask_matching_py(
                 pred_to_gt_np[q] = actual
 
         elif assignment_strategy == "round":
+            # Run K independent Hungarian rounds.  Each round exposes every
+            # ground truth at most once, consumes the detections selected by
+            # the solver, and therefore emulates the classic DETR matching
+            # schedule where matches from earlier rounds cannot be reused
+            # later on.
             capacities = {gt: K_val for gt in valid_cols}
             remaining = list(range(Q))
             for _ in range(K_val):
@@ -304,6 +314,10 @@ def mask_matching_py(
                 remaining = [q for q in remaining if q not in matched]
 
         elif assignment_strategy == "greedy":
+            # Assign each detection to the valid ground truth with the
+            # currently-lowest cost.  The running capacities ensure that no GT
+            # collects more than K detections.  This is intentionally simple
+            # and mirrors the greedy approaches used in several DETR variants.
             capacities = {gt: K_val for gt in valid_cols}
             for q in range(Q):
                 best_gt = -1
@@ -320,6 +334,11 @@ def mask_matching_py(
                     capacities[best_gt] -= 1
 
         elif assignment_strategy == "pseudo_greedy":
+            # Run one Hungarian assignment to secure the globally best set of
+            # matches (subject to the single-slot constraint) and then greedily
+            # assign the remaining detections.  This hybrid strategy keeps a
+            # strong first round while still allowing cheap assignments for the
+            # tail detections.
             capacities = {gt: K_val for gt in valid_cols}
             base_cols = valid_cols[:min(len(valid_cols), Q)]
             matches = hungarian(base_cols, list(range(Q)))
@@ -346,6 +365,8 @@ def mask_matching_py(
                     capacities[best_gt] -= 1
 
         for actual in valid_cols:
+            # Sort detections assigned to each GT by their final matching cost
+            # so we can report the round index (i.e. rank) of every match.
             assigned = [
                 q for q in range(Q)
                 if pred_to_gt_np[q] == actual

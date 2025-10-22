@@ -198,6 +198,10 @@ static void greedy_assign_predictions(
     }
 }
 
+// Run a single Hungarian solve after materialising up to `topk` copies of
+// every valid ground-truth column.  The duplication provides `topk` slots per
+// GT so the solver can select the best detections globally while respecting
+// the per-ground-truth budget.
 static void global_hungarian_assign(
     const double* cost,
     int64_t Q,
@@ -247,6 +251,9 @@ static void global_hungarian_assign(
     }
 }
 
+// Perform K Hungarian rounds.  Each round exposes each ground truth at most
+// once, consumes any matched detections, and therefore mimics the multi-round
+// matching used by DETR-style approaches.
 static void round_hungarian_assign(
     const double* cost,
     int64_t Q,
@@ -321,6 +328,8 @@ static void round_hungarian_assign(
     }
 }
 
+// Pure greedy assignment that picks the available ground truth with the
+// lowest cost for every detection.  Capacities enforce the per-GT budget.
 static void greedy_assign_all(
     const double* cost,
     int64_t Q,
@@ -344,6 +353,9 @@ static void greedy_assign_all(
     greedy_assign_predictions(cost, preds, valid_cols, inf_thresh, capacities, GT_out, pred_to_gt);
 }
 
+// Hybrid strategy: run one Hungarian round to secure the best global matches
+// and assign the rest greedily.  This mirrors the "pseudo greedy" matching
+// used in several DETR follow-ups.
 static void pseudo_greedy_assign(
     const double* cost,
     int64_t Q,
@@ -464,6 +476,8 @@ static void assign_predictions_for_slice(
         }
     }
 
+    // Bucket the matched detections per GT so we can rank them by the final
+    // matching cost and report the round index ("best", "second best", ...).
     std::vector<std::vector<std::pair<double, int64_t>>> per_gt(GT_out);
     for (int64_t q = 0; q < Q; ++q) {
         int64_t gt = pred_to_gt_vec[q];
