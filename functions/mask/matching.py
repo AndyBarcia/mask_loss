@@ -30,8 +30,8 @@ class MaskMatchingFunction(Function):
         background_index, 
         inf_thresh,
         num_masks,
-        force_unmatched_class_to_background=False,
-        force_unmatched_masks_to_empty=False,
+        force_unmatched_class_to_background,
+        force_unmatched_masks_to_empty,
     ):
         L, B, C, h, w = mask_logits.shape
         B_t, H_t, W_t = mask_targets.shape
@@ -49,10 +49,10 @@ class MaskMatchingFunction(Function):
         background_index_val = int(background_index if background_index is not None else -1)
         inf_thresh_val = float(inf_thresh if inf_thresh is not None else 1e30)
         num_masks_val = int(num_masks if num_masks is not None else -1)
-        force_unmatched_cls = bool(force_unmatched_class_to_background)
-        force_unmatched_masks = bool(force_unmatched_masks_to_empty)
+        force_unmatched_cls = bool(force_unmatched_class_to_background if force_unmatched_class_to_background is not None else False)
+        force_unmatched_masks = bool(force_unmatched_masks_to_empty if force_unmatched_masks_to_empty is not None else False)
 
-        matches, layer_mask_mean, layer_dice_mean, layer_cls_mean, matched = mask_loss.mask_matching(
+        gt_to_pred, pred_to_gt, layer_mask_mean, layer_dice_mean, layer_cls_mean, matched = mask_loss.mask_matching(
             mask_logits,
             mask_targets,
             cls_logits,
@@ -73,7 +73,8 @@ class MaskMatchingFunction(Function):
             mask_targets.detach(),
             cls_logits.detach(),
             cls_targets.detach(),
-            matches.detach()
+            gt_to_pred.detach(),
+            pred_to_gt.detach(),
         )
         ctx.logits_dtype = mask_logits.dtype
         ctx.smooth = smooth_val
@@ -86,18 +87,18 @@ class MaskMatchingFunction(Function):
         ctx.force_unmatched_cls = force_unmatched_cls
         ctx.force_unmatched_masks = force_unmatched_masks
 
-        return matches, layer_mask_mean, layer_dice_mean, layer_cls_mean, matched
+        return gt_to_pred, pred_to_gt, layer_mask_mean, layer_dice_mean, layer_cls_mean, matched
 
     @staticmethod
-    def backward(ctx, grad_matches, grad_layer_mask_mean, grad_layer_dice_mean, grad_layer_cls_mean, grad_matched):
+    def backward(ctx, _1, _2, grad_layer_mask_mean, grad_layer_dice_mean, grad_layer_cls_mean, _3):
         (
             mask_logits, 
             mask_targets,
             cls_logits,
             cls_targets, 
-            matches
+            gt_to_pred, 
+            pred_to_gt
         ) = ctx.saved_tensors
-        logits_dtype = ctx.logits_dtype
         smooth = ctx.smooth
         sigmoid_scale = ctx.sigmoid_scale
         dice_scale = ctx.dice_scale
@@ -119,7 +120,8 @@ class MaskMatchingFunction(Function):
             mask_targets,
             cls_logits,
             cls_targets,
-            matches,
+            gt_to_pred,
+            pred_to_gt,
             smooth,
             sigmoid_scale,
             dice_scale,
@@ -179,15 +181,21 @@ def mask_matching_py(
     sigmoid_cost = costs[0]
     dice_cost = costs[1]
     cls_cost = costs[2]
-    costs = costs.sum(dim=0)  # (L,B,C,GT_out)
+    costs = costs.sum(dim=0)  # (L,B,Q,GT_out)
 
     # Output matches (L,B,GT_out), default -1 for invalid/ignored GTs
-    matches = torch.full(
+    gt_to_pred = torch.full(
         (L, B, costs.shape[-1]),
         -1,
         dtype=torch.int64,
         device=mask_logits.device,
-    )
+    ) # (L,B,GT_out)
+    pred_to_gt = torch.full(
+        (L, B, costs.shape[-2]),
+        -1,
+        dtype=torch.int64,
+        device=mask_logits.device,
+    ) # (L,B,Q)
 
     # Large finite fallback for masked pairs
     if math.isfinite(inf_thresh) and inf_thresh > 0:
@@ -229,10 +237,11 @@ def mask_matching_py(
             for r, c in zip(row_ind.tolist(), col_ind.tolist()):
                 gt_col = int(valid_cols[r].item())  # original GT column
                 pred_row = int(c)                   # prediction row (0..C-1)
-                matches[l, b, gt_col] = pred_row
+                gt_to_pred[l, b, gt_col] = pred_row
+                pred_to_gt[l, b, pred_row] = gt_col
 
     # Aggregate losses using assignments
-    assigned = matches.ge(0)                          # (L,B,GT)
+    assigned = gt_to_pred.ge(0)                          # (L,B,GT)
     matched = int(assigned.sum().item())              # local matched GTs
 
     layer_mask_sum = torch.zeros(L, device=mask_logits.device, dtype=mask_logits.dtype)
@@ -244,7 +253,7 @@ def mask_matching_py(
         l_idx = idx[:, 0]
         b_idx = idx[:, 1]
         g_idx = idx[:, 2]
-        p_idx = matches[assigned].to(torch.long)      # (N,)
+        p_idx = gt_to_pred[assigned].to(torch.long)      # (N,)
 
         sig_vals  = sigmoid_cost[l_idx, b_idx, p_idx, g_idx]
         dice_vals = dice_cost[l_idx, b_idx, p_idx, g_idx]
@@ -306,7 +315,7 @@ def mask_matching_py(
 
     # Return exactly like the C++ ext now does
     matched_tensor = torch.tensor(matched, device=mask_logits.device, dtype=torch.long)
-    return matches, layer_mask_mean, layer_dice_mean, layer_cls_mean, matched_tensor
+    return gt_to_pred, pred_to_gt, layer_mask_mean, layer_dice_mean, layer_cls_mean, matched_tensor
 
 def mask_matching_sampling_py(
     mask_logits,         # (L,B,Q,H,W)
@@ -340,13 +349,19 @@ def mask_matching_sampling_py(
     cls_cost = costs[3]
     costs = costs.sum(dim=0)  # (L,B,C,GT_out)
 
-    # Output matches (L,B,GT_out), default -1 for invalid/ignored GTs
-    matches = torch.full(
+    # Output gt_to_pred (L,B,GT_out), default -1 for invalid/ignored GTs
+    gt_to_pred = torch.full(
         (L, B, costs.shape[-1]),
         -1,
         dtype=torch.int64,
         device=mask_logits.device,
-    )
+    ) # (L,B,GT_out)
+    pred_to_gt = torch.full(
+        (L, B, costs.shape[-2]),
+        -1,
+        dtype=torch.int64,
+        device=mask_logits.device,
+    ) # (L,B,Q)
 
     # Large finite fallback for masked pairs
     if math.isfinite(inf_thresh) and inf_thresh > 0:
@@ -388,10 +403,11 @@ def mask_matching_sampling_py(
             for r, c in zip(row_ind.tolist(), col_ind.tolist()):
                 gt_col = int(valid_cols[r].item())  # original GT column
                 pred_row = int(c)                   # prediction row (0..C-1)
-                matches[l, b, gt_col] = pred_row
+                gt_to_pred[l, b, gt_col] = pred_row
+                pred_to_gt[l, b, pred_row] = gt_col
 
     # Aggregate losses using assignments
-    assigned = matches.ge(0)                          # (L,B,GT)
+    assigned = gt_to_pred.ge(0)                          # (L,B,GT)
     matched = int(assigned.sum().item())              # local matched GTs
 
     layer_mask_sum = torch.zeros(L, device=mask_logits.device, dtype=mask_logits.dtype)
@@ -402,7 +418,7 @@ def mask_matching_sampling_py(
         l_idx = idx[:, 0]
         b_idx = idx[:, 1]
         g_idx = idx[:, 2]
-        p_idx = matches[assigned].to(torch.long)      # (N,)
+        p_idx = gt_to_pred[assigned].to(torch.long)      # (N,)
 
         sig_vals  = sigmoid_cost[l_idx, b_idx, p_idx, g_idx]
         dice_vals = dice_cost[l_idx, b_idx, p_idx, g_idx]
@@ -417,4 +433,4 @@ def mask_matching_sampling_py(
     layer_mask_mean = layer_mask_sum / denom          # (L,)
     layer_dice_mean = layer_dice_sum / denom          # (L,)
     matched_tensor = torch.tensor(matched, device=mask_logits.device, dtype=torch.long)
-    return matches, layer_mask_mean, layer_dice_mean, matched_tensor
+    return gt_to_pred, pred_to_gt, layer_mask_mean, layer_dice_mean, matched_tensor

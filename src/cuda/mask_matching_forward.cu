@@ -8,8 +8,6 @@
 #include <tuple>
 #include <cstdint>
 
-namespace {
-
 inline __device__ float softplusf(float x) {
     const float abs_x = fabsf(x);
     return log1pf(expf(-abs_x)) + fmaxf(x, 0.0f);
@@ -128,16 +126,17 @@ __global__ void unmatched_forward_kernel(
     }
 }
 
-} // namespace
-
 // Launches the CUDA kernel that integrates unmatched-query penalties into the
 // per-layer loss accumulators. The mask target height/width are used to deduce
 // the number of target pixels represented by a single predicted pixel when we
 // enforce empty masks.
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mask_matching_unmatched_forward(
+void mask_matching_unmatched_forward(
     const torch::Tensor& mask_logits,
     const torch::Tensor& cls_logits,
-    const torch::Tensor& unmatched_mask,
+    const torch::Tensor& unassigned_pred,
+    const torch::Tensor& layer_mask_sum,
+    const torch::Tensor& layer_dice_sum,
+    const torch::Tensor& layer_cls_sum,
     const float smooth,
     const float sigmoid_scale,
     const float dice_scale,
@@ -148,31 +147,26 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mask_matching_unmatched_
     const bool force_unmatched_class
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
-    TORCH_CHECK(unmatched_mask.is_cuda(), "unmatched_mask must be CUDA");
-    TORCH_CHECK(mask_logits.device() == unmatched_mask.device(), "mask_logits and unmatched_mask must be on the same device");
+    TORCH_CHECK(unassigned_pred.is_cuda(), "unassigned_pred must be CUDA");
+    TORCH_CHECK(mask_logits.device() == unassigned_pred.device(), "mask_logits and unassigned_pred must be on the same device");
     if (force_unmatched_class) {
         TORCH_CHECK(cls_logits.is_cuda(), "cls_logits must be CUDA when forcing unmatched class loss");
         TORCH_CHECK(cls_logits.device() == mask_logits.device(), "cls_logits and mask_logits must be on the same device");
     }
 
-    const int64_t L = mask_logits.size(0);
-    const auto options = mask_logits.options().dtype(torch::kFloat);
-    torch::Tensor layer_mask_sum = torch::zeros({L}, options);
-    torch::Tensor layer_dice_sum = torch::zeros({L}, options);
-    torch::Tensor layer_cls_sum = torch::zeros({L}, options);
-
     if (!force_unmatched_masks && !force_unmatched_class) {
-        return {layer_mask_sum, layer_dice_sum, layer_cls_sum};
+        return;
     }
 
     TORCH_CHECK(mask_logits.dim() == 5, "mask_logits must have shape (L,B,Q,H,W)");
-    TORCH_CHECK(unmatched_mask.sizes().equals({mask_logits.size(0), mask_logits.size(1), mask_logits.size(2)}),
-        "unmatched_mask must have shape (L,B,Q)");
+    TORCH_CHECK(unassigned_pred.sizes().equals({mask_logits.size(0), mask_logits.size(1), mask_logits.size(2)}),
+        "unassigned_pred must have shape (L,B,Q)");
 
     auto mask_logits_contig = mask_logits.contiguous();
-    auto unmatched_contig = unmatched_mask.to(torch::kUInt8).contiguous();
+    auto unmatched_contig = unassigned_pred.to(torch::kUInt8).contiguous();
     torch::Tensor cls_contig;
 
+    const int64_t L = mask_logits.size(0);
     const int64_t B = mask_logits.size(1);
     const int64_t Q = mask_logits.size(2);
     const int64_t H = mask_logits.size(3);
@@ -290,7 +284,5 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> mask_matching_unmatched_
     }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    return {layer_mask_sum, layer_dice_sum, layer_cls_sum};
 }
 
