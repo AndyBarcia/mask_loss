@@ -341,8 +341,10 @@ std::vector<torch::Tensor> mask_matching_forward(
     }
 
     const int64_t term_stride = L * B * Q * GT_out;
+    const bool uses_ce_loss = (label_loss_type == 2) || (label_loss_type == 3);
+    const bool kernel_force_class = force_unmatched_class && !uses_ce_loss;
 
-    if (force_unmatched_masks && force_unmatched_class) {
+    if (force_unmatched_masks && kernel_force_class) {
         shared_elems = 3;
         mask_matching_forward_kernel<true, true><<<grid, threads, shared_elems * threads * sizeof(float), stream.stream()>>>(
             mask_ptr,
@@ -398,7 +400,7 @@ std::vector<torch::Tensor> mask_matching_forward(
             label_focal_alpha,
             label_focal_gamma
         );
-    } else if (force_unmatched_class) {
+    } else if (kernel_force_class) {
         shared_elems = 1;
         mask_matching_forward_kernel<false, true><<<grid, threads, shared_elems * threads * sizeof(float), stream.stream()>>>(
             mask_ptr,
@@ -457,6 +459,28 @@ std::vector<torch::Tensor> mask_matching_forward(
     }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    if (force_unmatched_class && uses_ce_loss) {
+        TORCH_CHECK(cls_contig.defined(), "cls_logits must be provided when supervising unmatched classification");
+        auto unmatched_mask = pred_to_gt_contig.lt(0);           // (L,B,Q)
+        auto unmatched_mask_f = unmatched_mask.to(layer_cls_sum.options().dtype());
+        auto logsumexp = cls_contig.logsumexp(-1);               // (L,B,Q)
+        auto z_bg = cls_contig.select(-1, background_index);     // (L,B,Q)
+
+        torch::Tensor loss;
+        if (label_loss_type == 2) {
+            loss = (logsumexp - z_bg) * cls_scale_val;
+        } else {
+            auto log_p = z_bg - logsumexp;
+            auto p = log_p.exp();
+            auto mod = (1.0f - p).clamp_min(0.0f).pow(label_focal_gamma);
+            const float alpha = (label_focal_alpha >= 0.f) ? label_focal_alpha : 1.0f;
+            loss = (-alpha * mod * log_p) * cls_scale_val;
+        }
+
+        auto unmatched_cls = (loss * unmatched_mask_f).sum({1, 2});
+        layer_cls_sum.add_(unmatched_cls);
+    }
 
     auto matches = pred_to_gt_contig.ge(0);
     auto matches_f = matches.to(layer_mask_sum.dtype());

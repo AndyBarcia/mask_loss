@@ -44,12 +44,12 @@ class MaskMatchingFunction(Function):
         label_loss_type=PairwiseLabelLossType.BCE,
         label_focal_alpha=None,
         label_focal_gamma=2.0,
-        inf_thresh,
-        num_masks,
-        force_unmatched_class_to_background,
-        force_unmatched_masks_to_empty,
-        K,
-        assignment_strategy,
+        inf_thresh=1e30,
+        num_masks=None,
+        force_unmatched_class_to_background=False,
+        force_unmatched_masks_to_empty=False,
+        K=1,
+        assignment_strategy="global",
     ):
         """Run the forward pass of the matching op.
 
