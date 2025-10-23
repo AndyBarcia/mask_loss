@@ -75,7 +75,7 @@ std::vector<torch::Tensor> mask_matching(
     float   cls_scale       = 1.0f,
     int64_t background_index= -1,
     double  inf_thresh      = 1e30,
-    int64_t num_masks       = -1,
+    double  num_masks       = -1.0,
     bool    force_unmatched_class_to_background = false,
     bool    force_unmatched_masks_to_empty      = false,
     int64_t topk_matches    = 1,
@@ -96,7 +96,7 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float dice_scale,
     const float cls_scale,
     int64_t background_index,
-    const int64_t num_masks,
+    const double num_masks,
     const bool force_unmatched_class_to_background,
     const bool force_unmatched_masks_to_empty
 );

@@ -155,7 +155,7 @@ std::vector<torch::Tensor> mask_matching_forward(
     const float cls_scale,
     const int64_t target_H,
     const int64_t target_W,
-    const int64_t num_masks,
+    const double num_masks,
     const bool force_unmatched_masks,
     const bool force_unmatched_class
 ) {
@@ -342,25 +342,33 @@ std::vector<torch::Tensor> mask_matching_forward(
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    const int64_t matched_dts = pred_to_gt_contig.ge(0).sum().item<int64_t>();
-    const int64_t unmatched_pred = pred_to_gt_contig.lt(0).sum().item<int64_t>();
+    auto matches = pred_to_gt_contig.ge(0);
+    auto matches_f = matches.to(layer_mask_sum.dtype());
+    torch::Tensor per_layer_matched = matches_f.sum({1, 2});
+    torch::Tensor per_layer_total = torch::full({L}, static_cast<float>(B * Q), layer_mask_sum.options());
 
-    int64_t mask_norm = (num_masks > 0)
-        ? num_masks
-        : matched_dts + (force_unmatched_masks ? unmatched_pred : 0);
-    if (mask_norm <= 0) {
-        mask_norm = 1;
+    const bool has_num_masks = num_masks > 0.0;
+
+    torch::Tensor mask_denom;
+    if (force_unmatched_masks) {
+        mask_denom = per_layer_total.clone();
+    } else if (has_num_masks) {
+        mask_denom = torch::full({L}, static_cast<float>(num_masks), layer_mask_sum.options());
+    } else {
+        mask_denom = per_layer_matched.clone();
     }
 
-    int64_t cls_norm = (num_masks > 0)
-        ? num_masks
-        : matched_dts + (force_unmatched_class ? unmatched_pred : 0);
-    if (cls_norm <= 0) {
-        cls_norm = 1;
+    torch::Tensor cls_denom;
+    if (force_unmatched_class) {
+        cls_denom = per_layer_total.clone();
+    } else if (has_num_masks) {
+        cls_denom = torch::full({L}, static_cast<float>(num_masks), layer_mask_sum.options());
+    } else {
+        cls_denom = per_layer_matched.clone();
     }
 
-    const double mask_denom = static_cast<double>(mask_norm);
-    const double cls_denom = static_cast<double>(cls_norm);
+    mask_denom = mask_denom.clamp_min(1.0f);
+    cls_denom = cls_denom.clamp_min(1.0f);
 
     torch::Tensor layer_mask_mean = layer_mask_sum / mask_denom;
     torch::Tensor layer_dice_mean = layer_dice_sum / mask_denom;

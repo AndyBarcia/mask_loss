@@ -36,7 +36,7 @@ __global__ void mask_matching_backward_kernel(
     const float sigmoid_factor,
     const float dice_scale,
     const float area_scale,
-    const float inv_denom,
+    const float* __restrict__ inv_denom,
     const int64_t background_index
 ) {
     const int64_t q = blockIdx.x;
@@ -61,8 +61,8 @@ __global__ void mask_matching_backward_kernel(
     }
 
     // Each layer shares the same coefficients across ground-truth indices.
-    const float mask_coeff = grad_mask_mean[l] * inv_denom;
-    const float dice_coeff = grad_dice_mean[l] * inv_denom;
+    const float mask_coeff = grad_mask_mean[l] * inv_denom[l];
+    const float dice_coeff = grad_dice_mean[l] * inv_denom[l];
     if (mask_coeff == 0.0f && dice_coeff == 0.0f) {
         return;
     }
@@ -165,7 +165,7 @@ __global__ void cls_matching_backward_kernel(
     const int64_t Q,
     const int64_t C,
     const int64_t GT_total,
-    const float coeff_base,
+    const float* __restrict__ coeff_base,
     const int64_t background_index
 ) {
     const int64_t q = blockIdx.x;  // prediction index
@@ -181,7 +181,7 @@ __global__ void cls_matching_backward_kernel(
     if (!is_matched && !ForceUnmatchedClass) return;
 
     // Per-layer coefficient: upstream grad * normalization * cls_scale * (1/C)
-    const float coeff = grad_layer_cls[l] * coeff_base / static_cast<float>(C);
+    const float coeff = grad_layer_cls[l] * coeff_base[l] / static_cast<float>(C);
     if (coeff == 0.0f) return;
 
     // Write grads for the entire class vector of the matched/unmatched query
@@ -217,7 +217,7 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float dice_scale,
     const float cls_scale,
     int64_t background_index,
-    const int64_t num_masks,
+    const double num_masks,
     const bool force_unmatched_class_to_background,
     const bool force_unmatched_masks_to_empty
 ) {
@@ -274,22 +274,36 @@ std::vector<torch::Tensor> mask_matching_backward(
     auto grad_mask_logits = torch::zeros_like(mask_logits);
     auto grad_cls_logits  = torch::zeros_like(cls_logits);
 
-    const int64_t total_queries = L * B * Q;
+    auto matches_bool = pred_to_gt.ge(0);
+    const int64_t matched_dts = matches_bool.sum().item<int64_t>();
 
-    const int64_t matched_dts = pred_to_gt.ge(0).sum().item<int64_t>();
-    const int64_t unmatched_queries = std::max<int64_t>(int64_t{0}, total_queries - matched_dts);
+    auto matches_f = matches_bool.to(torch::kFloat32);
+    torch::Tensor per_layer_matched = matches_f.sum({1, 2});
+    torch::Tensor per_layer_total = torch::full({L}, static_cast<float>(B * Q), mask_logits.options());
 
-    int64_t mask_norm = (num_masks > 0)
-        ? num_masks
-        : matched_dts + (force_unmatched_masks_to_empty ? unmatched_queries : 0);
-    if (mask_norm <= 0) mask_norm = 1;
-    const float inv_mask_denom = 1.0f / static_cast<float>(mask_norm);
+    const bool has_num_masks = num_masks > 0.0;
 
-    int64_t cls_norm = (num_masks > 0)
-        ? num_masks
-        : matched_dts + (force_unmatched_class_to_background ? unmatched_queries : 0);
-    if (cls_norm <= 0) cls_norm = 1;
-    const float inv_cls_denom = 1.0f / static_cast<float>(cls_norm);
+    torch::Tensor mask_denom;
+    if (force_unmatched_masks_to_empty) {
+        mask_denom = per_layer_total.clone();
+    } else if (has_num_masks) {
+        mask_denom = torch::full({L}, static_cast<float>(num_masks), mask_logits.options());
+    } else {
+        mask_denom = per_layer_matched.clone();
+    }
+    mask_denom = mask_denom.clamp_min(1.0f);
+    torch::Tensor inv_mask_denom = mask_denom.reciprocal().contiguous();
+
+    torch::Tensor cls_denom;
+    if (force_unmatched_class_to_background) {
+        cls_denom = per_layer_total.clone();
+    } else if (has_num_masks) {
+        cls_denom = torch::full({L}, static_cast<float>(num_masks), mask_logits.options());
+    } else {
+        cls_denom = per_layer_matched.clone();
+    }
+    cls_denom = cls_denom.clamp_min(1.0f);
+    torch::Tensor inv_cls_denom = cls_denom.reciprocal().contiguous();
 
     torch::Tensor counts;
     if (matched_dts > 0 && GT_total > 0 && mask_targets.numel() > 0 && L > 0 && B > 0 && H > 0 && W > 0) {
@@ -326,7 +340,7 @@ std::vector<torch::Tensor> mask_matching_backward(
         ? 1.0f / static_cast<float>(H_t * W_t)
         : 0.0f;
     const float sigmoid_factor = sigmoid_scale * norm;
-    const float coeff_base = cls_scale * inv_cls_denom;
+    torch::Tensor cls_coeff = (inv_cls_denom * cls_scale).contiguous();
 
     const uint8_t* counts_ptr = counts.defined() ? counts.data_ptr<uint8_t>() : nullptr;
 
@@ -362,7 +376,7 @@ std::vector<torch::Tensor> mask_matching_backward(
                 sigmoid_factor,
                 dice_scale,
                 area_scale,
-                inv_mask_denom,
+                inv_mask_denom.data_ptr<float>(),
                 background_index
             );
             CHECK_CUDA_ERROR(cudaGetLastError());
@@ -381,7 +395,7 @@ std::vector<torch::Tensor> mask_matching_backward(
                 Q,
                 C,
                 GT_total,
-                coeff_base,
+                cls_coeff.data_ptr<float>(),
                 background_index
             );
             CHECK_CUDA_ERROR(cudaGetLastError());

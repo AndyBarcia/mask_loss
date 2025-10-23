@@ -68,7 +68,7 @@ class MaskMatchingFunction(Function):
                 the background class. ``-1`` disables background forcing.
             inf_thresh (float): Threshold above which costs are treated as
                 ``+inf`` and therefore ignored by the assignment step.
-            num_masks (int): Optional normalisation denominator for the mask
+            num_masks (float): Optional normalisation denominator for the mask
                 and dice losses. ``-1`` or ``None`` fall back to the number of
                 (matched) elements.
             force_unmatched_class_to_background (bool): Whether unmatched
@@ -99,7 +99,7 @@ class MaskMatchingFunction(Function):
         cls_scale = float(cls_scale if cls_scale is not None else 1.0)
         background_index_val = int(background_index if background_index is not None else -1)
         inf_thresh_val = float(inf_thresh if inf_thresh is not None else 1e30)
-        num_masks_val = int(num_masks if num_masks is not None else -1)
+        num_masks_val = float(num_masks if num_masks is not None else -1.0)
         force_unmatched_cls = bool(
             force_unmatched_class_to_background if force_unmatched_class_to_background is not None else False
         )
@@ -256,7 +256,7 @@ def mask_matching_py(
         cls_scale (float): Weight applied to the classification cost.
         background_index (int): Background class index or ``-1`` to disable.
         inf_thresh (float): Costs equal/above this value are ignored.
-        num_masks (Optional[int]): Optional denominator for loss averaging.
+        num_masks (Optional[float]): Optional denominator for loss averaging.
         force_unmatched_class_to_background (bool): If ``True`` enforce
             background classification for unmatched predictions.
         force_unmatched_masks_to_empty (bool): If ``True`` supervise unmatched
@@ -544,15 +544,25 @@ def mask_matching_py(
             cls_loss = cls_bce.mean(dim=-1) * cls_scale
             layer_cls_sum += (cls_loss * unmatched_mask).sum(dim=(1, 2))
 
-    mask_count = matched_dts + (unmatched_dts if force_unmatched_masks_to_empty else 0)
-    cls_count = matched_dts + (unmatched_dts if force_unmatched_class_to_background else 0)
+    per_layer_matched = assigned.sum(dim=(1, 2)).to(layer_mask_sum.dtype)
+    queries_per_layer = layer_mask_sum.new_full((L,), float(B * C))
 
-    if num_masks is not None and num_masks > 0:
-        mask_denom = float(num_masks)
-        cls_denom = float(num_masks)
+    if force_unmatched_masks_to_empty:
+        mask_denom = queries_per_layer
+    elif num_masks is not None and num_masks > 0:
+        mask_denom = layer_mask_sum.new_full((L,), float(num_masks))
     else:
-        mask_denom = float(mask_count) if mask_count > 0 else 1.0
-        cls_denom = float(cls_count) if cls_count > 0 else 1.0
+        mask_denom = per_layer_matched
+
+    if force_unmatched_class_to_background:
+        cls_denom = queries_per_layer
+    elif num_masks is not None and num_masks > 0:
+        cls_denom = layer_mask_sum.new_full((L,), float(num_masks))
+    else:
+        cls_denom = per_layer_matched
+
+    mask_denom = torch.clamp(mask_denom, min=1.0)
+    cls_denom = torch.clamp(cls_denom, min=1.0)
 
     layer_mask_mean = layer_mask_sum / mask_denom  # (L,)
     layer_dice_mean = layer_dice_sum / mask_denom  # (L,)
