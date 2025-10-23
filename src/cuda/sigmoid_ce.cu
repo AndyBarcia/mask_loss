@@ -174,8 +174,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
 }
 
 torch::Tensor sigmoid_cross_entropy_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& logits,   // (L,B,C,H,W), float
+    const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float num_masks,
     const float scale
 ) {
@@ -230,9 +230,9 @@ torch::Tensor sigmoid_cross_entropy_forward(
 }
 
 torch::Tensor sigmoid_cross_entropy_backward(
-    const torch::Tensor& grad_out,
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& grad_out, // (L,), float
+    const torch::Tensor& logits,   // (L,B,C,H,W), float
+    const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float num_masks,
     const float scale
 ) {

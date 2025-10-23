@@ -137,8 +137,8 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_s
 }
 
 torch::Tensor pairwise_sigmoid_cross_entropy_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& logits,   // (L,B,C,H,W), float
+    const torch::Tensor& targets,  // (B,H_t,W_t), int64
     int64_t background_index = -1,
     const float scale = 1.0f
 ) {

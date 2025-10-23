@@ -1,50 +1,50 @@
 #include <torch/extension.h>
 
 torch::Tensor sigmoid_cross_entropy_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& logits,   // (L,B,C,H,W), float
+    const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float num_masks,
     const float scale = 1.0f
 );
 
 torch::Tensor sigmoid_cross_entropy_backward(
-    const torch::Tensor& grad_out,
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& grad_out, // (L,), float
+    const torch::Tensor& logits,   // (L,B,C,H,W), float
+    const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float num_masks,
     const float scale = 1.0f
 );
 
 torch::Tensor pairwise_sigmoid_cross_entropy_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& logits,   // (L,B,C,H,W), float
+    const torch::Tensor& targets,  // (B,H_t,W_t), int64
     int64_t background_index = -1,
     const float scale = 1.0f
 );
 
 std::vector<torch::Tensor> dice_loss_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& logits,   // (L,B,C,H,W), float
+    const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float smooth,
     const float num_masks,
     const float scale = 1.0f
 );
 
 torch::Tensor dice_loss_backward(
-    const torch::Tensor& grad_out,
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
-    const torch::Tensor& total_intersection_sum,
-    const torch::Tensor& total_p_sum,
-    const torch::Tensor& total_t_sum,
+    const torch::Tensor& grad_out,               // (L,), float
+    const torch::Tensor& logits,                 // (L,B,C,H,W), float
+    const torch::Tensor& targets,                // (B,H_t,W_t), int64
+    const torch::Tensor& total_intersection_sum, // (L,B,C), float
+    const torch::Tensor& total_p_sum,            // (L,B,C), float
+    const torch::Tensor& total_t_sum,            // (L,B,C), float
     const float smooth,
     const float num_masks,
     const float scale = 1.0f
 );
 
 torch::Tensor pairwise_dice_loss_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& logits,   // (L,B,C,H,W), float
+    const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float smooth,
     int64_t background_index = -1,
     const float scale = 1.0f
@@ -83,14 +83,14 @@ std::vector<torch::Tensor> mask_matching(
 );
 
 std::vector<torch::Tensor> mask_matching_backward(
-    const torch::Tensor& grad_layer_mask_mean,
-    const torch::Tensor& grad_layer_dice_mean,
-    const torch::Tensor& grad_layer_cls_mean,
-    const torch::Tensor& mask_logits,
-    const torch::Tensor& mask_targets,
-    const torch::Tensor& cls_logits,
-    const torch::Tensor& cls_targets,
-    const torch::Tensor& pred_to_gt,
+    const torch::Tensor& grad_layer_mask_mean, // (L,), float
+    const torch::Tensor& grad_layer_dice_mean, // (L,), float
+    const torch::Tensor& grad_layer_cls_mean,  // (L,), float
+    const torch::Tensor& mask_logits,          // (L,B,Q,H,W), float
+    const torch::Tensor& mask_targets,         // (B,H_t,W_t), int64
+    const torch::Tensor& cls_logits,           // (L,B,Q,C),   float
+    const torch::Tensor& cls_targets,          // (B,GT_total), int64
+    const torch::Tensor& pred_to_gt,           // (L,B,Q), int64
     const float smooth,
     const float sigmoid_scale,
     const float dice_scale,
@@ -102,8 +102,8 @@ std::vector<torch::Tensor> mask_matching_backward(
 );
 
 torch::Tensor pairwise_label_loss_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& logits,   // (L,B,Q,C), float
+    const torch::Tensor& targets,  // (B,GT_total), int64 with -1 padding
     int64_t background_index = -1,
     const float scale = 1.0f
 );
