@@ -12,8 +12,6 @@
 enum PairwiseLabelLossType : int32_t {
     kBinaryCrossEntropy      = 0,
     kBinaryCrossEntropyFocal = 1,
-    kCrossEntropy            = 2,
-    kCrossEntropyFocal       = 3,
 };
 
 // Kernel: for each (l,b,q) reduce across C once to get the necessary statistics for
@@ -45,16 +43,14 @@ reduce_pairwise_label_kernel(
 
     const bool use_bce      = (loss_type == kBinaryCrossEntropy) || (loss_type == kBinaryCrossEntropyFocal);
     const bool use_bce_focal= (loss_type == kBinaryCrossEntropyFocal);
-    const bool use_ce       = (loss_type == kCrossEntropy) || (loss_type == kCrossEntropyFocal);
 
     const bool   has_alpha = focal_alpha >= 0.f;
     const float  alpha_clamped = has_alpha ? fminf(fmaxf(focal_alpha, 0.f), 1.f) : 1.f;
-    const float  alpha_pos = alpha_clamped;
-    const float  alpha_neg = has_alpha ? (1.f - alpha_clamped) : 1.f;
+    const float  alpha_pos = use_bce_focal ? alpha_clamped : 1.f;
+    const float  alpha_neg = use_bce_focal ? (has_alpha ? (1.f - alpha_clamped) : 1.f) : 1.f;
 
     float thread_sum_softplus = 0.f;
     float thread_sum_mod_softplus = 0.f;
-    float thread_max = -INFINITY;
 
     // Stride across C by blockDim.x; template C is compile-time for efficient looping
     for (int c = tid; c < C; c += REDUCTION_THREADS_PER_BLOCK) {
@@ -69,9 +65,6 @@ reduce_pairwise_label_kernel(
                 const float sig = 1.f / (1.f + __expf(-z));
                 thread_sum_mod_softplus += powf(sig, focal_gamma) * softplus_z;
             }
-        }
-        if (use_ce) {
-            thread_max = fmaxf(thread_max, z);
         }
     }
 
@@ -117,53 +110,6 @@ reduce_pairwise_label_kernel(
         block_sum_mod_softplus = __shfl_sync(0xffffffff, block_sum_mod_softplus, 0);
     }
 
-    float block_max = -INFINITY;
-    if (use_ce) {
-        float max_val = thread_max;
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, off));
-        }
-        if ((tid & 31) == 0) {
-            s_warp[tid >> 5] = max_val;
-        }
-        __syncthreads();
-        for (int s = NUM_WARPS >> 1; s > 0; s >>= 1) {
-            if (tid < s) {
-                s_warp[tid] = fmaxf(s_warp[tid], s_warp[tid + s]);
-            }
-            __syncthreads();
-        }
-        block_max = (tid == 0) ? s_warp[0] : -INFINITY;
-        block_max = __shfl_sync(0xffffffff, block_max, 0);
-    }
-
-    float block_sum_exp = 0.f;
-    if (use_ce) {
-        float thread_sum = 0.f;
-        for (int c = tid; c < C; c += REDUCTION_THREADS_PER_BLOCK) {
-            const float z = logits[(((l * B + b) * Q + qid) * C) + c];
-            thread_sum += __expf(z - block_max);
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            thread_sum += __shfl_down_sync(0xffffffff, thread_sum, off);
-        }
-        if ((tid & 31) == 0) {
-            s_warp[tid >> 5] = thread_sum;
-        }
-        __syncthreads();
-        for (int s = NUM_WARPS >> 1; s > 0; s >>= 1) {
-            if (tid < s) {
-                s_warp[tid] += s_warp[tid + s];
-            }
-            __syncthreads();
-        }
-        block_sum_exp = (tid == 0) ? s_warp[0] : 0.f;
-        block_sum_exp = __shfl_sync(0xffffffff, block_sum_exp, 0);
-    }
-
-    const float block_logsumexp = use_ce ? (logf(fmaxf(block_sum_exp, 1e-20f)) + block_max) : 0.f;
     const float invC = (C > 0) ? (1.f / static_cast<float>(C)) : 0.f;
 
     // For each output GT slot, write loss or +inf for padding ---
@@ -194,13 +140,6 @@ reduce_pairwise_label_kernel(
                 const float neg_except = block_sum_mod_softplus - mod_pos * softplus_pos;
                 const float pos_term = softplus_neg * mod_neg;
                 v = (alpha_pos * pos_term + alpha_neg * neg_except) * invC;
-            } else if (loss_type == kCrossEntropy) {
-                v = block_logsumexp - z_pos;
-            } else if (loss_type == kCrossEntropyFocal) {
-                const float log_p = z_pos - block_logsumexp;
-                const float p = __expf(log_p);
-                const float focal = powf(fmaxf(1.f - p, 0.f), focal_gamma);
-                v = -alpha_pos * focal * log_p;
             } else {
                 v = INFINITY;
             }
@@ -239,7 +178,7 @@ torch::Tensor pairwise_label_loss_forward(
         // Set to an invalid index so device-side MAP_OUT_TO_ACTUAL is a no-op
         background_index = GT_total;
     }
-    TORCH_CHECK(loss_type >= 0 && loss_type <= 3, "pairwise_label_loss_forward: invalid loss type");
+    TORCH_CHECK(loss_type >= 0 && loss_type <= 1, "pairwise_label_loss_forward: invalid loss type");
 
     const int GT_out = GT_total - (drop_bg_col ? 1 : 0);
 

@@ -688,14 +688,6 @@ std::vector<torch::Tensor> mask_matching(
     torch::Tensor pred_to_gt = pred_to_gt_cpu.to(device, /*non_blocking=*/false);
     torch::Tensor pred_round = pred_round_cpu.to(device, /*non_blocking=*/false);
 
-    const bool uses_ce_loss = (label_loss_type == 2 || label_loss_type == 3);
-    if (force_unmatched_class_to_background && uses_ce_loss) {
-        TORCH_CHECK(
-            background_index >= 0 && background_index < cls_logits.size(3),
-            "mask_matching: background_index must be within [0, C) when using cross entropy label losses"
-        );
-    }
-
     auto losses = mask_matching_forward(
         mask_logits,
         cls_logits,

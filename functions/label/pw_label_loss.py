@@ -12,8 +12,6 @@ except ImportError:
 class PairwiseLabelLossType:
     BCE = 0
     BCE_FOCAL = 1
-    CE = 2
-    CE_FOCAL = 3
 
 
 class PairwiseSigmoidCELossFunction(Function):
@@ -61,10 +59,10 @@ def pairwise_label_loss_py(
 ):
     """Compute pairwise classification costs between predictions and labels.
 
-    ``loss_type`` selects among sigmoid BCE, sigmoid focal BCE, softmax cross
-    entropy, and softmax focal loss.  When a focal variant is used,
-    ``focal_gamma`` controls the focusing factor and ``focal_alpha`` (if not
-    ``None``) scales the positive term while negatives keep unit weight.
+    ``loss_type`` selects between sigmoid BCE and sigmoid focal BCE.  When the
+    focal variant is used, ``focal_gamma`` controls the focusing factor and
+    ``focal_alpha`` (if not ``None``) scales the positive term while negatives
+    keep unit weight.
 
     Args:
         logits (torch.Tensor): (L, B, Q, C) prediction logits.
@@ -146,21 +144,6 @@ def pairwise_label_loss_py(
         neg_except = sum_neg - (sig_pos.pow(gamma) * softplus_pos)
         pos_term = softplus_neg * torch.pow(1.0 - sig_pos, gamma)
         loss = (alpha_pos * pos_term + alpha_neg * neg_except) / float(max(C, 1))
-
-    elif loss_type == PairwiseLabelLossType.CE:
-        logsumexp = torch.logsumexp(z, dim=3, keepdim=True)  # (L,B,Q,1)
-        z_pos = torch.gather(z, dim=3, index=gather_idx)
-        loss = logsumexp - z_pos
-
-    elif loss_type == PairwiseLabelLossType.CE_FOCAL:
-        gamma = float(focal_gamma)
-        alpha = 1.0 if focal_alpha is None else float(focal_alpha)
-        logsumexp = torch.logsumexp(z, dim=3, keepdim=True)  # (L,B,Q,1)
-        z_pos = torch.gather(z, dim=3, index=gather_idx)
-        log_p = z_pos - logsumexp           # (L,B,Q,GT_out)
-        p = torch.exp(log_p)                # (L,B,Q,GT_out)
-        focal = torch.pow(1.0 - p, gamma)   # (L,B,Q,GT_out)
-        loss = -alpha * focal * log_p
 
     else:
         raise ValueError(f"Unsupported pairwise label loss type: {loss_type}")

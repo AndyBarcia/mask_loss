@@ -55,6 +55,7 @@ __global__ void mask_matching_forward_kernel(
 
     const int64_t pred_index = ((l * B) + b) * Q + q;
     const int64_t gt_index = pred_to_gt[pred_index];
+    (void)background_index;
 
     if (gt_index >= 0) {
         if (threadIdx.x == 0) {
@@ -121,46 +122,34 @@ __global__ void mask_matching_forward_kernel(
     if (ForceClass) {
         __syncthreads();
 
-        const bool use_bce = (label_loss_type == 0) || (label_loss_type == 1);
         const bool use_bce_focal = (label_loss_type == 1);
-        const bool use_ce = (label_loss_type == 2) || (label_loss_type == 3);
         const bool has_alpha = label_focal_alpha >= 0.f;
         const float alpha_clamped = has_alpha ? fminf(fmaxf(label_focal_alpha, 0.f), 1.f) : 1.f;
-        const float alpha_neg = has_alpha ? (1.f - alpha_clamped) : 1.f;
+        const float alpha_neg = use_bce_focal ? (has_alpha ? (1.f - alpha_clamped) : 1.f) : 1.f;
 
         const int64_t base_cls = pred_index * C;
         float sum_softplus = 0.0f;
         float sum_mod_softplus = 0.0f;
-        float thread_max = -INFINITY;
         for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
             const float logit = cls_logits[base_cls + c];
-            if (use_bce) {
-                sum_softplus += softplusf(logit);
-            }
+            const float softplus_val = softplusf(logit);
+            sum_softplus += softplus_val;
             if (use_bce_focal) {
                 const float sig = 1.0f / (1.0f + expf(-logit));
-                sum_mod_softplus += powf(sig, label_focal_gamma) * softplusf(logit);
-            }
-            if (use_ce) {
-                thread_max = fmaxf(thread_max, logit);
+                sum_mod_softplus += powf(sig, label_focal_gamma) * softplus_val;
             }
         }
 
-        float block_sum_softplus = 0.0f;
-        if (use_bce) {
-            sh_softplus_cls[threadIdx.x] = sum_softplus;
-            __syncthreads();
-            for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-                if (threadIdx.x < stride) {
-                    sh_softplus_cls[threadIdx.x] += sh_softplus_cls[threadIdx.x + stride];
-                }
-                __syncthreads();
-            }
-            if (threadIdx.x == 0) {
-                block_sum_softplus = sh_softplus_cls[0];
+        sh_softplus_cls[threadIdx.x] = sum_softplus;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                sh_softplus_cls[threadIdx.x] += sh_softplus_cls[threadIdx.x + stride];
             }
             __syncthreads();
         }
+        const float block_sum_softplus = sh_softplus_cls[0];
+        __syncthreads();
 
         float block_sum_mod_softplus = 0.0f;
         if (use_bce_focal) {
@@ -172,47 +161,7 @@ __global__ void mask_matching_forward_kernel(
                 }
                 __syncthreads();
             }
-            if (threadIdx.x == 0) {
-                block_sum_mod_softplus = sh_softplus_cls[0];
-            }
-            __syncthreads();
-        }
-
-        float block_logsumexp = 0.0f;
-        float z_bg = 0.0f;
-        if (use_ce) {
-            sh_softplus_cls[threadIdx.x] = thread_max;
-            __syncthreads();
-            for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-                if (threadIdx.x < stride) {
-                    sh_softplus_cls[threadIdx.x] = fmaxf(
-                        sh_softplus_cls[threadIdx.x],
-                        sh_softplus_cls[threadIdx.x + stride]
-                    );
-                }
-                __syncthreads();
-            }
-            const float block_max = sh_softplus_cls[0];
-            __syncthreads();
-
-            float thread_sum = 0.0f;
-            for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
-                const float logit = cls_logits[base_cls + c];
-                thread_sum += expf(logit - block_max);
-            }
-            sh_softplus_cls[threadIdx.x] = thread_sum;
-            __syncthreads();
-            for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-                if (threadIdx.x < stride) {
-                    sh_softplus_cls[threadIdx.x] += sh_softplus_cls[threadIdx.x + stride];
-                }
-                __syncthreads();
-            }
-            if (threadIdx.x == 0) {
-                const float sum_exp = sh_softplus_cls[0];
-                block_logsumexp = logf(fmaxf(sum_exp, 1e-20f)) + block_max;
-                z_bg = cls_logits[base_cls + background_index];
-            }
+            block_sum_mod_softplus = sh_softplus_cls[0];
             __syncthreads();
         }
 
@@ -224,14 +173,6 @@ __global__ void mask_matching_forward_kernel(
             } else if (label_loss_type == 1) {
                 const float inv_C = (C > 0) ? (1.0f / static_cast<float>(C)) : 0.0f;
                 cls_loss = cls_scale * (alpha_neg * block_sum_mod_softplus * inv_C);
-            } else if (label_loss_type == 2) {
-                cls_loss = cls_scale * (block_logsumexp - z_bg);
-            } else if (label_loss_type == 3) {
-                const float alpha = (label_focal_alpha >= 0.f) ? label_focal_alpha : 1.0f;
-                const float log_p = z_bg - block_logsumexp;
-                const float p = expf(log_p);
-                const float mod = powf(fmaxf(1.0f - p, 0.0f), label_focal_gamma);
-                cls_loss = cls_scale * (-alpha * mod * log_p);
             }
             atomicAdd(layer_cls_sum + l, cls_loss);
         }
@@ -341,8 +282,7 @@ std::vector<torch::Tensor> mask_matching_forward(
     }
 
     const int64_t term_stride = L * B * Q * GT_out;
-    const bool uses_ce_loss = (label_loss_type == 2) || (label_loss_type == 3);
-    const bool kernel_force_class = force_unmatched_class && !uses_ce_loss;
+    const bool kernel_force_class = force_unmatched_class;
 
     if (force_unmatched_masks && kernel_force_class) {
         shared_elems = 3;
@@ -463,43 +403,6 @@ std::vector<torch::Tensor> mask_matching_forward(
     auto matches = pred_to_gt_contig.ge(0);                        // (L,B,Q), bool
     auto matches_f = matches.to(layer_mask_sum.dtype());           // (L,B,Q)
     torch::Tensor per_layer_matched = matches_f.sum({1, 2});       // (L,)
-
-    if (uses_ce_loss) {
-        layer_cls_sum.zero_();
-
-        if (GT_out > 0) {
-            bool any_matches = matches.any().item<bool>();
-            if (any_matches) {
-                auto cls_costs = separate_costs_contig.select(0, 2); // (L,B,Q,GT_out)
-                auto gather_idx = pred_to_gt_contig.clamp_min(0).unsqueeze(-1); // (L,B,Q,1)
-                auto gathered = cls_costs.gather(-1, gather_idx).squeeze(-1);    // (L,B,Q)
-                auto matched_cls = (gathered * matches_f).sum({1, 2});           // (L,)
-                layer_cls_sum.add_(matched_cls);
-            }
-        }
-    }
-
-    if (force_unmatched_class && uses_ce_loss) {
-        TORCH_CHECK(cls_contig.defined(), "cls_logits must be provided when supervising unmatched classification");
-        auto unmatched_mask = matches.logical_not();                                    // (L,B,Q)
-        auto unmatched_mask_f = unmatched_mask.to(layer_cls_sum.options().dtype());     // (L,B,Q)
-        auto logsumexp = cls_contig.logsumexp(-1);                                      // (L,B,Q)
-        auto z_bg = cls_contig.select(-1, background_index);                            // (L,B,Q)
-
-        torch::Tensor loss;
-        if (label_loss_type == 2) {
-            loss = (logsumexp - z_bg) * cls_scale_val;
-        } else {
-            auto log_p = z_bg - logsumexp;
-            auto p = log_p.exp();
-            auto mod = (1.0f - p).clamp_min(0.0f).pow(label_focal_gamma);
-            const float alpha = (label_focal_alpha >= 0.f) ? label_focal_alpha : 1.0f;
-            loss = (-alpha * mod * log_p) * cls_scale_val;
-        }
-
-        auto unmatched_cls = (loss * unmatched_mask_f).sum({1, 2});
-        layer_cls_sum.add_(unmatched_cls);
-    }
 
     torch::Tensor per_layer_total = torch::full({L}, static_cast<float>(B * Q), layer_mask_sum.options());
 

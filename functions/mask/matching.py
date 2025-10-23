@@ -592,27 +592,6 @@ def mask_matching_py(
                 neg_term = (sig.pow(gamma) * softplus).sum(dim=-1)
                 alpha_neg = 1.0 if alpha is None else (1.0 - alpha)
                 cls_loss = (alpha_neg * neg_term / cls_logits.shape[-1]) * cls_scale
-            elif loss_type_val == PairwiseLabelLossType.CE:
-                if background_index is None or background_index < 0 or background_index >= cls_logits.shape[-1]:
-                    raise ValueError(
-                        "mask_matching_py: background_index must be within [0, C) when using cross entropy losses"
-                    )
-                logsumexp = torch.logsumexp(cls_logits, dim=-1)
-                z_bg = cls_logits[..., background_index]
-                cls_loss = (logsumexp - z_bg) * cls_scale
-            elif loss_type_val == PairwiseLabelLossType.CE_FOCAL:
-                if background_index is None or background_index < 0 or background_index >= cls_logits.shape[-1]:
-                    raise ValueError(
-                        "mask_matching_py: background_index must be within [0, C) when using cross entropy losses"
-                    )
-                gamma = float(label_focal_gamma)
-                alpha = 1.0 if label_focal_alpha is None else float(label_focal_alpha)
-                logsumexp = torch.logsumexp(cls_logits, dim=-1)
-                z_bg = cls_logits[..., background_index]
-                log_p = z_bg - logsumexp
-                p = log_p.exp()
-                focal = torch.pow(torch.clamp(1.0 - p, min=0.0), gamma)
-                cls_loss = (-alpha * focal * log_p) * cls_scale
             else:
                 raise ValueError(f"Unsupported label loss type: {loss_type_val}")
 
