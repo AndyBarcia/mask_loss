@@ -65,7 +65,9 @@ torch::Tensor pairwise_mask_loss_forward(
     const float sigmoid_scale = 1.0,
     const float dice_scale = 1.0,
     const float cls_scale = 1.0f,
-    int64_t background_index = -1
+    int64_t background_index = -1,
+    const float gamma = 0.0f,
+    const float alpha = -1.0f
 );
 
 // Hybrid mask matcher front-end.  Returns ``{pred_to_gt, pred_round,

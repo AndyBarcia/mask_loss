@@ -46,7 +46,9 @@ reduce_pairwise_sigmoid_dice_kernel(
     const int L,
     const float smooth,
     const float sigmoid_scale,
-    const float dice_scale
+    const float dice_scale,
+    const float gamma,
+    const float alpha
 ) {
     constexpr int TILE_H = 32;
     constexpr int TILE_W = 32;
@@ -69,6 +71,9 @@ reduce_pairwise_sigmoid_dice_kernel(
     const int s = H_t / H;
     const float N2 = static_cast<float>(s * s);
     const float denom = static_cast<float>(H_t * W_t);
+    const float alpha_pos = (alpha >= 0.0f) ? alpha : 1.0f;
+    const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
+    const bool use_gamma = (gamma > 0.0f);
 
     float thread_base = 0.f;
     float thread_p_total = 0.f;
@@ -96,8 +101,11 @@ reduce_pairwise_sigmoid_dice_kernel(
                 const float maxL = Lij > 0.f ? Lij : 0.f;
                 const float absL = fabsf(Lij);
                 const float logexp = log1pf(__expf(-absL));
-                thread_base += N2 * (maxL + logexp);
+                const float ce_neg = logexp + maxL;
                 const float p = 1.f / (1.f + __expf(-Lij));
+                const float mod_neg = use_gamma ? powf(p, gamma) : 1.0f;
+                const float coeff_neg = alpha_neg * mod_neg * ce_neg;
+                thread_base += N2 * coeff_neg;
                 thread_p_total += N2 * p;
             }
             __syncthreads();
@@ -184,8 +192,20 @@ reduce_pairwise_sigmoid_dice_kernel(
                     if (i < H && j < W) {
                         const float Lij = s_logits[idx];
                         const float fn = static_cast<float>(gt_counts_base[i * W + j]);
-                        thread_ce += -Lij * fn;
+                        const float absL = fabsf(Lij);
+                        const float maxL = Lij > 0.f ? Lij : 0.f;
+                        const float maxNegL = (-Lij) > 0.f ? -Lij : 0.f;
+                        const float logexp = log1pf(__expf(-absL));
+                        const float ce_neg = logexp + maxL;
+                        const float ce_pos = logexp + maxNegL;
                         const float p = 1.f / (1.f + __expf(-Lij));
+                        const float one_minus = 1.f - p;
+                        const float mod_neg = use_gamma ? powf(p, gamma) : 1.0f;
+                        const float mod_pos = use_gamma ? powf(one_minus, gamma) : 1.0f;
+                        const float coeff_neg = alpha_neg * mod_neg * ce_neg;
+                        const float coeff_pos = alpha_pos * mod_pos * ce_pos;
+                        const float coeff_delta = coeff_pos - coeff_neg;
+                        thread_ce += coeff_delta * fn;
                         thread_intersection += p * fn;
                     }
                 }
@@ -235,7 +255,9 @@ torch::Tensor pairwise_mask_loss_forward(
     const float sigmoid_scale = 1.0,
     const float dice_scale = 1.0,
     const float cls_scale = 1.0f,
-    int64_t background_index = -1
+    int64_t background_index = -1,
+    const float gamma = 0.0f,
+    const float alpha = -1.0f
 ) {
     CHECK_INPUT(mask_logits);
     CHECK_INPUT(mask_targets);
@@ -246,6 +268,9 @@ torch::Tensor pairwise_mask_loss_forward(
     TORCH_CHECK(mask_targets.dim() == 3, "mask_targets must be (B,H_t,W_t)");
     TORCH_CHECK(cls_logits.dim()  == 4, "cls_logits must be (L,B,Q,C)");
     TORCH_CHECK(cls_targets.dim() == 2, "cls_targets must be (B,GT)");
+    TORCH_CHECK(gamma >= 0.0f, "focal_gamma must be non-negative");
+    TORCH_CHECK(alpha < 0.0f || (alpha >= 0.0f && alpha <= 1.0f),
+        "focal_alpha must be in [0, 1] or negative to disable");
 
     const int L = mask_logits.size(0);
     const int B = mask_logits.size(1);
@@ -325,7 +350,9 @@ torch::Tensor pairwise_mask_loss_forward(
                     L,
                     smooth,
                     sigmoid_scale,
-                    dice_scale
+                    dice_scale,
+                    gamma,
+                    alpha
                 );
         };
 
