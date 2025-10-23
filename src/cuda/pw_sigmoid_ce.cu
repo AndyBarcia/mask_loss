@@ -20,7 +20,9 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_s
     const int GT_out,
     const int B,
     const int L,
-    const float scale
+    const float scale,
+    const float gamma,
+    const float alpha
 ) {
     constexpr int TILE_H = 32;
     constexpr int TILE_W = 32;
@@ -35,6 +37,8 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_s
 
     const int s = H_t / H;
     const float N2 = static_cast<float>(s * s);
+    const float alpha_pos = (alpha >= 0.0f) ? alpha : 1.0f;
+    const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
 
     // Compute base loss, independent of GT label
     float thread_base = 0.f;
@@ -56,10 +60,14 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_s
             // Base contribution only
             for (int idx = tid; idx < TILE_H*TILE_W; idx += REDUCTION_THREADS_PER_BLOCK) {
                 float Lij = s_logits[idx];
-                float maxL = Lij > 0.f ? Lij : 0.f;
                 float absL = fabsf(Lij);
+                float maxL = Lij > 0.f ? Lij : 0.f;
                 float logexp = log1pf(__expf(-absL));
-                thread_base += N2 * (maxL + logexp);
+                float ce_neg = logexp + maxL;
+                float sigma = 1.0f / (1.0f + __expf(-Lij));
+                float mod_neg = (gamma > 0.0f) ? powf(sigma, gamma) : 1.0f;
+                float coeff_neg = alpha_neg * mod_neg * ce_neg;
+                thread_base += N2 * coeff_neg;
             }
             __syncthreads();
         }
@@ -112,7 +120,21 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_s
                     int i = ti + di, j = tj + dj;
                     if (i < H && j < W) {
                         uint8_t n = gt_counts_base[i*W + j];
-                        thread_gt += - s_logits[idx] * float(n);
+                        float Lij = s_logits[idx];
+                        float absL = fabsf(Lij);
+                        float maxL = Lij > 0.f ? Lij : 0.f;
+                        float maxNegL = (-Lij) > 0.f ? -Lij : 0.f;
+                        float logexp = log1pf(__expf(-absL));
+                        float ce_neg = logexp + maxL;
+                        float ce_pos = logexp + maxNegL;
+                        float sigma = 1.0f / (1.0f + __expf(-Lij));
+                        float one_minus = 1.0f - sigma;
+                        float mod_neg = (gamma > 0.0f) ? powf(sigma, gamma) : 1.0f;
+                        float mod_pos = (gamma > 0.0f) ? powf(one_minus, gamma) : 1.0f;
+                        float coeff_neg = alpha_neg * mod_neg * ce_neg;
+                        float coeff_pos = alpha_pos * mod_pos * ce_pos;
+                        float coeff_delta = coeff_pos - coeff_neg;
+                        thread_gt += coeff_delta * float(n);
                     }
                 }
                 __syncthreads();
@@ -140,7 +162,9 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,   // (L,B,C,H,W), float
     const torch::Tensor& targets,  // (B,H_t,W_t), int64
     int64_t background_index = -1,
-    const float scale = 1.0f
+    const float scale = 1.0f,
+    const float gamma = 0.0f,
+    const float alpha = -1.0f
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -223,7 +247,9 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
                     static_cast<int32_t>(background_index),
                     GT_total,
                     GT_out,
-                    B, L, scale
+                    B, L, scale,
+                    gamma,
+                    alpha
                 );
         };
 

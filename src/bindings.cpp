@@ -23,7 +23,9 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,   // (L,B,C,H,W), float
     const torch::Tensor& targets,  // (B,H_t,W_t), int64
     int64_t background_index = -1,
-    const float scale = 1.0f
+    const float scale = 1.0f,
+    const float gamma = 0.0f,
+    const float alpha = -1.0f
 );
 
 std::vector<torch::Tensor> dice_loss_forward(

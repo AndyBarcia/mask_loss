@@ -387,10 +387,12 @@ def test_pw_sigmoid_ce_loss():
         "logits": lambda device, dtype: torch.randn(L, B, C, H, W, device=device, dtype=dtype),
         "targets": lambda device, dtype: create_gaussian_blob_targets(B, C, H_t, W_t, device),
         "background_index": 0,
-        "scale": 1.0
+        "scale": 1.0,
+        "focal_gamma": 0.0,
+        "focal_alpha": None,
     }
-    
-    arg_order = ["logits", "targets", "background_index", "scale"]
+
+    arg_order = ["logits", "targets", "background_index", "scale", "focal_gamma", "focal_alpha"]
     
     tester = CUDAKernelTester(
         cuda_function=PairwiseSigmoidCELossFunction.apply,

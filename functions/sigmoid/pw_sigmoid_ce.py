@@ -1,4 +1,6 @@
 import math
+from typing import List, Optional
+
 import torch
 import torch.nn.functional as F
 from torch.autograd import Function
@@ -14,26 +16,52 @@ except ImportError:
 
 class PairwiseSigmoidCELossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, background_index, scale):
+    def forward(
+        ctx,
+        logits,
+        targets,
+        background_index,
+        scale,
+        focal_gamma,
+        focal_alpha,
+    ):
         L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
-        
+
         logits = logits.contiguous().float()
         targets = targets.contiguous()
+        fg = 0.0 if focal_gamma is None else float(focal_gamma)
+        if fg < 0.0:
+            raise ValueError("focal_gamma must be non-negative")
+        if focal_alpha is None:
+            fa = -1.0
+        else:
+            fa = float(focal_alpha)
+            if not (0.0 <= fa <= 1.0):
+                raise ValueError("focal_alpha must be in [0, 1]")
         output = mask_loss.forward_pw_sigmoid_ce_loss(
-            logits, 
-            targets, 
+            logits,
+            targets,
             background_index if background_index is not None else -1,
-            scale if scale is not None else 1.0
+            scale if scale is not None else 1.0,
+            fg,
+            fa,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return None, None, None, None
+        return None, None, None, None, None, None
 
-def pairwise_sigmoid_cross_entropy_loss_inneficient_py(logits, targets, background_index=None, scale=1.0):
+def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
+    logits,
+    targets,
+    background_index=None,
+    scale=1.0,
+    focal_gamma: float = 0.0,
+    focal_alpha: Optional[float] = None,
+):
     """
     Computes pairwise sigmoid cross-entropy loss.
 
@@ -54,6 +82,9 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(logits, targets, backgrou
                             to be ignored. If not provided, all classses are
                             computed normally. If specified, the output tensor
                             has the column corresponding to the background removed.
+        focal_gamma (float): Focal loss exponent. Use 0.0 for vanilla BCE.
+        focal_alpha (Optional[float]): Weight for positives in [0, 1]. If ``None``
+                            the standard BCE weighting is used.
 
     Returns:
         torch.Tensor: A tensor of shape (L, B, C, max_GT) where max_GT is the maximum value
@@ -76,6 +107,22 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(logits, targets, backgrou
     logits_reshaped = logits.view(L * B, C, h, w)
     logits_up = F.interpolate(logits_reshaped, size=(H_t, W_t), mode='nearest')
     logits_up = logits_up.view(L, B, C, H_t, W_t)  # (L, B, C, H_t, W_t)
+
+    if focal_gamma is None:
+        focal_gamma = 0.0
+    focal_gamma = float(focal_gamma)
+    if focal_gamma < 0.0:
+        raise ValueError("focal_gamma must be non-negative")
+
+    if focal_alpha is None:
+        alpha_pos = logits.new_tensor(1.0)
+        alpha_neg = logits.new_tensor(1.0)
+    else:
+        focal_alpha = float(focal_alpha)
+        if not (0.0 <= focal_alpha <= 1.0):
+            raise ValueError("focal_alpha must be in [0, 1]")
+        alpha_pos = logits.new_tensor(focal_alpha)
+        alpha_neg = logits.new_tensor(1.0 - focal_alpha)
 
     targets_long = targets.long().to(device)
 
@@ -111,12 +158,24 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(logits, targets, backgrou
         y_b = y_mask.unsqueeze(0).unsqueeze(2)  # (1, B, 1, H_t, W_t)
 
         # Stable BCE-with-logits (broadcasts y_b over L and C)
-        maxL = torch.clamp(logits_up, min=0.0)
-        logexp = torch.log1p(torch.exp(-torch.abs(logits_up)))
-        bce_elem = maxL - logits_up * y_b + logexp  # (L, B, C, H_t, W_t)
+        ce_pos = F.softplus(-logits_up)
+        ce_neg = F.softplus(logits_up)
+        probs = torch.sigmoid(logits_up)
+
+        if focal_gamma == 0.0:
+            mod_pos = torch.ones_like(probs)
+            mod_neg = mod_pos
+        else:
+            mod_pos = (1.0 - probs).pow(focal_gamma)
+            mod_neg = probs.pow(focal_gamma)
+
+        loss_tensor = (
+            alpha_pos * y_b * mod_pos * ce_pos
+            + alpha_neg * (1.0 - y_b) * mod_neg * ce_neg
+        )
 
         # Sum spatially and normalize by area
-        loss_per_class = bce_elem.sum(dim=(3, 4)) / (H_t * W_t)  # (L, B, C)
+        loss_per_class = loss_tensor.sum(dim=(3, 4)) / (H_t * W_t)  # (L, B, C)
 
         # Build mask to select where to write loss (expand has_class to (L,B,C))
         has_class_expand = has_class.unsqueeze(0).unsqueeze(-1).expand(L, B, C)  # (L,B,C)
@@ -132,7 +191,14 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(logits, targets, backgrou
     return pairwise_loss * scale
 
 
-def pairwise_sigmoid_cross_entropy_loss_py(logits, targets, background_index=None, scale=1.0):
+def pairwise_sigmoid_cross_entropy_loss_py(
+    logits,
+    targets,
+    background_index=None,
+    scale=1.0,
+    focal_gamma: float = 0.0,
+    focal_alpha: Optional[float] = None,
+):
     """
     Computes pairwise sigmoid cross-entropy loss in an efficient way.
 
@@ -153,6 +219,9 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets, background_index=Non
                             to be ignored. If not provided, all classses are
                             computed normally. If specified, the output tensor
                             has the column corresponding to the background removed.
+        focal_gamma (float): Focal loss exponent. Use 0.0 for vanilla BCE.
+        focal_alpha (Optional[float]): Weight for positives in [0, 1]. If ``None``
+                            the standard BCE weighting is used.
 
     Returns:
         torch.Tensor: A tensor of shape (L, B, C, max_GT) where max_GT is the maximum value
@@ -176,17 +245,35 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets, background_index=Non
     device = logits.device
     dtype  = logits.dtype
 
+    if focal_gamma is None:
+        focal_gamma = 0.0
+    focal_gamma = float(focal_gamma)
+    if focal_gamma < 0.0:
+        raise ValueError("focal_gamma must be non-negative")
+
+    if focal_alpha is None:
+        alpha_pos = logits.new_tensor(1.0)
+        alpha_neg = logits.new_tensor(1.0)
+    else:
+        focal_alpha = float(focal_alpha)
+        if not (0.0 <= focal_alpha <= 1.0):
+            raise ValueError("focal_alpha must be in [0, 1]")
+        alpha_pos = logits.new_tensor(focal_alpha)
+        alpha_neg = logits.new_tensor(1.0 - focal_alpha)
+
     # Prepare logits (L,B,C,J) and stable BCE pieces
     z = logits.reshape(L, B, C, J)
 
-    # neg(z) = BCEWithLogits(z, 0) = max(z,0) + log1p(exp(-|z|))
-    maxL = torch.clamp(z, min=0.0)
-    logexp = torch.log1p(torch.exp(-torch.abs(z)))
-    neg = maxL + logexp # (L,B,C,J)
+    ce_pos = F.softplus(-z)
+    ce_neg = F.softplus(z)
+    probs = torch.sigmoid(z)
 
-    # Sum of the "all negatives" part across the N2 pixels per cell
-    # (same for every GT class):  sum_j N2 * neg(z_j)
-    base_neg = (N2 * neg).sum(dim=3) # (L,B,C)
+    if focal_gamma == 0.0:
+        mod_pos = torch.ones_like(probs)
+        mod_neg = mod_pos
+    else:
+        mod_pos = (1.0 - probs).pow(focal_gamma)
+        mod_neg = probs.pow(focal_gamma)
 
     # Per-cell per-class positive counts k (how many pixels equal that class) 
     targets_long = targets.to(device=device, dtype=torch.long, non_blocking=True)
@@ -213,11 +300,14 @@ def pairwise_sigmoid_cross_entropy_loss_py(logits, targets, background_index=Non
 
     counts = counts_all.index_select(2, idxs) # (B, J, G)
     counts_f = counts.to(dtype) # float for einsum
+    neg_counts = counts_f.new_full(counts_f.shape, float(N2)) - counts_f
 
-    # sum_j [-z * k] + sum_j [N2 * neg]
-    # term1 = -einsum over cells J: (L,B,C,J) x (B,J,G) -> (L,B,C,G)
-    term1 = -torch.einsum('lbcj,bjg->lbcg', z, counts_f)
-    loss = (term1 + base_neg.unsqueeze(-1)) / (H_t * W_t)  # (L,B,C,G)
+    coeff_pos = ce_pos * mod_pos
+    coeff_neg = ce_neg * mod_neg
+
+    loss_pos = torch.einsum('lbcj,bjg->lbcg', coeff_pos, counts_f)
+    loss_neg = torch.einsum('lbcj,bjg->lbcg', coeff_neg, neg_counts)
+    loss = (alpha_pos * loss_pos + alpha_neg * loss_neg) / (H_t * W_t)
 
     # Set +inf where the GT class doesn't appear in that image
     present = (counts.sum(dim=1) > 0) # (B,G) bool
@@ -234,6 +324,8 @@ def pairwise_sigmoid_cross_entropy_loss_sampling_py(
     scale: float = 1.0,
     num_points: int = 5000,
     align_corners: bool = False,
+    focal_gamma: float = 0.0,
+    focal_alpha: Optional[float] = None,
 ):
     """
     Pairwise sigmoid CE using *point sampling* (like Mask2Former matching).
@@ -246,6 +338,9 @@ def pairwise_sigmoid_cross_entropy_loss_sampling_py(
         targets: (B, H_t, W_t)    integer label map per image
         background_index: int or None
         scale:   multiply the final loss
+        focal_gamma: Focal loss exponent. Use 0.0 for vanilla BCE.
+        focal_alpha: Optional positive-class prior in [0, 1]. If ``None`` use
+            standard BCE weighting.
         num_points: number of random points per image to sample (default: 5000)
         align_corners: forwarded to `point_sample` for the prediction sampling
 
@@ -262,6 +357,22 @@ def pairwise_sigmoid_cross_entropy_loss_sampling_py(
 
     device = logits.device
     dtype  = logits.dtype
+
+    if focal_gamma is None:
+        focal_gamma = 0.0
+    focal_gamma = float(focal_gamma)
+    if focal_gamma < 0.0:
+        raise ValueError("focal_gamma must be non-negative")
+
+    if focal_alpha is None:
+        alpha_pos = logits.new_tensor(1.0)
+        alpha_neg = logits.new_tensor(1.0)
+    else:
+        focal_alpha = float(focal_alpha)
+        if not (0.0 <= focal_alpha <= 1.0):
+            raise ValueError("focal_alpha must be in [0, 1]")
+        alpha_pos = logits.new_tensor(focal_alpha)
+        alpha_neg = logits.new_tensor(1.0 - focal_alpha)
 
     # Determine global set of GT classes to report (consistent last dim across batch)
     targets_long = targets.to(device=device, dtype=torch.long, non_blocking=True)
@@ -327,13 +438,24 @@ def pairwise_sigmoid_cross_entropy_loss_sampling_py(
 
         # BCE-with-logits via einsum
         # pred_pts: (N, P) with N=L*C
-        pos = F.binary_cross_entropy_with_logits(pred_pts, torch.ones_like(pred_pts), reduction="none")  # (N, P)
-        neg = F.binary_cross_entropy_with_logits(pred_pts, torch.zeros_like(pred_pts), reduction="none")  # (N, P)
+        ce_pos = F.softplus(-pred_pts)
+        ce_neg = F.softplus(pred_pts)
+        probs = torch.sigmoid(pred_pts)
 
-        # loss = ⟨pos, tgt⟩ + ⟨neg, 1 - tgt⟩ over the points dimension
-        term_pos = torch.einsum("np,mp->nm", pos, tgt_pts)                      # (N, Gb)
-        term_neg = torch.einsum("np,mp->nm", neg, (1.0 - tgt_pts))              # (N, Gb)
-        loss_lc_gb = (term_pos + term_neg) / float(num_points)                  # (N, Gb)
+        if focal_gamma == 0.0:
+            mod_pos = torch.ones_like(probs)
+            mod_neg = mod_pos
+        else:
+            mod_pos = (1.0 - probs).pow(focal_gamma)
+            mod_neg = probs.pow(focal_gamma)
+
+        weighted_pos = alpha_pos * mod_pos * ce_pos
+        weighted_neg = alpha_neg * mod_neg * ce_neg
+
+        # loss = ⟨weighted_pos, tgt⟩ + ⟨weighted_neg, 1 - tgt⟩ over the points dimension
+        term_pos = torch.einsum("np,mp->nm", weighted_pos, tgt_pts)                      # (N, Gb)
+        term_neg = torch.einsum("np,mp->nm", weighted_neg, (1.0 - tgt_pts))              # (N, Gb)
+        loss_lc_gb = (term_pos + term_neg) / float(num_points)                            # (N, Gb)
         loss_l_c_gb = loss_lc_gb.view(L, C, Gb)                                 # (L, C, Gb)
 
         out[:, b, :, cols] = loss_l_c_gb
