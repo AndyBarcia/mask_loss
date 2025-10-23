@@ -8,6 +8,7 @@ from torch.autograd import Function
 from torch.utils.checkpoint import checkpoint
 
 from .pw_mask import pairwise_mask_loss_py
+from ..label.pw_label_loss import PairwiseLabelLossType
 from scipy.optimize import linear_sum_assignment
 
 try:
@@ -40,6 +41,9 @@ class MaskMatchingFunction(Function):
         dice_scale,
         cls_scale,
         background_index,
+        label_loss_type=PairwiseLabelLossType.BCE,
+        label_focal_alpha=None,
+        label_focal_gamma=2.0,
         inf_thresh,
         num_masks,
         force_unmatched_class_to_background,
@@ -66,6 +70,13 @@ class MaskMatchingFunction(Function):
             cls_scale (float): Scalar multiplier applied to the class cost.
             background_index (int): Index in ``cls_targets`` that represents
                 the background class. ``-1`` disables background forcing.
+            label_loss_type (PairwiseLabelLossType): Classification loss variant
+                used for the pairwise label costs.
+            label_focal_alpha (Optional[float]): Focal alpha parameter applied
+                when ``label_loss_type`` selects a focal variant. ``None``
+                falls back to the CUDA default.
+            label_focal_gamma (float): Focal gamma parameter for focal label
+                losses.
             inf_thresh (float): Threshold above which costs are treated as
                 ``+inf`` and therefore ignored by the assignment step.
             num_masks (float): Optional normalisation denominator for the mask
@@ -98,6 +109,11 @@ class MaskMatchingFunction(Function):
         dice_scale_val = float(dice_scale if dice_scale is not None else 1.0)
         cls_scale = float(cls_scale if cls_scale is not None else 1.0)
         background_index_val = int(background_index if background_index is not None else -1)
+        label_loss_type_val = int(
+            label_loss_type if label_loss_type is not None else int(PairwiseLabelLossType.BCE)
+        )
+        label_focal_alpha_val = float(label_focal_alpha) if label_focal_alpha is not None else -1.0
+        label_focal_gamma_val = float(label_focal_gamma) if label_focal_gamma is not None else 2.0
         inf_thresh_val = float(inf_thresh if inf_thresh is not None else 1e30)
         num_masks_val = float(num_masks if num_masks is not None else -1.0)
         force_unmatched_cls = bool(
@@ -136,6 +152,9 @@ class MaskMatchingFunction(Function):
             dice_scale_val,
             cls_scale,
             background_index_val,
+            label_loss_type_val,
+            label_focal_alpha_val,
+            label_focal_gamma_val,
             inf_thresh_val,
             num_masks_val,
             force_unmatched_cls,
@@ -157,6 +176,9 @@ class MaskMatchingFunction(Function):
         ctx.dice_scale = dice_scale_val
         ctx.cls_scale = cls_scale
         ctx.background_index = background_index_val
+        ctx.label_loss_type = label_loss_type_val
+        ctx.label_focal_alpha = label_focal_alpha_val
+        ctx.label_focal_gamma = label_focal_gamma_val
         ctx.num_masks = num_masks_val
         ctx.force_unmatched_cls = force_unmatched_cls
         ctx.force_unmatched_masks = force_unmatched_masks
@@ -221,6 +243,9 @@ class MaskMatchingFunction(Function):
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
 
 def mask_matching_py(
@@ -233,6 +258,9 @@ def mask_matching_py(
     dice_scale      = 1.0,
     cls_scale       = 1.0,
     background_index= -1,
+    label_loss_type=PairwiseLabelLossType.BCE,
+    label_focal_alpha=None,
+    label_focal_gamma=2.0,
     inf_thresh      = 1e30,
     num_masks       = None,
     force_unmatched_class_to_background=False,
@@ -255,6 +283,13 @@ def mask_matching_py(
         dice_scale (float): Weight applied to the dice cost.
         cls_scale (float): Weight applied to the classification cost.
         background_index (int): Background class index or ``-1`` to disable.
+        label_loss_type (PairwiseLabelLossType): Classification loss variant
+            used for the pairwise label costs.
+        label_focal_alpha (Optional[float]): Focal alpha parameter used when
+            ``label_loss_type`` selects a focal formulation. ``None`` falls
+            back to the CUDA default value.
+        label_focal_gamma (float): Focal gamma parameter for focal label
+            losses.
         inf_thresh (float): Costs equal/above this value are ignored.
         num_masks (Optional[float]): Optional denominator for loss averaging.
         force_unmatched_class_to_background (bool): If ``True`` enforce
@@ -293,6 +328,9 @@ def mask_matching_py(
         dice_scale,
         cls_scale,
         background_index,
+        label_loss_type,
+        label_focal_alpha,
+        label_focal_gamma,
     )
     sigmoid_cost = costs[0]
     dice_cost = costs[1]
@@ -580,6 +618,9 @@ def mask_matching_sampling_py(
     dice_scale      = 1.0,
     cls_scale       = 1.0,
     background_index= -1,
+    label_loss_type=PairwiseLabelLossType.BCE,
+    label_focal_alpha=None,
+    label_focal_gamma=2.0,
     inf_thresh      = 1e30,
     num_masks       = None,
 ):
@@ -596,6 +637,9 @@ def mask_matching_sampling_py(
         dice_scale,
         cls_scale,
         background_index,
+        label_loss_type,
+        label_focal_alpha,
+        label_focal_gamma,
     )
     sigmoid_cost = costs[0]
     dice_cost = costs[1]

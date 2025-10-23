@@ -524,6 +524,9 @@ def test_mask_matching():
         "dice_scale": 1.0,
         "cls_scale": 1.0,
         "background_index": 0,
+        "label_loss_type": PairwiseLabelLossType.BCE,
+        "label_focal_alpha": None,
+        "label_focal_gamma": 2.0,
         "inf_thresh": 1e30,
         "num_masks": 0
     }
@@ -535,9 +538,12 @@ def test_mask_matching():
         "cls_targets",
         "smooth", 
         "sigmoid_scale", 
-        "dice_scale", 
+        "dice_scale",
         "cls_scale",
         "background_index",
+        "label_loss_type",
+        "label_focal_alpha",
+        "label_focal_gamma",
         "inf_thresh",
         "num_masks"
     ]
