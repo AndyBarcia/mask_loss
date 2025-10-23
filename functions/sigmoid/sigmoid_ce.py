@@ -21,7 +21,7 @@ except ImportError:
 
 class SigmoidCELossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, num_masks, scale, focal_gamma=None, focal_alpha=None):
+    def forward(ctx, logits, targets, num_masks, scale, focal_gamma, focal_alpha):
         L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
@@ -183,9 +183,6 @@ def sigmoid_cross_entropy_loss_py(
     if num_masks is None:
         num_masks = float(B * C)
 
-    if focal_gamma < 0.0:
-        raise ValueError("focal_gamma must be non-negative")
-
     if focal_alpha is None:
         alpha_pos = logits.new_tensor(1.0)
         alpha_neg = logits.new_tensor(1.0)
@@ -208,14 +205,14 @@ def sigmoid_cross_entropy_loss_py(
     neg_counts = N2 - pos_counts  # (B, C, h*w)
 
     L_flat = logits.reshape(L, B, C, h * w)  # (L,B,C,h*w), float
-    pos_counts = pos_counts.to(dtype)
-    neg_counts = neg_counts.to(dtype)
+    pos_counts = pos_counts.to(logits.dtype)
+    neg_counts = neg_counts.to(logits.dtype)
 
     ce_pos = F.softplus(-L_flat)
     ce_neg = F.softplus(L_flat)
     probs = torch.sigmoid(L_flat)
 
-    if focal_gamma == 0.0:
+    if focal_gamma is None or focal_gamma == 0.0:
         mod_pos = torch.ones_like(probs)
         mod_neg = mod_pos
     else:
