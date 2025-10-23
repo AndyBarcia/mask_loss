@@ -22,7 +22,10 @@ reduce_pairwise_label_kernel(
     const int32_t B,
     const int32_t Q,
     const int32_t L,
-    const float scale
+    const float scale,
+    const int32_t loss_type,
+    const float focal_alpha,
+    const float focal_gamma
 );
 
 // This kernel fuses the pairwise sigmoid cross-entropy (BCE) and Dice reductions.
@@ -235,7 +238,10 @@ torch::Tensor pairwise_mask_loss_forward(
     const float sigmoid_scale = 1.0,
     const float dice_scale = 1.0,
     const float cls_scale = 1.0f,
-    int64_t background_index = -1
+    int64_t background_index = -1,
+    int64_t label_loss_type = 0,
+    const float label_focal_alpha = -1.0f,
+    const float label_focal_gamma = 2.0f
 ) {
     CHECK_INPUT(mask_logits);
     CHECK_INPUT(mask_targets);
@@ -246,6 +252,7 @@ torch::Tensor pairwise_mask_loss_forward(
     TORCH_CHECK(mask_targets.dim() == 3, "mask_targets must be (B,H_t,W_t)");
     TORCH_CHECK(cls_logits.dim()  == 4, "cls_logits must be (L,B,Q,C)");
     TORCH_CHECK(cls_targets.dim() == 2, "cls_targets must be (B,GT)");
+    TORCH_CHECK(label_loss_type >= 0 && label_loss_type <= 3, "pairwise_mask_loss_forward: invalid label loss type");
 
     const int L = mask_logits.size(0);
     const int B = mask_logits.size(1);
@@ -359,7 +366,10 @@ torch::Tensor pairwise_mask_loss_forward(
                     B,
                     Q,
                     L,
-                    cls_scale
+                    cls_scale,
+                    static_cast<int32_t>(label_loss_type),
+                    label_focal_alpha,
+                    label_focal_gamma
                 );
         };
         const auto supported_dims = std::make_tuple(

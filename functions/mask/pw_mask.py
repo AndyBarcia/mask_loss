@@ -8,7 +8,10 @@ from torch.utils.checkpoint import checkpoint
 
 from ..sigmoid.pw_sigmoid_ce import pairwise_sigmoid_cross_entropy_loss_py
 from ..dice.pw_dice_loss import pairwise_dice_loss_py
-from ..label.pw_label_loss import pairwise_label_loss_py
+from ..label.pw_label_loss import (
+    pairwise_label_loss_py,
+    PairwiseLabelLossType,
+)
 
 try:
     import mask_loss
@@ -28,12 +31,15 @@ class PairwiseMaskLossFunction(Function):
         sigmoid_scale,
         dice_scale,
         cls_scale,
-        background_index, 
+        background_index,
+        label_loss_type=PairwiseLabelLossType.BCE,
+        label_focal_alpha=None,
+        label_focal_gamma=2.0,
     ):
         L, B, C, h, w = mask_logits.shape
         B_t, H_t, W_t = mask_targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
-        
+
         mask_logits = mask_logits.contiguous().float()
         mask_targets = mask_targets.contiguous()
         cls_logits = cls_logits.contiguous().float()
@@ -48,12 +54,15 @@ class PairwiseMaskLossFunction(Function):
             dice_scale if dice_scale is not None else 1.0,
             cls_scale if cls_scale is not None else 1.0,
             background_index if background_index is not None else -1,
+            int(label_loss_type) if label_loss_type is not None else PairwiseLabelLossType.BCE,
+            float(label_focal_alpha) if label_focal_alpha is not None else -1.0,
+            float(label_focal_gamma) if label_focal_gamma is not None else 2.0,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return (None,)*9
+        return (None,)*12
 
 
 def pairwise_mask_loss_py(
@@ -66,10 +75,13 @@ def pairwise_mask_loss_py(
     dice_scale      = 1.0,
     cls_scale       = 1.0,
     background_index= -1,
+    label_loss_type=PairwiseLabelLossType.BCE,
+    label_focal_alpha=None,
+    label_focal_gamma=2.0,
 ):
     sigmoid_cost = pairwise_sigmoid_cross_entropy_loss_py(
-        mask_logits, 
-        mask_targets, 
+        mask_logits,
+        mask_targets,
         background_index,
         sigmoid_scale, 
     )  # (L,B,C,GT_out)
@@ -84,6 +96,9 @@ def pairwise_mask_loss_py(
         cls_logits,
         cls_targets,
         background_index=background_index,
-        scale=cls_scale
+        scale=cls_scale,
+        loss_type=label_loss_type,
+        focal_alpha=label_focal_alpha,
+        focal_gamma=label_focal_gamma,
     ) # (L,B,C,GT_out)
     return torch.stack([sigmoid_cost, dice_cost, cls_cost], dim=0)  # (3,L,B,C,GT_out)

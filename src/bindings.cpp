@@ -59,7 +59,10 @@ torch::Tensor pairwise_mask_loss_forward(
     const float sigmoid_scale = 1.0,
     const float dice_scale = 1.0,
     const float cls_scale = 1.0f,
-    int64_t background_index = -1
+    int64_t background_index = -1,
+    int64_t label_loss_type = 0,
+    const float label_focal_alpha = -1.0f,
+    const float label_focal_gamma = 2.0f
 );
 
 // Hybrid mask matcher front-end.  Returns ``{pred_to_gt, pred_round,
@@ -105,7 +108,10 @@ torch::Tensor pairwise_label_loss_forward(
     const torch::Tensor& logits,   // (L,B,Q,C), float
     const torch::Tensor& targets,  // (B,GT_total), int64 with -1 padding
     int64_t background_index = -1,
-    const float scale = 1.0f
+    const float scale = 1.0f,
+    int64_t loss_type = 0,
+    const float focal_alpha = -1.0f,
+    const float focal_gamma = 2.0f
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
