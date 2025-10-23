@@ -166,7 +166,10 @@ __global__ void cls_matching_backward_kernel(
     const int64_t C,
     const int64_t GT_total,
     const float* __restrict__ coeff_base,
-    const int64_t background_index
+    const int64_t background_index,
+    const int loss_type,
+    const float focal_alpha,
+    const float focal_gamma
 ) {
     const int64_t q = blockIdx.x;  // prediction index
     const int64_t b = blockIdx.y;
@@ -180,26 +183,138 @@ __global__ void cls_matching_backward_kernel(
     const bool is_matched = out_gt >= 0 && actual_gt < GT_total;
     if (!is_matched && !ForceUnmatchedClass) return;
 
-    // Per-layer coefficient: upstream grad * normalization * cls_scale * (1/C)
-    const float coeff = grad_layer_cls[l] * coeff_base[l] / static_cast<float>(C);
+    const float coeff = grad_layer_cls[l] * coeff_base[l];
     if (coeff == 0.0f) return;
 
-    // Write grads for the entire class vector of the matched/unmatched query
     const int64_t base = pred_index * C;
 
     int y = -1;
     if (is_matched) {
         const int64_t y64 = cls_targets[b * GT_total + actual_gt];
-        if (y64 < 0 || y64 >= C) return; // invalid label (padding or OOR)
+        if (y64 < 0 || y64 >= C) return;
         y = static_cast<int>(y64);
+    } else if (ForceUnmatchedClass && (loss_type == 2 || loss_type == 3)) {
+        if (background_index < 0 || background_index >= C) {
+            return;
+        }
+        y = static_cast<int>(background_index);
     }
+
+    const bool use_bce = (loss_type == 0) || (loss_type == 1);
+    const bool use_bce_focal = (loss_type == 1);
+    const bool use_ce = (loss_type == 2) || (loss_type == 3);
+    const bool use_ce_focal = (loss_type == 3);
+    const bool has_alpha = focal_alpha >= 0.0f;
+    const float alpha_clamped = has_alpha ? fminf(fmaxf(focal_alpha, 0.0f), 1.0f) : 1.0f;
+    const float alpha_pos = has_alpha ? alpha_clamped : 1.0f;
+    const float alpha_neg = has_alpha ? (1.0f - alpha_clamped) : 1.0f;
+    const float invC = (C > 0) ? (1.0f / static_cast<float>(C)) : 0.0f;
+
+    if (use_bce) {
+        for (int c = threadIdx.x; c < C; c += blockDim.x) {
+            const float z = cls_logits[base + c];
+            const float p = 1.0f / (1.0f + __expf(-z));
+            float grad_term;
+            if (!use_bce_focal) {
+                const float t = (is_matched && c == y) ? 1.0f : 0.0f;
+                grad_term = (p - t) * invC;
+            } else {
+                const float one_minus_p = 1.0f - p;
+                const float log_p = logf(fmaxf(p, 1e-8f));
+                const float log_one_minus_p = logf(fmaxf(one_minus_p, 1e-8f));
+                if (is_matched && c == y) {
+                    const float mod = powf(fmaxf(one_minus_p, 0.0f), focal_gamma);
+                    grad_term = alpha_pos * mod * (focal_gamma * p * log_p - one_minus_p) * invC;
+                } else {
+                    const float mod = powf(fmaxf(p, 0.0f), focal_gamma);
+                    grad_term = alpha_neg * mod * (p - focal_gamma * one_minus_p * log_one_minus_p) * invC;
+                }
+            }
+            grad_cls_logits[base + c] = coeff * grad_term;
+        }
+        return;
+    }
+
+    if (!use_ce) {
+        return;
+    }
+
+    if (y < 0 || y >= C) {
+        return;
+    }
+
+    __shared__ float sh_reduce[GRAD_THREADS];
+
+    float max_z = -INFINITY;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        max_z = fmaxf(max_z, cls_logits[base + c]);
+    }
+    sh_reduce[threadIdx.x] = max_z;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sh_reduce[threadIdx.x] = fmaxf(sh_reduce[threadIdx.x], sh_reduce[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    max_z = sh_reduce[0];
+    __syncthreads();
+
+    float sum_exp = 0.0f;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        sum_exp += expf(cls_logits[base + c] - max_z);
+    }
+    sh_reduce[threadIdx.x] = sum_exp;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sh_reduce[threadIdx.x] += sh_reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    sum_exp = sh_reduce[0];
+    __syncthreads();
+
+    const float logsumexp = logf(fmaxf(sum_exp, 1e-20f)) + max_z;
+    const float z_y = cls_logits[base + y];
+    const float log_p_y = z_y - logsumexp;
+    float p_y = expf(log_p_y);
+    p_y = fminf(fmaxf(p_y, 1e-8f), 1.0f);
+
+    if (!use_ce_focal) {
+        for (int c = threadIdx.x; c < C; c += blockDim.x) {
+            const float z = cls_logits[base + c];
+            float grad_term = expf(z - logsumexp);
+            if (c == y) {
+                grad_term -= 1.0f;
+            }
+            grad_cls_logits[base + c] = coeff * grad_term;
+        }
+        return;
+    }
+
+    const float alpha = (focal_alpha >= 0.0f) ? focal_alpha : 1.0f;
+    const float m = fmaxf(1.0f - p_y, 1e-8f);
+    float common;
+    if (focal_gamma == 0.0f) {
+        common = -alpha;
+    } else {
+        const float inv_py = 1.0f / p_y;
+        const float pow_term = powf(m, focal_gamma - 1.0f);
+        common = alpha * p_y * pow_term * (focal_gamma * log_p_y - m * inv_py);
+    }
+    const float grad_y_coeff = common * (1.0f - p_y);
 
     for (int c = threadIdx.x; c < C; c += blockDim.x) {
         const float z = cls_logits[base + c];
-        const float p = 1.0f / (1.0f + __expf(-z));   // sigmoid
-        const float t = (is_matched && c == y) ? 1.0f : 0.0f;
-        // d/dz BCE(one-hot) averaged over C: (p - t) / C
-        grad_cls_logits[base + c] = coeff * (p - t);
+        const float p = expf(z - logsumexp);
+        float grad_term;
+        if (c == y) {
+            grad_term = grad_y_coeff;
+        } else {
+            grad_term = -common * p;
+        }
+        grad_cls_logits[base + c] = coeff * grad_term;
     }
 }
 
@@ -217,6 +332,9 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float dice_scale,
     const float cls_scale,
     int64_t background_index,
+    int64_t label_loss_type,
+    const float label_focal_alpha,
+    const float label_focal_gamma,
     const double num_masks,
     const bool force_unmatched_class_to_background,
     const bool force_unmatched_masks_to_empty
@@ -256,6 +374,14 @@ std::vector<torch::Tensor> mask_matching_backward(
     const int64_t C = cls_logits.size(3);
     const int64_t GT_total = cls_targets.size(1);
 
+    const bool uses_ce_loss = (label_loss_type == 2) || (label_loss_type == 3);
+    if (force_unmatched_class_to_background && uses_ce_loss) {
+        TORCH_CHECK(
+            background_index >= 0 && background_index < C,
+            "mask_matching_backward: background_index must be within [0, C) when using cross entropy label losses"
+        );
+    }
+
     TORCH_CHECK(H > 0 && W > 0, "mask_logits must have positive spatial size");
 
     const int64_t H_t = mask_targets.size(1);
@@ -268,7 +394,7 @@ std::vector<torch::Tensor> mask_matching_backward(
 
     if (background_index < 0) {
         // If negative, set to an invalid index to simplify device code
-        background_index = GT_total; 
+        background_index = GT_total;
     }
 
     auto grad_mask_logits = torch::zeros_like(mask_logits);
@@ -396,7 +522,10 @@ std::vector<torch::Tensor> mask_matching_backward(
                 C,
                 GT_total,
                 cls_coeff.data_ptr<float>(),
-                background_index
+                background_index,
+                static_cast<int>(label_loss_type),
+                label_focal_alpha,
+                label_focal_gamma
             );
             CHECK_CUDA_ERROR(cudaGetLastError());
         }

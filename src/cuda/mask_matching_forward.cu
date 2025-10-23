@@ -39,7 +39,11 @@ __global__ void mask_matching_forward_kernel(
     const float dice_scale,
     const float cls_scale,
     const float area_scale,
-    const int64_t term_stride
+    const int64_t term_stride,
+    const int64_t background_index,
+    const int32_t label_loss_type,
+    const float label_focal_alpha,
+    const float label_focal_gamma
 ) {
     const int64_t q = blockIdx.x;
     const int64_t b = blockIdx.y;
@@ -96,18 +100,6 @@ __global__ void mask_matching_forward_kernel(
         sh_sigmoid[threadIdx.x] = sum_sigmoid;
     }
 
-    if (ForceClass) {
-        const int64_t base_cls = pred_index * C;
-        float sum_softplus = 0.0f;
-        for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
-            const float logit = cls_logits[base_cls + c];
-            sum_softplus += softplusf(logit);
-        }
-        sh_softplus_cls[threadIdx.x] = sum_softplus;
-    }
-
-    __syncthreads();
-
     if (ForceMasks) {
         for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
             if (threadIdx.x < stride) {
@@ -128,15 +120,119 @@ __global__ void mask_matching_forward_kernel(
 
     if (ForceClass) {
         __syncthreads();
-        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) {
-                sh_softplus_cls[threadIdx.x] += sh_softplus_cls[threadIdx.x + stride];
+
+        const bool use_bce = (label_loss_type == 0) || (label_loss_type == 1);
+        const bool use_bce_focal = (label_loss_type == 1);
+        const bool use_ce = (label_loss_type == 2) || (label_loss_type == 3);
+        const bool has_alpha = label_focal_alpha >= 0.f;
+        const float alpha_clamped = has_alpha ? fminf(fmaxf(label_focal_alpha, 0.f), 1.f) : 1.f;
+        const float alpha_neg = has_alpha ? (1.f - alpha_clamped) : 1.f;
+
+        const int64_t base_cls = pred_index * C;
+        float sum_softplus = 0.0f;
+        float sum_mod_softplus = 0.0f;
+        float thread_max = -INFINITY;
+        for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
+            const float logit = cls_logits[base_cls + c];
+            if (use_bce) {
+                sum_softplus += softplusf(logit);
+            }
+            if (use_bce_focal) {
+                const float sig = 1.0f / (1.0f + expf(-logit));
+                sum_mod_softplus += powf(sig, label_focal_gamma) * softplusf(logit);
+            }
+            if (use_ce) {
+                thread_max = fmaxf(thread_max, logit);
+            }
+        }
+
+        float block_sum_softplus = 0.0f;
+        if (use_bce) {
+            sh_softplus_cls[threadIdx.x] = sum_softplus;
+            __syncthreads();
+            for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (threadIdx.x < stride) {
+                    sh_softplus_cls[threadIdx.x] += sh_softplus_cls[threadIdx.x + stride];
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) {
+                block_sum_softplus = sh_softplus_cls[0];
             }
             __syncthreads();
         }
+
+        float block_sum_mod_softplus = 0.0f;
+        if (use_bce_focal) {
+            sh_softplus_cls[threadIdx.x] = sum_mod_softplus;
+            __syncthreads();
+            for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (threadIdx.x < stride) {
+                    sh_softplus_cls[threadIdx.x] += sh_softplus_cls[threadIdx.x + stride];
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) {
+                block_sum_mod_softplus = sh_softplus_cls[0];
+            }
+            __syncthreads();
+        }
+
+        float block_logsumexp = 0.0f;
+        float z_bg = 0.0f;
+        if (use_ce) {
+            sh_softplus_cls[threadIdx.x] = thread_max;
+            __syncthreads();
+            for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (threadIdx.x < stride) {
+                    sh_softplus_cls[threadIdx.x] = fmaxf(
+                        sh_softplus_cls[threadIdx.x],
+                        sh_softplus_cls[threadIdx.x + stride]
+                    );
+                }
+                __syncthreads();
+            }
+            const float block_max = sh_softplus_cls[0];
+            __syncthreads();
+
+            float thread_sum = 0.0f;
+            for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
+                const float logit = cls_logits[base_cls + c];
+                thread_sum += expf(logit - block_max);
+            }
+            sh_softplus_cls[threadIdx.x] = thread_sum;
+            __syncthreads();
+            for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (threadIdx.x < stride) {
+                    sh_softplus_cls[threadIdx.x] += sh_softplus_cls[threadIdx.x + stride];
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) {
+                const float sum_exp = sh_softplus_cls[0];
+                block_logsumexp = logf(fmaxf(sum_exp, 1e-20f)) + block_max;
+                z_bg = cls_logits[base_cls + background_index];
+            }
+            __syncthreads();
+        }
+
         if (threadIdx.x == 0) {
-            const float inv_C = 1.0f / static_cast<float>(C);
-            const float cls_loss = cls_scale * (sh_softplus_cls[0] * inv_C);
+            float cls_loss = 0.0f;
+            if (label_loss_type == 0) {
+                const float inv_C = (C > 0) ? (1.0f / static_cast<float>(C)) : 0.0f;
+                cls_loss = cls_scale * (block_sum_softplus * inv_C);
+            } else if (label_loss_type == 1) {
+                const float inv_C = (C > 0) ? (1.0f / static_cast<float>(C)) : 0.0f;
+                cls_loss = cls_scale * (alpha_neg * block_sum_mod_softplus * inv_C);
+            } else if (label_loss_type == 2) {
+                cls_loss = cls_scale * (block_logsumexp - z_bg);
+            } else if (label_loss_type == 3) {
+                const float alpha = (label_focal_alpha >= 0.f) ? label_focal_alpha : 1.0f;
+                const float log_p = z_bg - block_logsumexp;
+                const float p = expf(log_p);
+                const float mod = powf(fmaxf(1.0f - p, 0.0f), label_focal_gamma);
+                cls_loss = cls_scale * (-alpha * mod * log_p);
+            }
             atomicAdd(layer_cls_sum + l, cls_loss);
         }
     }
@@ -157,7 +253,11 @@ std::vector<torch::Tensor> mask_matching_forward(
     const int64_t target_W,
     const double num_masks,
     const bool force_unmatched_masks,
-    const bool force_unmatched_class
+    const bool force_unmatched_class,
+    const int64_t background_index,
+    const int64_t label_loss_type,
+    const float label_focal_alpha,
+    const float label_focal_gamma
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
     TORCH_CHECK(separate_costs.is_cuda(), "separate_costs must be CUDA");
@@ -264,7 +364,11 @@ std::vector<torch::Tensor> mask_matching_forward(
             dice_scale_val,
             cls_scale_val,
             area_scale_val,
-            term_stride
+            term_stride,
+            background_index,
+            static_cast<int32_t>(label_loss_type),
+            label_focal_alpha,
+            label_focal_gamma
         );
     } else if (force_unmatched_masks) {
         shared_elems = 2;
@@ -288,7 +392,11 @@ std::vector<torch::Tensor> mask_matching_forward(
             dice_scale_val,
             cls_scale_val,
             area_scale_val,
-            term_stride
+            term_stride,
+            background_index,
+            static_cast<int32_t>(label_loss_type),
+            label_focal_alpha,
+            label_focal_gamma
         );
     } else if (force_unmatched_class) {
         shared_elems = 1;
@@ -312,7 +420,11 @@ std::vector<torch::Tensor> mask_matching_forward(
             dice_scale_val,
             cls_scale_val,
             area_scale_val,
-            term_stride
+            term_stride,
+            background_index,
+            static_cast<int32_t>(label_loss_type),
+            label_focal_alpha,
+            label_focal_gamma
         );
     } else {
         shared_elems = 0;
@@ -336,7 +448,11 @@ std::vector<torch::Tensor> mask_matching_forward(
             dice_scale_val,
             cls_scale_val,
             area_scale_val,
-            term_stride
+            term_stride,
+            background_index,
+            static_cast<int32_t>(label_loss_type),
+            label_focal_alpha,
+            label_focal_gamma
         );
     }
 

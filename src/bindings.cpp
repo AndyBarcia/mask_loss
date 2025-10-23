@@ -102,6 +102,9 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float dice_scale,
     const float cls_scale,
     int64_t background_index,
+    int64_t label_loss_type,
+    const float label_focal_alpha,
+    const float label_focal_gamma,
     const double num_masks,
     const bool force_unmatched_class_to_background,
     const bool force_unmatched_masks_to_empty

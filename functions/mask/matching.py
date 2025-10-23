@@ -208,6 +208,10 @@ class MaskMatchingFunction(Function):
         grad_layer_dice_mean = grad_layer_dice_mean.contiguous()
         grad_layer_cls_mean = grad_layer_cls_mean.contiguous()
 
+        label_loss_type = ctx.label_loss_type
+        label_focal_alpha = ctx.label_focal_alpha
+        label_focal_gamma = ctx.label_focal_gamma
+
         grad_mask_logits, grad_cls_logits = mask_loss.mask_matching_backward(
             grad_layer_mask_mean,
             grad_layer_dice_mean,
@@ -222,6 +226,9 @@ class MaskMatchingFunction(Function):
             dice_scale,
             cls_scale,
             background_index,
+            label_loss_type,
+            label_focal_alpha,
+            label_focal_gamma,
             num_masks,
             force_unmatched_cls,
             force_unmatched_masks,
@@ -574,12 +581,41 @@ def mask_matching_py(
             layer_dice_sum += (dice_loss * unmatched_mask).sum(dim=(1, 2))
 
         if force_unmatched_class_to_background and unmatched_dts > 0:
-            cls_bce = F.binary_cross_entropy_with_logits(
-                cls_logits,
-                torch.zeros_like(cls_logits),
-                reduction="none",
-            )
-            cls_loss = cls_bce.mean(dim=-1) * cls_scale
+            loss_type_val = int(label_loss_type)
+            if loss_type_val == PairwiseLabelLossType.BCE:
+                cls_loss = F.softplus(cls_logits).mean(dim=-1) * cls_scale
+            elif loss_type_val == PairwiseLabelLossType.BCE_FOCAL:
+                gamma = float(label_focal_gamma)
+                alpha = None if label_focal_alpha is None else max(0.0, min(float(label_focal_alpha), 1.0))
+                sig = torch.sigmoid(cls_logits)
+                softplus = F.softplus(cls_logits)
+                neg_term = (sig.pow(gamma) * softplus).sum(dim=-1)
+                alpha_neg = 1.0 if alpha is None else (1.0 - alpha)
+                cls_loss = (alpha_neg * neg_term / cls_logits.shape[-1]) * cls_scale
+            elif loss_type_val == PairwiseLabelLossType.CE:
+                if background_index is None or background_index < 0 or background_index >= cls_logits.shape[-1]:
+                    raise ValueError(
+                        "mask_matching_py: background_index must be within [0, C) when using cross entropy losses"
+                    )
+                logsumexp = torch.logsumexp(cls_logits, dim=-1)
+                z_bg = cls_logits[..., background_index]
+                cls_loss = (logsumexp - z_bg) * cls_scale
+            elif loss_type_val == PairwiseLabelLossType.CE_FOCAL:
+                if background_index is None or background_index < 0 or background_index >= cls_logits.shape[-1]:
+                    raise ValueError(
+                        "mask_matching_py: background_index must be within [0, C) when using cross entropy losses"
+                    )
+                gamma = float(label_focal_gamma)
+                alpha = 1.0 if label_focal_alpha is None else float(label_focal_alpha)
+                logsumexp = torch.logsumexp(cls_logits, dim=-1)
+                z_bg = cls_logits[..., background_index]
+                log_p = z_bg - logsumexp
+                p = log_p.exp()
+                focal = torch.pow(torch.clamp(1.0 - p, min=0.0), gamma)
+                cls_loss = (-alpha * focal * log_p) * cls_scale
+            else:
+                raise ValueError(f"Unsupported label loss type: {loss_type_val}")
+
             layer_cls_sum += (cls_loss * unmatched_mask).sum(dim=(1, 2))
 
     per_layer_matched = assigned.sum(dim=(1, 2)).to(layer_mask_sum.dtype)

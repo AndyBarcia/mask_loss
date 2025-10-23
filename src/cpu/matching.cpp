@@ -42,7 +42,11 @@ std::vector<torch::Tensor> mask_matching_forward(
     const int64_t target_W,
     const double num_masks,
     const bool force_unmatched_masks,
-    const bool force_unmatched_class
+    const bool force_unmatched_class,
+    const int64_t background_index,
+    const int64_t label_loss_type,
+    const float label_focal_alpha,
+    const float label_focal_gamma
 );
 
 enum class MatchingStrategy : int64_t {
@@ -684,6 +688,14 @@ std::vector<torch::Tensor> mask_matching(
     torch::Tensor pred_to_gt = pred_to_gt_cpu.to(device, /*non_blocking=*/false);
     torch::Tensor pred_round = pred_round_cpu.to(device, /*non_blocking=*/false);
 
+    const bool uses_ce_loss = (label_loss_type == 2 || label_loss_type == 3);
+    if (force_unmatched_class_to_background && uses_ce_loss) {
+        TORCH_CHECK(
+            background_index >= 0 && background_index < cls_logits.size(3),
+            "mask_matching: background_index must be within [0, C) when using cross entropy label losses"
+        );
+    }
+
     auto losses = mask_matching_forward(
         mask_logits,
         cls_logits,
@@ -697,7 +709,11 @@ std::vector<torch::Tensor> mask_matching(
         mask_targets.size(2),
         num_masks,
         force_unmatched_masks_to_empty,
-        force_unmatched_class_to_background
+        force_unmatched_class_to_background,
+        background_index,
+        label_loss_type,
+        label_focal_alpha,
+        label_focal_gamma
     );
 
     torch::Tensor layer_mask_mean = losses[0];
