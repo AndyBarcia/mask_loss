@@ -96,8 +96,8 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_d
 
 
 torch::Tensor pairwise_dice_loss_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& logits,   // (L,B,C,H,W), float
+    const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float smooth,
     int64_t background_index = -1,
     const float scale = 1.0f

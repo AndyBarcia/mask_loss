@@ -157,8 +157,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) dice_loss_backward_kerne
 }
 
 std::vector<torch::Tensor> dice_loss_forward(
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
+    const torch::Tensor& logits,   // (L,B,C,H,W), float
+    const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float smooth,
     const float num_masks,
     const float scale
@@ -222,12 +222,12 @@ std::vector<torch::Tensor> dice_loss_forward(
 }
 
 torch::Tensor dice_loss_backward(
-    const torch::Tensor& grad_out,
-    const torch::Tensor& logits,
-    const torch::Tensor& targets,
-    const torch::Tensor& total_intersection_sum,
-    const torch::Tensor& total_p_sum,
-    const torch::Tensor& total_t_sum,
+    const torch::Tensor& grad_out,               // (L,), float
+    const torch::Tensor& logits,                 // (L,B,C,H,W), float
+    const torch::Tensor& targets,                // (B,H_t,W_t), int64
+    const torch::Tensor& total_intersection_sum, // (L,B,C), float
+    const torch::Tensor& total_p_sum,            // (L,B,C), float
+    const torch::Tensor& total_t_sum,            // (L,B,C), float
     const float smooth,
     const float num_masks,
     const float scale
