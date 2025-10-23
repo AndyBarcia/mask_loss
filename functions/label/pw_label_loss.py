@@ -7,7 +7,7 @@ except ImportError:
     print("CUDA extension pos_mlp_bias not found. Please compile it first.")
     print("Run: pip3 install --no-build-isolation .")
 
-class PairwiseSigmoidCELossFunction(Function):
+class PairwiseLabelLossFunction(Function):
     @staticmethod
     def forward(ctx, logits, targets, background_index, scale):
         L, B, Q, C = logits.shape

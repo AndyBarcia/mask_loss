@@ -35,7 +35,8 @@ def get_extensions():
             "-D__CUDA_NO_HALF_OPERATORS__",
             "-D__CUDA_NO_HALF_CONVERSIONS__",
             "-D__CUDA_NO_HALF2_OPERATORS__",
-            "-O2",
+            "--use_fast_math",
+            "-O3",
             #"--generate-line-info" # For profiling.
         ]
     else:
