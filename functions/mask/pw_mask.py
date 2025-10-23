@@ -102,6 +102,8 @@ def pairwise_mask_loss_py(
         cls_logits,
         cls_targets,
         background_index=background_index,
-        scale=cls_scale
+        scale=cls_scale,
+        focal_gamma=focal_gamma,
+        focal_alpha=focal_alpha,
     ) # (L,B,C,GT_out)
     return torch.stack([sigmoid_cost, dice_cost, cls_cost], dim=0)  # (3,L,B,C,GT_out)

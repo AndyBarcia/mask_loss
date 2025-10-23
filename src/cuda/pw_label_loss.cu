@@ -25,7 +25,9 @@ reduce_pairwise_label_kernel(
     const int32_t B,
     const int32_t Q,
     const int32_t L,
-    const float scale
+    const float scale,
+    const float gamma,
+    const float alpha
 ) {
     constexpr int NUM_WARPS = REDUCTION_THREADS_PER_BLOCK / 32;
     __shared__ float s_warp[NUM_WARPS];
@@ -37,6 +39,9 @@ reduce_pairwise_label_kernel(
 
     // Reduce across C to get sum_neg(l,b,q)
     float thread_sum = 0.f;
+    const float alpha_pos = (alpha >= 0.0f) ? alpha : 1.0f;
+    const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
+    const bool use_gamma = (gamma > 0.0f);
 
     // Stride across C by blockDim.x; template C is compile-time for efficient looping
     for (int c = tid; c < C; c += REDUCTION_THREADS_PER_BLOCK) {
@@ -44,29 +49,32 @@ reduce_pairwise_label_kernel(
         const float maxL  = z > 0.f ? z : 0.f;
         const float absL  = fabsf(z);
         const float logex = log1pf(__expf(-absL));
-        thread_sum += (maxL + logex);
+        const float ce_neg = logex + maxL;
+        const float sigma  = 1.0f / (1.0f + __expf(-z));
+        const float mod_neg = use_gamma ? powf(sigma, gamma) : 1.0f;
+        thread_sum += alpha_neg * mod_neg * ce_neg;
     }
 
     // Warp reduce to a single value per block
-    float sum_neg = thread_sum;
+    float base_sum = thread_sum;
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        sum_neg += __shfl_down_sync(0xffffffff, sum_neg, off);
+        base_sum += __shfl_down_sync(0xffffffff, base_sum, off);
     }
-    if ((tid & 31) == 0) s_warp[tid >> 5] = sum_neg;
+    if ((tid & 31) == 0) s_warp[tid >> 5] = base_sum;
     __syncthreads();
     for (int s = NUM_WARPS >> 1; s > 0; s >>= 1) {
         if (tid < s) s_warp[tid] += s_warp[tid + s];
         __syncthreads();
     }
-    sum_neg = (tid == 0) ? s_warp[0] : 0.f;
+    base_sum = (tid == 0) ? s_warp[0] : 0.f;
     // Broadcast to all threads in warp 0 (for symmetry; only tid==0 will write outputs)
-    sum_neg = __shfl_sync(0xffffffff, sum_neg, 0);
+    base_sum = __shfl_sync(0xffffffff, base_sum, 0);
 
     // For each output GT slot, write loss or +inf for padding ---
     // We only need one writer (tid==0) since (l,b,q,*) are independent
     if (tid == 0) {
-        const float invC = 1.f / static_cast<float>(C);
+        const float invC = (C > 0) ? (1.f / static_cast<float>(C)) : 0.f;
 
         for (int out_gt_idx = 0; out_gt_idx < GT_out; ++out_gt_idx) {
             const int gt_actual = MAP_OUT_TO_ACTUAL(out_gt_idx, background_index);
@@ -79,8 +87,19 @@ reduce_pairwise_label_kernel(
             }
 
             const int y = static_cast<int>(y64);
-            const float z_pos = logits[(((l * B + b) * Q + qid) * C) + y];
-            float v = (sum_neg - z_pos) * invC;
+            const float z_val = logits[(((l * B + b) * Q + qid) * C) + y];
+            const float absL  = fabsf(z_val);
+            const float maxL  = z_val > 0.f ? z_val : 0.f;
+            const float maxNeg = (-z_val) > 0.f ? -z_val : 0.f;
+            const float logex = log1pf(__expf(-absL));
+            const float ce_neg = logex + maxL;
+            const float ce_pos = logex + maxNeg;
+            const float sigma  = 1.0f / (1.0f + __expf(-z_val));
+            const float one_minus = 1.0f - sigma;
+            const float mod_neg = use_gamma ? powf(sigma, gamma) : 1.0f;
+            const float mod_pos = use_gamma ? powf(one_minus, gamma) : 1.0f;
+            const float delta = alpha_pos * mod_pos * ce_pos - alpha_neg * mod_neg * ce_neg;
+            const float v = (base_sum + delta) * invC;
             out[(((l * B + b) * Q + qid) * GT_out) + out_gt_idx] = v * scale;
         }
     }
@@ -90,13 +109,18 @@ torch::Tensor pairwise_label_loss_forward(
     const torch::Tensor& logits,   // (L,B,Q,C), float
     const torch::Tensor& targets,  // (B,GT), int64 with -1 padding
     int64_t background_index = -1, // drop column targets[:, background_index]
-    const float scale = 1.0f
+    const float scale = 1.0f,
+    const float gamma = 0.0f,
+    const float alpha = -1.0f
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
 
     TORCH_CHECK(logits.dim() == 4, "pairwise_label_loss_forward: logits must be (L,B,Q,C)");
     TORCH_CHECK(targets.dim() == 2, "pairwise_label_loss_forward: targets must be (B,GT)");
+    TORCH_CHECK(gamma >= 0.0f, "pairwise_label_loss_forward: focal_gamma must be non-negative");
+    TORCH_CHECK(alpha < 0.0f || (alpha >= 0.0f && alpha <= 1.0f),
+                "pairwise_label_loss_forward: focal_alpha must be in [0,1] or negative to disable");
 
     const int L  = static_cast<int>(logits.size(0));
     const int B  = static_cast<int>(logits.size(1));
@@ -141,7 +165,9 @@ torch::Tensor pairwise_label_loss_forward(
                 static_cast<int32_t>(B),
                 static_cast<int32_t>(Q),
                 static_cast<int32_t>(L),
-                scale
+                scale,
+                gamma,
+                alpha
             );
     };
 

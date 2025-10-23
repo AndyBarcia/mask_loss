@@ -22,7 +22,9 @@ reduce_pairwise_label_kernel(
     const int32_t B,
     const int32_t Q,
     const int32_t L,
-    const float scale
+    const float scale,
+    const float gamma,
+    const float alpha
 );
 
 // This kernel fuses the pairwise sigmoid cross-entropy (BCE) and Dice reductions.
@@ -386,7 +388,9 @@ torch::Tensor pairwise_mask_loss_forward(
                     B,
                     Q,
                     L,
-                    cls_scale
+                    cls_scale,
+                    gamma,
+                    alpha
                 );
         };
         const auto supported_dims = std::make_tuple(

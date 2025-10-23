@@ -113,7 +113,9 @@ torch::Tensor pairwise_label_loss_forward(
     const torch::Tensor& logits,   // (L,B,Q,C), float
     const torch::Tensor& targets,  // (B,GT_total), int64 with -1 padding
     int64_t background_index = -1,
-    const float scale = 1.0f
+    const float scale = 1.0f,
+    const float gamma = 0.0f,
+    const float alpha = -1.0f
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
