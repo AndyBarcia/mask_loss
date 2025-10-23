@@ -460,12 +460,31 @@ std::vector<torch::Tensor> mask_matching_forward(
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+    auto matches = pred_to_gt_contig.ge(0);                        // (L,B,Q), bool
+    auto matches_f = matches.to(layer_mask_sum.dtype());           // (L,B,Q)
+    torch::Tensor per_layer_matched = matches_f.sum({1, 2});       // (L,)
+
+    if (uses_ce_loss) {
+        layer_cls_sum.zero_();
+
+        if (GT_out > 0) {
+            bool any_matches = matches.any().item<bool>();
+            if (any_matches) {
+                auto cls_costs = separate_costs_contig.select(0, 2); // (L,B,Q,GT_out)
+                auto gather_idx = pred_to_gt_contig.clamp_min(0).unsqueeze(-1); // (L,B,Q,1)
+                auto gathered = cls_costs.gather(-1, gather_idx).squeeze(-1);    // (L,B,Q)
+                auto matched_cls = (gathered * matches_f).sum({1, 2});           // (L,)
+                layer_cls_sum.add_(matched_cls);
+            }
+        }
+    }
+
     if (force_unmatched_class && uses_ce_loss) {
         TORCH_CHECK(cls_contig.defined(), "cls_logits must be provided when supervising unmatched classification");
-        auto unmatched_mask = pred_to_gt_contig.lt(0);           // (L,B,Q)
-        auto unmatched_mask_f = unmatched_mask.to(layer_cls_sum.options().dtype());
-        auto logsumexp = cls_contig.logsumexp(-1);               // (L,B,Q)
-        auto z_bg = cls_contig.select(-1, background_index);     // (L,B,Q)
+        auto unmatched_mask = matches.logical_not();                                    // (L,B,Q)
+        auto unmatched_mask_f = unmatched_mask.to(layer_cls_sum.options().dtype());     // (L,B,Q)
+        auto logsumexp = cls_contig.logsumexp(-1);                                      // (L,B,Q)
+        auto z_bg = cls_contig.select(-1, background_index);                            // (L,B,Q)
 
         torch::Tensor loss;
         if (label_loss_type == 2) {
@@ -482,9 +501,6 @@ std::vector<torch::Tensor> mask_matching_forward(
         layer_cls_sum.add_(unmatched_cls);
     }
 
-    auto matches = pred_to_gt_contig.ge(0);
-    auto matches_f = matches.to(layer_mask_sum.dtype());
-    torch::Tensor per_layer_matched = matches_f.sum({1, 2});
     torch::Tensor per_layer_total = torch::full({L}, static_cast<float>(B * Q), layer_mask_sum.options());
 
     const bool has_num_masks = num_masks > 0.0;
