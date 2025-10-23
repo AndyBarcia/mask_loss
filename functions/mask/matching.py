@@ -598,8 +598,8 @@ def mask_matching_sampling_py(
         background_index,
     )
     sigmoid_cost = costs[0]
-    dice_cost = costs[2]
-    cls_cost = costs[3]
+    dice_cost = costs[1]
+    cls_cost = costs[2]
     costs = costs.sum(dim=0)  # (L,B,C,GT_out)
 
     # Output gt_to_pred (L,B,GT_out), default -1 for invalid/ignored GTs
