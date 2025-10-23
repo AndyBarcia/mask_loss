@@ -534,9 +534,19 @@ def mask_matching_py(
     assigned = pred_to_gt.ge(0) # (L,B,Q)
     matched_dts = int(assigned.sum().item()) # local matched detections
 
-    layer_mask_sum = torch.zeros(L, device=mask_logits.device, dtype=mask_logits.dtype)
-    layer_dice_sum = torch.zeros(L, device=mask_logits.device, dtype=mask_logits.dtype)
-    layer_cls_sum = torch.zeros(L, device=mask_logits.device, dtype=mask_logits.dtype)
+    acc_dtype = (
+        torch.float32
+        if mask_logits.dtype in (torch.float16, torch.bfloat16)
+        else mask_logits.dtype
+    )
+    smooth_val = float(smooth)
+    sigmoid_scale_val = 1.0 if sigmoid_scale is None else float(sigmoid_scale)
+    dice_scale_val = 1.0 if dice_scale is None else float(dice_scale)
+    cls_scale_val = 1.0 if cls_scale is None else float(cls_scale)
+
+    layer_mask_sum = torch.zeros(L, device=mask_logits.device, dtype=acc_dtype)  # (L,), float
+    layer_dice_sum = torch.zeros(L, device=mask_logits.device, dtype=acc_dtype)  # (L,), float
+    layer_cls_sum = torch.zeros(L, device=mask_logits.device, dtype=acc_dtype)   # (L,), float
 
     if matched_dts > 0:
         idx = assigned.nonzero(as_tuple=False) # (N,3): [l,b,q]
@@ -545,9 +555,9 @@ def mask_matching_py(
         p_idx = idx[:, 2]
         g_idx = pred_to_gt[assigned].to(torch.long) # (N,)
 
-        sig_vals  = sigmoid_cost[l_idx, b_idx, p_idx, g_idx]
-        dice_vals = dice_cost[l_idx, b_idx, p_idx, g_idx]
-        cls_vals = cls_cost[l_idx, b_idx, p_idx, g_idx]
+        sig_vals  = sigmoid_cost[l_idx, b_idx, p_idx, g_idx].to(acc_dtype)
+        dice_vals = dice_cost[l_idx, b_idx, p_idx, g_idx].to(acc_dtype)
+        cls_vals = cls_cost[l_idx, b_idx, p_idx, g_idx].to(acc_dtype)
 
         layer_mask_sum.index_add_(0, l_idx, sig_vals)
         layer_dice_sum.index_add_(0, l_idx, dice_vals)
@@ -557,69 +567,71 @@ def mask_matching_py(
     unmatched_dts = total_queries - matched_dts
 
     if (force_unmatched_masks_to_empty or force_unmatched_class_to_background) and total_queries > 0:
-        assigned_pred = torch.zeros((L, B, C), device=mask_logits.device, dtype=torch.bool)
+        assigned_pred = torch.zeros((L, B, C), device=mask_logits.device, dtype=torch.bool)  # (L,B,Q), bool
         if matched_dts > 0:
             assigned_pred[l_idx, b_idx, p_idx] = True
-        unmatched_mask = (~assigned_pred).to(mask_logits.dtype)
+        unmatched_mask = (~assigned_pred).to(acc_dtype)  # (L,B,Q), float
 
         if force_unmatched_masks_to_empty and unmatched_dts > 0:
+            mask_logits_f = mask_logits.to(acc_dtype)  # (L,B,Q,H,W), float
             bce = F.binary_cross_entropy_with_logits(
-                mask_logits,
-                torch.zeros_like(mask_logits),
+                mask_logits_f,
+                torch.zeros_like(mask_logits_f),
                 reduction="none",
-            )
-            mask_loss_per = bce.mean(dim=(-1, -2)) * sigmoid_scale
+            )  # (L,B,Q,H,W), float
+            mask_loss_per = bce.mean(dim=(-1, -2)) * sigmoid_scale_val  # (L,B,Q), float
             layer_mask_sum += (mask_loss_per * unmatched_mask).sum(dim=(1, 2))
 
-            probs = mask_logits.sigmoid()
+            probs = mask_logits_f.sigmoid()  # (L,B,Q,H,W), float
             H_t, W_t = mask_targets.shape[1:]
             scale_h = H_t // H
             scale_w = W_t // W
             area_scale = float(scale_h * scale_w)
             p_sum_up = probs.sum(dim=(-1, -2)) * area_scale
-            dice_loss = dice_scale * (p_sum_up / (p_sum_up + smooth))
+            dice_loss = dice_scale_val * (p_sum_up / (p_sum_up + smooth_val))
             layer_dice_sum += (dice_loss * unmatched_mask).sum(dim=(1, 2))
 
         if force_unmatched_class_to_background and unmatched_dts > 0:
             loss_type_val = int(label_loss_type)
+            cls_logits_acc = cls_logits.to(acc_dtype)  # (L,B,Q,C), float
             if loss_type_val == PairwiseLabelLossType.BCE:
-                cls_loss = F.softplus(cls_logits).mean(dim=-1) * cls_scale
+                cls_loss = F.softplus(cls_logits_acc).mean(dim=-1) * cls_scale_val
             elif loss_type_val == PairwiseLabelLossType.BCE_FOCAL:
                 gamma = float(label_focal_gamma)
                 alpha = None if label_focal_alpha is None else max(0.0, min(float(label_focal_alpha), 1.0))
-                sig = torch.sigmoid(cls_logits)
-                softplus = F.softplus(cls_logits)
+                sig = torch.sigmoid(cls_logits_acc)
+                softplus = F.softplus(cls_logits_acc)
                 neg_term = (sig.pow(gamma) * softplus).sum(dim=-1)
                 alpha_neg = 1.0 if alpha is None else (1.0 - alpha)
-                cls_loss = (alpha_neg * neg_term / cls_logits.shape[-1]) * cls_scale
+                cls_loss = (alpha_neg * neg_term / cls_logits.shape[-1]) * cls_scale_val
             else:
                 raise ValueError(f"Unsupported label loss type: {loss_type_val}")
 
             layer_cls_sum += (cls_loss * unmatched_mask).sum(dim=(1, 2))
 
-    per_layer_matched = assigned.sum(dim=(1, 2)).to(layer_mask_sum.dtype)
-    queries_per_layer = layer_mask_sum.new_full((L,), float(B * C))
+    per_layer_matched = assigned.sum(dim=(1, 2)).to(acc_dtype)  # (L,), float
+    queries_per_layer = torch.full((L,), float(B * C), device=mask_logits.device, dtype=acc_dtype)  # (L,), float
 
     if force_unmatched_masks_to_empty:
         mask_denom = queries_per_layer
     elif num_masks is not None and num_masks > 0:
-        mask_denom = layer_mask_sum.new_full((L,), float(num_masks))
+        mask_denom = torch.full((L,), float(num_masks), device=mask_logits.device, dtype=acc_dtype)
     else:
         mask_denom = per_layer_matched
 
     if force_unmatched_class_to_background:
         cls_denom = queries_per_layer
     elif num_masks is not None and num_masks > 0:
-        cls_denom = layer_mask_sum.new_full((L,), float(num_masks))
+        cls_denom = torch.full((L,), float(num_masks), device=mask_logits.device, dtype=acc_dtype)
     else:
         cls_denom = per_layer_matched
 
     mask_denom = torch.clamp(mask_denom, min=1.0)
     cls_denom = torch.clamp(cls_denom, min=1.0)
 
-    layer_mask_mean = layer_mask_sum / mask_denom  # (L,)
-    layer_dice_mean = layer_dice_sum / mask_denom  # (L,)
-    layer_cls_mean = layer_cls_sum / cls_denom     # (L,)
+    layer_mask_mean = (layer_mask_sum / mask_denom).to(mask_logits.dtype)  # (L,)
+    layer_dice_mean = (layer_dice_sum / mask_denom).to(mask_logits.dtype)  # (L,)
+    layer_cls_mean = (layer_cls_sum / cls_denom).to(mask_logits.dtype)     # (L,)
 
     return pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean
 
