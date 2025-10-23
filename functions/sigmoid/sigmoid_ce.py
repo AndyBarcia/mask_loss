@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch.autograd import Function
@@ -68,15 +70,26 @@ class SigmoidCELossFunction(Function):
         return grad_weights, None, None, None, None, None
 
 
-def sigmoid_cross_entropy_loss_inefficient_py(logits, targets, num_masks=None, scale=1.0):
+def sigmoid_cross_entropy_loss_inefficient_py(
+    logits,
+    targets,
+    num_masks=None,
+    scale=1.0,
+    focal_gamma: float = 0.0,
+    focal_alpha: Optional[float] = None,
+):
     """Naive BCE-with-logits computed by explicitly upsampling the logits.
 
     Args:
         logits: Tensor of shape (L, B, C, h, w)
         targets: Tensor of shape (B, H_t, W_t) with integer labels in [0, C-1]
-    
+        focal_gamma: exponent for focal modulation. Set to 0 for vanilla BCE.
+        focal_alpha: optional positive-class prior in [0, 1]; if None defaults to
+            standard BCE weighting.
+
     Returns:
-        Tensor of shape (L,) containing the mean BCE loss for each level
+        Tensor of shape (L,) containing the mean (possibly focal) BCE loss for
+        each level
     """
 
     L, B, C, h, w = logits.shape
@@ -88,6 +101,18 @@ def sigmoid_cross_entropy_loss_inefficient_py(logits, targets, num_masks=None, s
     if num_masks is None:
         num_masks = float(L * B * C)
 
+    if focal_gamma < 0.0:
+        raise ValueError("focal_gamma must be non-negative")
+
+    if focal_alpha is None:
+        alpha_pos = logits.new_tensor(1.0)
+        alpha_neg = logits.new_tensor(1.0)
+    else:
+        if not (0.0 <= focal_alpha <= 1.0):
+            raise ValueError("focal_alpha must be in [0, 1]")
+        alpha_pos = logits.new_tensor(float(focal_alpha))
+        alpha_neg = logits.new_tensor(1.0 - float(focal_alpha))
+
     logits_up = F.interpolate(
         logits.reshape(L * B, C, h, w), size=(H_t, W_t), mode="nearest"
     ).reshape(L, B, C, H_t, W_t)
@@ -98,24 +123,47 @@ def sigmoid_cross_entropy_loss_inefficient_py(logits, targets, num_masks=None, s
         dtype=logits.dtype
     )
 
-    L_up = logits_up
-    y = onehot.unsqueeze(0)
-    maxL = torch.clamp(L_up, min=0.0)
-    logexp = torch.log1p(torch.exp(-torch.abs(L_up)))
-    bce_elem = maxL - L_up * y + logexp
+    L_up = logits_up  # (L, B, C, H_t, W_t), float
+    y = onehot.unsqueeze(0)  # (1, B, C, H_t, W_t), float in {0,1}
 
-    return bce_elem.sum(dim=(1, 2, 3, 4)) / (num_masks * H_t * W_t) * scale
+    ce_pos = F.softplus(-L_up)
+    ce_neg = F.softplus(L_up)
+    probs = torch.sigmoid(L_up)
+
+    if focal_gamma == 0.0:
+        mod_pos = torch.ones_like(probs)
+        mod_neg = mod_pos
+    else:
+        mod_pos = (1.0 - probs).pow(focal_gamma)
+        mod_neg = probs.pow(focal_gamma)
+
+    loss_pos = alpha_pos * y * mod_pos * ce_pos
+    loss_neg = alpha_neg * (1.0 - y) * mod_neg * ce_neg
+    loss = loss_pos + loss_neg
+
+    return loss.sum(dim=(1, 2, 3, 4)) / (num_masks * H_t * W_t) * scale
 
 
-def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None, scale=1.0):
+def sigmoid_cross_entropy_loss_py(
+    logits,
+    targets,
+    num_masks=None,
+    scale=1.0,
+    focal_gamma: float = 0.0,
+    focal_alpha: Optional[float] = None,
+):
     """Efficient count-based BCE-with-logits for non-mutually-exclusive classes.
 
     Args:
         logits: Tensor of shape (L, B, C, h, w)
         targets: Tensor of shape (B, H_t, W_t) with integer labels in [0, C-1]
+        focal_gamma: exponent for focal modulation. Set to 0 for vanilla BCE.
+        focal_alpha: optional positive-class prior in [0, 1]; if None defaults to
+            standard BCE weighting.
 
     Returns:
-        Tensor of shape (L,) representing the mean BCE-with-logits for each level
+        Tensor of shape (L,) representing the mean (possibly focal) BCE-with-logits
+        for each level
     """
 
     L, B, C, h, w = logits.shape
@@ -135,6 +183,18 @@ def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None, scale=1.0):
     if num_masks is None:
         num_masks = float(B * C)
 
+    if focal_gamma < 0.0:
+        raise ValueError("focal_gamma must be non-negative")
+
+    if focal_alpha is None:
+        alpha_pos = logits.new_tensor(1.0)
+        alpha_neg = logits.new_tensor(1.0)
+    else:
+        if not (0.0 <= focal_alpha <= 1.0):
+            raise ValueError("focal_alpha must be in [0, 1]")
+        alpha_pos = logits.new_tensor(float(focal_alpha))
+        alpha_neg = logits.new_tensor(1.0 - float(focal_alpha))
+
     device = logits.device
     targets_long = targets.long().to(device)
     onehot = F.one_hot(targets_long, num_classes=C).permute(0, 3, 1, 2).to(
@@ -144,13 +204,27 @@ def sigmoid_cross_entropy_loss_py(logits, targets, num_masks=None, scale=1.0):
     Bc = onehot.reshape(B * C, 1, H_t, W_t)
     unf = F.unfold(Bc, kernel_size=(s, s), stride=(s, s))
     unf = unf.reshape(B, C, s * s, h * w)
-    n_k = unf.sum(dim=2)  # (B, C, h*w)
+    pos_counts = unf.sum(dim=2)  # (B, C, h*w)
+    neg_counts = N2 - pos_counts  # (B, C, h*w)
 
-    L_flat = logits.reshape(L, B, C, h * w)
-    maxL = torch.clamp(L_flat, min=0.0)
-    logexp = torch.log1p(torch.exp(-torch.abs(L_flat)))
+    L_flat = logits.reshape(L, B, C, h * w)  # (L,B,C,h*w), float
+    pos_counts = pos_counts.to(dtype)
+    neg_counts = neg_counts.to(dtype)
 
-    loss_block = N2 * maxL - L_flat * n_k.unsqueeze(0) + N2 * logexp
+    ce_pos = F.softplus(-L_flat)
+    ce_neg = F.softplus(L_flat)
+    probs = torch.sigmoid(L_flat)
+
+    if focal_gamma == 0.0:
+        mod_pos = torch.ones_like(probs)
+        mod_neg = mod_pos
+    else:
+        mod_pos = (1.0 - probs).pow(focal_gamma)
+        mod_neg = probs.pow(focal_gamma)
+
+    loss_pos = alpha_pos * mod_pos * ce_pos * pos_counts.unsqueeze(0)
+    loss_neg = alpha_neg * mod_neg * ce_neg * neg_counts.unsqueeze(0)
+    loss_block = loss_pos + loss_neg
 
     return loss_block.sum(dim=(1, 2, 3)) / (num_masks * H_t * W_t) * scale
 
@@ -163,15 +237,21 @@ def sigmoid_cross_entropy_loss_sampling_py(
     oversample_ratio=3,
     importance_sample_ratio=0.75,
     scale=1.0,
+    focal_gamma: float = 0.0,
+    focal_alpha: Optional[float] = None,
 ):
     """Point-sampled BCE-with-logits performed per (level, image, class).
 
     Args:
         logits: Tensor of shape (L, B, C, h, w)
         targets: Tensor of shape (B, H_t, W_t) with integer labels in [0, C-1]
+        focal_gamma: exponent for focal modulation. Set to 0 for vanilla BCE.
+        focal_alpha: optional positive-class prior in [0, 1]; if None defaults to
+            standard BCE weighting.
 
     Returns:
-        Tensor of shape (L,) containing the sampled BCE loss for each level
+        Tensor of shape (L,) containing the sampled (possibly focal) BCE loss for
+        each level
     """
 
     L, B, C, h, w = logits.shape
@@ -181,6 +261,18 @@ def sigmoid_cross_entropy_loss_sampling_py(
 
     if num_masks is None:
         num_masks = float(B * C)
+
+    if focal_gamma < 0.0:
+        raise ValueError("focal_gamma must be non-negative")
+
+    if focal_alpha is None:
+        alpha_pos = logits.new_tensor(1.0)
+        alpha_neg = logits.new_tensor(1.0)
+    else:
+        if not (0.0 <= focal_alpha <= 1.0):
+            raise ValueError("focal_alpha must be in [0, 1]")
+        alpha_pos = logits.new_tensor(float(focal_alpha))
+        alpha_neg = logits.new_tensor(1.0 - float(focal_alpha))
 
     device = logits.device
     dtype = logits.dtype
@@ -210,9 +302,20 @@ def sigmoid_cross_entropy_loss_sampling_py(
         sampled_labels = sampled_labels.squeeze(-1)
     sampled_labels = sampled_labels.squeeze(1)  # (L*B*C, P)
 
-    per_point_loss = F.binary_cross_entropy_with_logits(
-        sampled_logits, sampled_labels, reduction="none"
-    )
+    ce_pos = F.softplus(-sampled_logits)
+    ce_neg = F.softplus(sampled_logits)
+    probs = torch.sigmoid(sampled_logits)
+
+    if focal_gamma == 0.0:
+        mod_pos = torch.ones_like(probs)
+        mod_neg = mod_pos
+    else:
+        mod_pos = (1.0 - probs).pow(focal_gamma)
+        mod_neg = probs.pow(focal_gamma)
+
+    loss_pos = alpha_pos * sampled_labels * mod_pos * ce_pos
+    loss_neg = alpha_neg * (1.0 - sampled_labels) * mod_neg * ce_neg
+    per_point_loss = loss_pos + loss_neg
 
     P = sampled_logits.shape[-1]
     per_class_loss = per_point_loss.sum(dim=1).reshape(L, B, C)
