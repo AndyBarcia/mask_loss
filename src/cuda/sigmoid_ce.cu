@@ -17,7 +17,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     double* __restrict__ total_loss_sum,
     const int B,
     const int L,
-    const float scale
+    const float scale,
+    const float gamma,
+    const float alpha
 ) {
     // Each CUDA block processes one (l, b, i, j) low-res block
     // Grid: dim.x = W (low-res width), dim.y = H (low-res height), dim.z = L * B (level * batch)
@@ -34,6 +36,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     int tid = threadIdx.x;
     const int s = H_t / H; // Stride
     const int s2 = s * s;
+
+    const float alpha_pos = (alpha >= 0.0f) ? alpha : 1.0f;
+    const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
 
     // Initialize shared counts to zero
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
@@ -68,15 +73,25 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_fo
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
         // logits layout: (L, B, C, H, W)
         float L_val = logits[((((l * B + b) * C + ci) * H + i) * W + j)];
-        float n = (float) sh_counts[ci];
-        float N2 = (float)s2;
+        float pos_count = static_cast<float>(sh_counts[ci]);
+        float N2 = static_cast<float>(s2);
+        float neg_count = N2 - pos_count;
 
-        // Stable BCE-with-logits sum over the block:
-        // loss_block = N2*max(L,0) - L*n + N2*log1p(exp(-|L|))
         float maxL = L_val > 0.0f ? L_val : 0.0f;
         float absL = fabsf(L_val);
+        float maxNegL = (-L_val) > 0.0f ? -L_val : 0.0f;
         float logexp = log1pf(expf(-absL));
-        thread_loss_sum += static_cast<double>(N2 * maxL - L_val * n + N2 * logexp);
+        float ce_pos = logexp + maxNegL;
+        float ce_neg = logexp + maxL;
+
+        float p = 1.0f / (1.0f + expf(-L_val));
+        float one_minus_p = 1.0f - p;
+        float mod_pos = (gamma > 0.0f) ? powf(one_minus_p, gamma) : 1.0f;
+        float mod_neg = (gamma > 0.0f) ? powf(p, gamma) : 1.0f;
+
+        float loss_pos = alpha_pos * mod_pos * ce_pos * pos_count;
+        float loss_neg = alpha_neg * mod_neg * ce_neg * neg_count;
+        thread_loss_sum += static_cast<double>(loss_pos + loss_neg);
     }
 
     // Store each thread's accumulated loss into shared memory
@@ -106,7 +121,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     float* __restrict__ grad_logits,
     const int B,
     const int L,
-    const float scale
+    const float scale,
+    const float gamma,
+    const float alpha
 ) {
     // Grid: dim.x = W (low-res x), dim.y = H (low-res y), dim.z = L * B
     int j = blockIdx.x;
@@ -123,6 +140,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
     // Partition shared memory for counts and for caching logits
     __shared__ int sh_counts[C];
     __shared__ float sh_logits[C];
+
+    const float alpha_pos = (alpha >= 0.0f) ? alpha : 1.0f;
+    const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
 
     // Initialize shared counts to zero
     for (int ci = tid; ci < C; ci += THREADS_PER_BLOCK) {
@@ -160,15 +180,26 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) sigmoid_cross_entropy_ba
         float L = sh_logits[ci]; // Fast read from shared memory
         int32_t n = sh_counts[ci];
         const float N2 = (float) s2;
+        float pos_count = static_cast<float>(n);
+        float neg_count = N2 - pos_count;
 
-        // Use a faster, mathematically equivalent implementation of the sigmoid function
         float sigma = 1.0f / (1.0f + expf(-L));
+        float one_minus_p = 1.0f - sigma;
 
-        // Derivative: dLoss/dL = N2 * sigma - n
-        float g = N2 * sigma - (float)n;
-        
-        // Apply scaling. The write to global memory is still uncoalesced,
-        // but modern GPU caches can help mitigate the performance impact.
+        float absL = fabsf(L);
+        float maxL = L > 0.0f ? L : 0.0f;
+        float maxNegL = (-L) > 0.0f ? -L : 0.0f;
+        float logexp = log1pf(expf(-absL));
+        float ce_pos = logexp + maxNegL;
+        float ce_neg = logexp + maxL;
+
+        float mod_pos = (gamma > 0.0f) ? powf(one_minus_p, gamma) : 1.0f;
+        float mod_neg = (gamma > 0.0f) ? powf(sigma, gamma) : 1.0f;
+
+        float grad_pos = -alpha_pos * pos_count * mod_pos * (gamma * sigma * ce_pos + one_minus_p);
+        float grad_neg = alpha_neg * neg_count * mod_neg * (gamma * one_minus_p * ce_neg + sigma);
+        float g = grad_pos + grad_neg;
+
         grad_logits[idx_base + ci * H * W] = g * grad_out_levels[l] * scale;
     }
 }
@@ -177,11 +208,12 @@ torch::Tensor sigmoid_cross_entropy_forward(
     const torch::Tensor& logits,   // (L,B,C,H,W), float
     const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float num_masks,
-    const float scale
+    const float scale,
+    const float gamma,
+    const float alpha
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
-
     const int L = logits.size(0);
     const int B = logits.size(1);
     const int C = logits.size(2);
@@ -189,6 +221,10 @@ torch::Tensor sigmoid_cross_entropy_forward(
     const int W = logits.size(4);
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
+
+    if (alpha >= 0.0f) {
+        TORCH_CHECK(alpha <= 1.0f, "alpha must be in [0, 1]");
+    }
 
     const int64_t total_elements = (int64_t) L * B * C * H_t * W_t;
     if (total_elements == 0) {
@@ -207,7 +243,9 @@ torch::Tensor sigmoid_cross_entropy_forward(
             total_loss_sum_tensor.data_ptr<double>(),
             B,
             L,
-            scale
+            scale,
+            gamma,
+            alpha
         );
     };
 
@@ -234,13 +272,14 @@ torch::Tensor sigmoid_cross_entropy_backward(
     const torch::Tensor& logits,   // (L,B,C,H,W), float
     const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float num_masks,
-    const float scale
+    const float scale,
+    const float gamma,
+    const float alpha
 ) {
-    
+
     CHECK_INPUT(grad_out);
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
-
     const int L = logits.size(0);
     const int B = logits.size(1);
     const int C = logits.size(2);
@@ -249,12 +288,16 @@ torch::Tensor sigmoid_cross_entropy_backward(
     const int H_t = targets.size(1);
     const int W_t = targets.size(2);
 
+    if (alpha >= 0.0f) {
+        TORCH_CHECK(alpha <= 1.0f, "alpha must be in [0, 1]");
+    }
+
     auto grad_logits = torch::empty_like(logits);
     const int64_t total_elements = (int64_t) L * B * C * H * W;
     if (total_elements == 0) return grad_logits;
 
     auto grad_out_levels = (grad_out.contiguous() / (num_masks * H_t * W_t)).to(torch::kFloat32);
-    
+
     dim3 grid(W, H, L * B);
 
     auto static_launcher = [&](auto... Dims) {
@@ -265,7 +308,9 @@ torch::Tensor sigmoid_cross_entropy_backward(
             grad_logits.data_ptr<float>(),
             B,
             L,
-            scale
+            scale,
+            gamma,
+            alpha
         );
     };
     

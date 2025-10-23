@@ -19,7 +19,7 @@ except ImportError:
 
 class SigmoidCELossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, num_masks, scale):
+    def forward(ctx, logits, targets, num_masks, scale, focal_gamma=None, focal_alpha=None):
         L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
@@ -28,11 +28,28 @@ class SigmoidCELossFunction(Function):
             num_masks = float(L * B * C)
         ctx.num_masks = num_masks
         ctx.scale = 1.0 if scale is None else float(scale)
+        ctx.focal_gamma = 0.0 if focal_gamma is None else float(focal_gamma)
+        if ctx.focal_gamma < 0.0:
+            raise ValueError("focal_gamma must be non-negative")
+
+        if focal_alpha is None:
+            ctx.focal_alpha = -1.0
+        else:
+            ctx.focal_alpha = float(focal_alpha)
+            if not (0.0 <= ctx.focal_alpha <= 1.0):
+                raise ValueError("focal_alpha must be in [0, 1]")
 
         logits = logits.contiguous().float()
         targets = targets.contiguous()
         ctx.save_for_backward(logits, targets)
-        output = mask_loss.forward_sigmoid_ce_loss(logits, targets, num_masks, ctx.scale)
+        output = mask_loss.forward_sigmoid_ce_loss(
+            logits,
+            targets,
+            num_masks,
+            ctx.scale,
+            ctx.focal_gamma,
+            ctx.focal_alpha,
+        )
         return output
 
     @staticmethod
@@ -40,9 +57,15 @@ class SigmoidCELossFunction(Function):
         logits, targets = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_weights = mask_loss.backward_sigmoid_ce_loss(
-            grad_output, logits, targets, ctx.num_masks, ctx.scale
+            grad_output,
+            logits,
+            targets,
+            ctx.num_masks,
+            ctx.scale,
+            ctx.focal_gamma,
+            ctx.focal_alpha,
         )
-        return grad_weights, None, None, None
+        return grad_weights, None, None, None, None, None
 
 
 def sigmoid_cross_entropy_loss_inefficient_py(logits, targets, num_masks=None, scale=1.0):
