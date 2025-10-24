@@ -38,8 +38,8 @@ __global__ void mask_matching_backward_kernel(
     const float area_scale,
     const float* __restrict__ inv_denom,
     const int64_t background_index,
-    const float gamma,
-    const float alpha
+    const float mask_gamma,
+    const float mask_alpha
 ) {
     const int64_t q = blockIdx.x;
     const int64_t b = blockIdx.y;
@@ -91,9 +91,9 @@ __global__ void mask_matching_backward_kernel(
     float local_target_sum = 0.0f;
     float local_inter_sum = 0.0f;
 
-    const bool use_gamma = gamma > 0.0f;
-    const float alpha_pos = (alpha >= 0.0f) ? alpha : 1.0f;
-    const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
+    const bool use_gamma = mask_gamma > 0.0f;
+    const float alpha_pos = (mask_alpha >= 0.0f) ? mask_alpha : 1.0f;
+    const float alpha_neg = (mask_alpha >= 0.0f) ? (1.0f - mask_alpha) : 1.0f;
 
     for (int64_t idx = threadIdx.x; idx < HW; idx += blockDim.x) {
         const int64_t h = idx / W;
@@ -148,8 +148,8 @@ __global__ void mask_matching_backward_kernel(
         const float logexp = log1pf(expf(-abs_logit));
         const float ce_neg = logexp + max_logit;
         const float ce_pos = logexp + max_neg_logit;
-        const float mod_neg = use_gamma ? powf(prob, gamma) : 1.0f;
-        const float mod_pos = use_gamma ? powf(one_minus, gamma) : 1.0f;
+        const float mod_neg = use_gamma ? powf(prob, mask_gamma) : 1.0f;
+        const float mod_pos = use_gamma ? powf(one_minus, mask_gamma) : 1.0f;
 
         float target = 0.0f;
         if (is_matched) {
@@ -160,8 +160,8 @@ __global__ void mask_matching_backward_kernel(
         if (neg_count < 0.0f) {
             neg_count = 0.0f;
         }
-        const float grad_pos = -alpha_pos * target * mod_pos * (gamma * prob * ce_pos + one_minus);
-        const float grad_neg = alpha_neg * neg_count * mod_neg * (gamma * one_minus * ce_neg + prob);
+        const float grad_pos = -alpha_pos * target * mod_pos * (mask_gamma * prob * ce_pos + one_minus);
+        const float grad_neg = alpha_neg * neg_count * mod_neg * (mask_gamma * one_minus * ce_neg + prob);
         const float grad_sigmoid = (grad_pos + grad_neg) * sigmoid_factor;
 
         const float d_inter = prob_prime * target;
@@ -187,8 +187,8 @@ __global__ void cls_matching_backward_kernel(
     const int64_t GT_total,
     const float* __restrict__ coeff_base,
     const int64_t background_index,
-    const float gamma,
-    const float alpha,
+    const float cls_gamma,
+    const float cls_alpha,
     const bool force_unmatched_class_to_background,
     const bool has_void_class,
     const int64_t void_class_index
@@ -220,9 +220,9 @@ __global__ void cls_matching_backward_kernel(
         y = static_cast<int>(y64);
     }
 
-    const bool use_gamma = gamma > 0.0f;
-    const float alpha_pos = (alpha >= 0.0f) ? alpha : 1.0f;
-    const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
+    const bool use_gamma = cls_gamma > 0.0f;
+    const float alpha_pos = (cls_alpha >= 0.0f) ? cls_alpha : 1.0f;
+    const float alpha_neg = (cls_alpha >= 0.0f) ? (1.0f - cls_alpha) : 1.0f;
 
     for (int c = threadIdx.x; c < C; c += blockDim.x) {
         const float z = cls_logits[base + c];
@@ -234,29 +234,29 @@ __global__ void cls_matching_backward_kernel(
         const float logexp = log1pf(__expf(-abs_z));
         const float ce_pos = logexp + max_neg_z;
         const float ce_neg = logexp + max_z;
-        const float mod_pos = use_gamma ? powf(one_minus, gamma) : 1.0f;
-        const float mod_neg = use_gamma ? powf(p, gamma) : 1.0f;
+        const float mod_pos = use_gamma ? powf(one_minus, cls_gamma) : 1.0f;
+        const float mod_neg = use_gamma ? powf(p, cls_gamma) : 1.0f;
 
         const bool is_void = has_void_class && (c == void_class_index);
         float grad = 0.0f;
         if (is_matched) {
             if (c == y) {
-                grad = -alpha_pos * mod_pos * (gamma * p * ce_pos + one_minus);
+                grad = -alpha_pos * mod_pos * (cls_gamma * p * ce_pos + one_minus);
                 grad_cls_logits[base + c] = base_coeff * inv_C * grad;
             } else {
-                grad = alpha_neg * mod_neg * (gamma * one_minus * ce_neg + p);
+                grad = alpha_neg * mod_neg * (cls_gamma * one_minus * ce_neg + p);
                 grad_cls_logits[base + c] = base_coeff * inv_C * grad;
             }
         } else {
             if (force_unmatched_class_to_background) {
                 if (is_void) {
-                    grad = -alpha_pos * mod_pos * (gamma * p * ce_pos + one_minus);
+                    grad = -alpha_pos * mod_pos * (cls_gamma * p * ce_pos + one_minus);
                 } else {
-                    grad = alpha_neg * mod_neg * (gamma * one_minus * ce_neg + p);
+                    grad = alpha_neg * mod_neg * (cls_gamma * one_minus * ce_neg + p);
                 }
                 grad_cls_logits[base + c] = base_coeff * inv_C * grad;
             } else if (is_void) {
-                grad = -alpha_pos * mod_pos * (gamma * p * ce_pos + one_minus);
+                grad = -alpha_pos * mod_pos * (cls_gamma * p * ce_pos + one_minus);
                 grad_cls_logits[base + c] = base_coeff * grad;
             } else {
                 grad_cls_logits[base + c] = 0.0f;
@@ -282,8 +282,10 @@ std::vector<torch::Tensor> mask_matching_backward(
     const double num_masks,
     const bool force_unmatched_class_to_background,
     const bool force_unmatched_masks_to_empty,
-    const float gamma,
-    const float alpha,
+    const float mask_gamma,
+    const float mask_alpha,
+    const float cls_gamma,
+    const float cls_alpha,
     int64_t void_class_index
 ) {
     // Backward pipeline:
@@ -299,9 +301,12 @@ std::vector<torch::Tensor> mask_matching_backward(
     CHECK_INPUT(cls_targets);
     CHECK_INPUT(pred_to_gt);
 
-    TORCH_CHECK(gamma >= 0.0f, "mask_matching_backward: focal_gamma must be non-negative");
-    TORCH_CHECK(alpha < 0.0f || (alpha >= 0.0f && alpha <= 1.0f),
-        "mask_matching_backward: focal_alpha must be in [0,1] or negative to disable");
+    TORCH_CHECK(mask_gamma >= 0.0f, "mask_matching_backward: mask focal_gamma must be non-negative");
+    TORCH_CHECK(mask_alpha < 0.0f || (mask_alpha >= 0.0f && mask_alpha <= 1.0f),
+        "mask_matching_backward: mask focal_alpha must be in [0,1] or negative to disable");
+    TORCH_CHECK(cls_gamma >= 0.0f, "mask_matching_backward: cls focal_gamma must be non-negative");
+    TORCH_CHECK(cls_alpha < 0.0f || (cls_alpha >= 0.0f && cls_alpha <= 1.0f),
+        "mask_matching_backward: cls focal_alpha must be in [0,1] or negative to disable");
 
     const auto device = mask_logits.device();
     TORCH_CHECK(mask_targets.device() == device, "mask_targets must be on the same device as mask_logits");
@@ -453,8 +458,8 @@ std::vector<torch::Tensor> mask_matching_backward(
                 area_scale,
                 inv_mask_denom.data_ptr<float>(),
                 background_index,
-                gamma,
-                alpha
+                mask_gamma,
+                mask_alpha
             );
             CHECK_CUDA_ERROR(cudaGetLastError());
         }
@@ -474,8 +479,8 @@ std::vector<torch::Tensor> mask_matching_backward(
                 GT_total,
                 cls_coeff.data_ptr<float>(),
                 background_index,
-                gamma,
-                alpha,
+                cls_gamma,
+                cls_alpha,
                 force_unmatched_class_to_background,
                 has_void_class,
                 void_index

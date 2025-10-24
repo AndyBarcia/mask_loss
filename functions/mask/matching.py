@@ -48,8 +48,10 @@ class MaskMatchingFunction(Function):
         force_unmatched_masks_to_empty,
         K,
         assignment_strategy,
-        focal_gamma,
-        focal_alpha,
+        mask_focal_gamma,
+        mask_focal_alpha,
+        cls_focal_gamma,
+        cls_focal_alpha,
         void_class_index=None,
     ):
         """Run the forward pass of the matching op.
@@ -135,14 +137,26 @@ class MaskMatchingFunction(Function):
         if K_val < 0:
             raise ValueError("K must be non-negative")
 
-        focal_gamma_val = 0.0 if focal_gamma is None else float(focal_gamma)
-        if focal_gamma_val < 0.0:
+        mask_focal_gamma_val = 0.0 if mask_focal_gamma is None else float(mask_focal_gamma)
+        if mask_focal_gamma_val < 0.0:
             raise ValueError("focal_gamma must be non-negative")
-        if focal_alpha is None:
-            focal_alpha_val = -1.0
+        if mask_focal_alpha is None:
+            mask_focal_alpha_val = -1.0
         else:
-            focal_alpha_val = float(focal_alpha)
-            if not (0.0 <= focal_alpha_val <= 1.0):
+            mask_focal_alpha_val = float(mask_focal_alpha)
+            if not (0.0 <= mask_focal_alpha_val <= 1.0):
+                raise ValueError("focal_alpha must be in [0, 1]")
+        if cls_focal_gamma is None:
+            cls_focal_gamma_val = mask_focal_gamma_val
+        else:
+            cls_focal_gamma_val = float(cls_focal_gamma)
+            if cls_focal_gamma_val < 0.0:
+                raise ValueError("focal_gamma must be non-negative")
+        if cls_focal_alpha is None:
+            cls_focal_alpha_val = mask_focal_alpha_val
+        else:
+            cls_focal_alpha_val = float(cls_focal_alpha)
+            if not (0.0 <= cls_focal_alpha_val <= 1.0):
                 raise ValueError("focal_alpha must be in [0, 1]")
 
         num_cls_channels = cls_logits.shape[-1]
@@ -172,8 +186,10 @@ class MaskMatchingFunction(Function):
             force_unmatched_masks,
             K_val,
             strategy_map[assignment_strategy],
-            focal_gamma_val,
-            focal_alpha_val,
+            mask_focal_gamma_val,
+            mask_focal_alpha_val,
+            cls_focal_gamma_val,
+            cls_focal_alpha_val,
             void_index_val,
         )
 
@@ -193,8 +209,10 @@ class MaskMatchingFunction(Function):
         ctx.num_masks = num_masks_val
         ctx.force_unmatched_cls = force_unmatched_cls
         ctx.force_unmatched_masks = force_unmatched_masks
-        ctx.focal_gamma = focal_gamma_val
-        ctx.focal_alpha = focal_alpha_val
+        ctx.mask_focal_gamma = mask_focal_gamma_val
+        ctx.mask_focal_alpha = mask_focal_alpha_val
+        ctx.cls_focal_gamma = cls_focal_gamma_val
+        ctx.cls_focal_alpha = cls_focal_alpha_val
         ctx.void_class_index = void_index_val
 
         return pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean
@@ -217,8 +235,10 @@ class MaskMatchingFunction(Function):
         num_masks = ctx.num_masks
         force_unmatched_cls = ctx.force_unmatched_cls
         force_unmatched_masks = ctx.force_unmatched_masks
-        focal_gamma = ctx.focal_gamma
-        focal_alpha = ctx.focal_alpha
+        mask_focal_gamma = ctx.mask_focal_gamma
+        mask_focal_alpha = ctx.mask_focal_alpha
+        cls_focal_gamma = ctx.cls_focal_gamma
+        cls_focal_alpha = ctx.cls_focal_alpha
 
         grad_layer_mask_mean = grad_layer_mask_mean.contiguous()
         grad_layer_dice_mean = grad_layer_dice_mean.contiguous()
@@ -241,8 +261,10 @@ class MaskMatchingFunction(Function):
             num_masks,
             force_unmatched_cls,
             force_unmatched_masks,
-            focal_gamma,
-            focal_alpha,
+            mask_focal_gamma,
+            mask_focal_alpha,
+            cls_focal_gamma,
+            cls_focal_alpha,
             ctx.void_class_index,
         )
 
@@ -250,6 +272,8 @@ class MaskMatchingFunction(Function):
             grad_mask_logits,
             None,
             grad_cls_logits,
+            None,
+            None,
             None,
             None,
             None,
@@ -283,8 +307,10 @@ def mask_matching_py(
     force_unmatched_masks_to_empty=False,
     K=1,
     assignment_strategy="global",
-    focal_gamma: float = 0.0,
-    focal_alpha: Optional[float] = None,
+    mask_focal_gamma: float = 0.0,
+    mask_focal_alpha: Optional[float] = None,
+    cls_focal_gamma: Optional[float] = None,
+    cls_focal_alpha: Optional[float] = None,
     void_class_index: Optional[int] = None,
 ):
     """Reference Python implementation of :func:`mask_matching`.
@@ -310,9 +336,13 @@ def mask_matching_py(
             predictions towards empty masks.
         K (int): Maximum number of detections per ground truth.
         assignment_strategy (str): Strategy identifier (see below).
-        focal_gamma (float): Focal loss exponent applied to BCE terms.
-        focal_alpha (Optional[float]): Positive-class prior in ``[0, 1]``. Use
-            ``None`` to disable class re-weighting.
+        mask_focal_gamma (float): Focal exponent for mask BCE terms.
+        mask_focal_alpha (Optional[float]): Positive-class prior for mask BCE
+            in ``[0, 1]``. Use ``None`` to disable re-weighting.
+        cls_focal_gamma (Optional[float]): Optional focal exponent for
+            classification BCE. ``None`` reuses ``mask_focal_gamma``.
+        cls_focal_alpha (Optional[float]): Optional positive-class prior for
+            classification BCE. ``None`` reuses ``mask_focal_alpha``.
         void_class_index (Optional[int]): Index of the "void" class in
             ``cls_logits``. If set, unmatched detections are trained to predict
             the void class regardless of ``force_unmatched_class_to_background``.
@@ -328,20 +358,43 @@ def mask_matching_py(
     if K_val < 0:
         raise ValueError("K must be non-negative")
 
-    focal_gamma_val = 0.0 if focal_gamma is None else float(focal_gamma)
-    if focal_gamma_val < 0.0:
+    mask_focal_gamma_val = 0.0 if mask_focal_gamma is None else float(mask_focal_gamma)
+    if mask_focal_gamma_val < 0.0:
         raise ValueError("focal_gamma must be non-negative")
-    if focal_alpha is None:
-        focal_alpha_val: Optional[float] = None
-        alpha_neg = 1.0
-        alpha_pos = 1.0
+    if mask_focal_alpha is None:
+        mask_focal_alpha_val: Optional[float] = None
+        mask_alpha_neg = 1.0
+        mask_alpha_pos = 1.0
     else:
-        focal_alpha_val = float(focal_alpha)
-        if not (0.0 <= focal_alpha_val <= 1.0):
+        mask_focal_alpha_val = float(mask_focal_alpha)
+        if not (0.0 <= mask_focal_alpha_val <= 1.0):
             raise ValueError("focal_alpha must be in [0, 1]")
-        alpha_neg = 1.0 - focal_alpha_val
-        alpha_pos = focal_alpha_val
-    use_gamma = focal_gamma_val != 0.0
+        mask_alpha_neg = 1.0 - mask_focal_alpha_val
+        mask_alpha_pos = mask_focal_alpha_val
+    mask_use_gamma = mask_focal_gamma_val != 0.0
+
+    if cls_focal_gamma is None:
+        cls_focal_gamma_val = mask_focal_gamma_val
+    else:
+        cls_focal_gamma_val = float(cls_focal_gamma)
+        if cls_focal_gamma_val < 0.0:
+            raise ValueError("focal_gamma must be non-negative")
+    cls_use_gamma = cls_focal_gamma_val != 0.0
+
+    if cls_focal_alpha is None:
+        cls_focal_alpha_val = mask_focal_alpha_val
+        if cls_focal_alpha_val is None:
+            cls_alpha_neg = 1.0
+            cls_alpha_pos = 1.0
+        else:
+            cls_alpha_neg = 1.0 - cls_focal_alpha_val
+            cls_alpha_pos = cls_focal_alpha_val
+    else:
+        cls_focal_alpha_val = float(cls_focal_alpha)
+        if not (0.0 <= cls_focal_alpha_val <= 1.0):
+            raise ValueError("focal_alpha must be in [0, 1]")
+        cls_alpha_neg = 1.0 - cls_focal_alpha_val
+        cls_alpha_pos = cls_focal_alpha_val
 
     num_cls_channels = cls_logits.shape[-1]
     void_idx: Optional[int]
@@ -375,8 +428,10 @@ def mask_matching_py(
         dice_scale,
         cls_scale,
         background_index,
-        focal_gamma=focal_gamma_val,
-        focal_alpha=focal_alpha_val,
+        mask_focal_gamma=mask_focal_gamma_val,
+        mask_focal_alpha=mask_focal_alpha_val,
+        cls_focal_gamma=cls_focal_gamma_val,
+        cls_focal_alpha=cls_focal_alpha_val,
     )
     sigmoid_cost = costs[0]
     dice_cost = costs[1]
@@ -605,13 +660,13 @@ def mask_matching_py(
             logits = mask_logits
             probs = logits.sigmoid()
             ce_neg = F.softplus(logits)
-            if use_gamma:
-                mod_neg = probs.pow(focal_gamma_val)
+            if mask_use_gamma:
+                mod_neg = probs.pow(mask_focal_gamma_val)
             else:
                 mod_neg = 1.0
             neg_term = ce_neg * mod_neg
-            if focal_alpha_val is not None:
-                neg_term = neg_term * alpha_neg
+            if mask_focal_alpha_val is not None:
+                neg_term = neg_term * mask_alpha_neg
             mask_loss_per = neg_term.mean(dim=(-1, -2)) * sigmoid_scale
             layer_mask_sum += (mask_loss_per * unmatched_mask).sum(dim=(1, 2))
 
@@ -629,17 +684,17 @@ def mask_matching_py(
             probs = logits.sigmoid()
             ce_neg = F.softplus(logits)
             ce_pos = F.softplus(-logits)
-            if use_gamma:
-                mod_neg = probs.pow(focal_gamma_val)
-                mod_pos = (1.0 - probs).pow(focal_gamma_val)
+            if cls_use_gamma:
+                mod_neg = probs.pow(cls_focal_gamma_val)
+                mod_pos = (1.0 - probs).pow(cls_focal_gamma_val)
             else:
                 mod_neg = 1.0
                 mod_pos = 1.0
             neg_term = ce_neg * mod_neg
             pos_term = ce_pos * mod_pos
-            if focal_alpha_val is not None:
-                neg_term = neg_term * alpha_neg
-                pos_term = pos_term * alpha_pos
+            if cls_focal_alpha_val is not None:
+                neg_term = neg_term * cls_alpha_neg
+                pos_term = pos_term * cls_alpha_pos
 
             cls_loss = None
             if force_unmatched_class_to_background:

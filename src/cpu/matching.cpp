@@ -595,8 +595,10 @@ std::vector<torch::Tensor> mask_matching(
     bool    force_unmatched_masks_to_empty      = false,
     int64_t topk_matches    = 1,
     int64_t strategy_id     = 0,
-    float   gamma           = 0.0f,
-    float   alpha           = -1.0f,
+    float   mask_gamma      = 0.0f,
+    float   mask_alpha      = -1.0f,
+    float   cls_gamma       = 0.0f,
+    float   cls_alpha       = -1.0f,
     int64_t void_class_index = -1
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
@@ -604,9 +606,12 @@ std::vector<torch::Tensor> mask_matching(
 
     TORCH_CHECK(topk_matches >= 0, "K must be non-negative");
     TORCH_CHECK(strategy_id >= 0 && strategy_id <= 3, "Invalid matching strategy id");
-    TORCH_CHECK(gamma >= 0.0f, "mask_matching: focal_gamma must be non-negative");
-    TORCH_CHECK(alpha < 0.0f || (alpha >= 0.0f && alpha <= 1.0f),
-        "mask_matching: focal_alpha must be in [0,1] or negative to disable");
+    TORCH_CHECK(mask_gamma >= 0.0f, "mask_matching: mask focal_gamma must be non-negative");
+    TORCH_CHECK(mask_alpha < 0.0f || (mask_alpha >= 0.0f && mask_alpha <= 1.0f),
+        "mask_matching: mask focal_alpha must be in [0,1] or negative to disable");
+    TORCH_CHECK(cls_gamma >= 0.0f, "mask_matching: cls focal_gamma must be non-negative");
+    TORCH_CHECK(cls_alpha < 0.0f || (cls_alpha >= 0.0f && cls_alpha <= 1.0f),
+        "mask_matching: cls focal_alpha must be in [0,1] or negative to disable");
     MatchingStrategy strategy = static_cast<MatchingStrategy>(strategy_id);
 
     // Get the mask, dice and cls pairwise costs, shape (3, L, B, C, GT_out)
@@ -620,8 +625,10 @@ std::vector<torch::Tensor> mask_matching(
         dice_scale,
         cls_scale,
         background_index,
-        gamma,
-        alpha
+        mask_gamma,
+        mask_alpha,
+        cls_gamma,
+        cls_alpha
     );
     TORCH_CHECK(
         separate_costs.dim() == 5 && separate_costs.size(0) == 3,
@@ -697,8 +704,10 @@ std::vector<torch::Tensor> mask_matching(
         sigmoid_scale,
         dice_scale,
         cls_scale,
-        gamma,
-        alpha,
+        mask_gamma,
+        mask_alpha,
+        cls_gamma,
+        cls_alpha,
         mask_targets.size(1),
         mask_targets.size(2),
         num_masks,

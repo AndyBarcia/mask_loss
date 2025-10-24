@@ -40,8 +40,10 @@ __global__ void mask_matching_forward_kernel(
     const float cls_scale,
     const float area_scale,
     const int64_t term_stride,
-    const float gamma,
-    const float alpha,
+    const float mask_gamma,
+    const float mask_alpha,
+    const float cls_gamma,
+    const float cls_alpha,
     const bool force_unmatched_class_to_background,
     const bool has_void_class,
     const int64_t void_class_index
@@ -99,9 +101,12 @@ __global__ void mask_matching_forward_kernel(
         }
     }
 
-    const bool use_gamma = gamma > 0.0f;
-    const float alpha_pos = (alpha >= 0.0f) ? alpha : 1.0f;
-    const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
+    const bool use_mask_gamma = mask_gamma > 0.0f;
+    const float mask_alpha_pos = (mask_alpha >= 0.0f) ? mask_alpha : 1.0f;
+    const float mask_alpha_neg = (mask_alpha >= 0.0f) ? (1.0f - mask_alpha) : 1.0f;
+    const bool use_cls_gamma = cls_gamma > 0.0f;
+    const float cls_alpha_pos = (cls_alpha >= 0.0f) ? cls_alpha : 1.0f;
+    const float cls_alpha_neg = (cls_alpha >= 0.0f) ? (1.0f - cls_alpha) : 1.0f;
 
     if (process_masks) {
         const int64_t HW = H * W;
@@ -115,8 +120,8 @@ __global__ void mask_matching_forward_kernel(
             const float max_logit = fmaxf(logit, 0.0f);
             const float logexp = log1pf(expf(-abs_logit));
             const float ce_neg = logexp + max_logit;
-            const float mod_neg = use_gamma ? powf(prob, gamma) : 1.0f;
-            sum_bce += alpha_neg * mod_neg * ce_neg;
+            const float mod_neg = use_mask_gamma ? powf(prob, mask_gamma) : 1.0f;
+            sum_bce += mask_alpha_neg * mod_neg * ce_neg;
             sum_sigmoid += prob;
         }
         sh_bce_mask[threadIdx.x] = sum_bce;
@@ -135,23 +140,23 @@ __global__ void mask_matching_forward_kernel(
             const float max_logit = fmaxf(logit, 0.0f);
             const float logexp = log1pf(expf(-abs_logit));
             const float ce_neg = logexp + max_logit;
-            const float mod_neg = use_gamma ? powf(prob, gamma) : 1.0f;
-            const float neg_term = alpha_neg * mod_neg * ce_neg;
+            const float mod_neg = use_cls_gamma ? powf(prob, cls_gamma) : 1.0f;
+            const float neg_term = cls_alpha_neg * mod_neg * ce_neg;
             const bool is_void = has_void_class && (c == void_class_index);
             if (force_unmatched_class_to_background) {
                 sum_neg += neg_term;
                 if (is_void) {
                     const float one_minus = 1.0f - prob;
                     const float ce_pos = logexp + fmaxf(-logit, 0.0f);
-                    const float mod_pos = use_gamma ? powf(one_minus, gamma) : 1.0f;
-                    void_pos = alpha_pos * mod_pos * ce_pos;
+                    const float mod_pos = use_cls_gamma ? powf(one_minus, cls_gamma) : 1.0f;
+                    void_pos = cls_alpha_pos * mod_pos * ce_pos;
                     void_neg = neg_term;
                 }
             } else if (is_void) {
                 const float one_minus = 1.0f - prob;
                 const float ce_pos = logexp + fmaxf(-logit, 0.0f);
-                const float mod_pos = use_gamma ? powf(one_minus, gamma) : 1.0f;
-                void_pos = alpha_pos * mod_pos * ce_pos;
+                const float mod_pos = use_cls_gamma ? powf(one_minus, cls_gamma) : 1.0f;
+                void_pos = cls_alpha_pos * mod_pos * ce_pos;
             }
         }
         if (sh_bce_cls) {
@@ -225,8 +230,10 @@ std::vector<torch::Tensor> mask_matching_forward(
     const float sigmoid_scale,
     const float dice_scale,
     const float cls_scale,
-    const float gamma,
-    const float alpha,
+    const float mask_gamma,
+    const float mask_alpha,
+    const float cls_gamma,
+    const float cls_alpha,
     const int64_t target_H,
     const int64_t target_W,
     const double num_masks,
@@ -331,9 +338,12 @@ std::vector<torch::Tensor> mask_matching_forward(
 
     const int64_t term_stride = L * B * Q * GT_out;
 
-    TORCH_CHECK(gamma >= 0.0f, "focal_gamma must be non-negative");
-    TORCH_CHECK(alpha < 0.0f || (alpha >= 0.0f && alpha <= 1.0f),
-        "focal_alpha must be in [0, 1] or negative to disable");
+    TORCH_CHECK(mask_gamma >= 0.0f, "mask focal_gamma must be non-negative");
+    TORCH_CHECK(mask_alpha < 0.0f || (mask_alpha >= 0.0f && mask_alpha <= 1.0f),
+        "mask focal_alpha must be in [0, 1] or negative to disable");
+    TORCH_CHECK(cls_gamma >= 0.0f, "cls focal_gamma must be non-negative");
+    TORCH_CHECK(cls_alpha < 0.0f || (cls_alpha >= 0.0f && cls_alpha <= 1.0f),
+        "cls focal_alpha must be in [0, 1] or negative to disable");
 
     const size_t mask_shared_bytes = static_cast<size_t>(mask_shared) * threads * sizeof(float);
     const size_t class_shared_bytes = static_cast<size_t>(class_shared) * threads * sizeof(float);
@@ -361,8 +371,10 @@ std::vector<torch::Tensor> mask_matching_forward(
             cls_scale_val,
             area_scale_val,
             term_stride,
-            gamma,
-            alpha,
+            mask_gamma,
+            mask_alpha,
+            cls_gamma,
+            cls_alpha,
             force_unmatched_class,
             has_void_class,
             void_index
@@ -389,8 +401,10 @@ std::vector<torch::Tensor> mask_matching_forward(
             cls_scale_val,
             area_scale_val,
             term_stride,
-            gamma,
-            alpha,
+            mask_gamma,
+            mask_alpha,
+            cls_gamma,
+            cls_alpha,
             false,
             false,
             -1
@@ -417,8 +431,10 @@ std::vector<torch::Tensor> mask_matching_forward(
             cls_scale_val,
             area_scale_val,
             term_stride,
-            gamma,
-            alpha,
+            mask_gamma,
+            mask_alpha,
+            cls_gamma,
+            cls_alpha,
             force_unmatched_class,
             has_void_class,
             void_index
@@ -445,8 +461,10 @@ std::vector<torch::Tensor> mask_matching_forward(
             cls_scale_val,
             area_scale_val,
             term_stride,
-            gamma,
-            alpha,
+            mask_gamma,
+            mask_alpha,
+            cls_gamma,
+            cls_alpha,
             false,
             false,
             -1

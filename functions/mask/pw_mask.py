@@ -30,8 +30,10 @@ class PairwiseMaskLossFunction(Function):
         dice_scale,
         cls_scale,
         background_index,
-        focal_gamma=None,
-        focal_alpha=None,
+        mask_focal_gamma=None,
+        mask_focal_alpha=None,
+        cls_focal_gamma=None,
+        cls_focal_alpha=None,
     ):
         L, B, C, h, w = mask_logits.shape
         B_t, H_t, W_t = mask_targets.shape
@@ -41,14 +43,26 @@ class PairwiseMaskLossFunction(Function):
         mask_targets = mask_targets.contiguous()
         cls_logits = cls_logits.contiguous().float()
         cls_targets = cls_targets.contiguous()
-        fg = 0.0 if focal_gamma is None else float(focal_gamma)
-        if fg < 0.0:
+        mask_fg = 0.0 if mask_focal_gamma is None else float(mask_focal_gamma)
+        if mask_fg < 0.0:
             raise ValueError("focal_gamma must be non-negative")
-        if focal_alpha is None:
-            fa = -1.0
+        if mask_focal_alpha is None:
+            mask_fa = -1.0
         else:
-            fa = float(focal_alpha)
-            if not (0.0 <= fa <= 1.0):
+            mask_fa = float(mask_focal_alpha)
+            if not (0.0 <= mask_fa <= 1.0):
+                raise ValueError("focal_alpha must be in [0, 1]")
+        if cls_focal_gamma is None:
+            cls_fg = mask_fg
+        else:
+            cls_fg = float(cls_focal_gamma)
+            if cls_fg < 0.0:
+                raise ValueError("focal_gamma must be non-negative")
+        if cls_focal_alpha is None:
+            cls_fa = mask_fa
+        else:
+            cls_fa = float(cls_focal_alpha)
+            if not (0.0 <= cls_fa <= 1.0):
                 raise ValueError("focal_alpha must be in [0, 1]")
         output = mask_loss.pairwise_mask_loss_forward(
             mask_logits,
@@ -60,14 +74,16 @@ class PairwiseMaskLossFunction(Function):
             dice_scale if dice_scale is not None else 1.0,
             cls_scale if cls_scale is not None else 1.0,
             background_index if background_index is not None else -1,
-            fg,
-            fa,
+            mask_fg,
+            mask_fa,
+            cls_fg,
+            cls_fa,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return (None,) * 11
+        return (None,) * 13
 
 
 def pairwise_mask_loss_py(
@@ -80,20 +96,30 @@ def pairwise_mask_loss_py(
     dice_scale      = 1.0,
     cls_scale       = 1.0,
     background_index= -1,
-    focal_gamma: float = 0.0,
-    focal_alpha: Optional[float] = None,
+    mask_focal_gamma: float = 0.0,
+    mask_focal_alpha: Optional[float] = None,
+    cls_focal_gamma: Optional[float] = None,
+    cls_focal_alpha: Optional[float] = None,
 ):
+    if cls_focal_gamma is None:
+        cls_fg = mask_focal_gamma
+    else:
+        cls_fg = cls_focal_gamma
+    if cls_focal_alpha is None:
+        cls_fa = mask_focal_alpha
+    else:
+        cls_fa = cls_focal_alpha
     sigmoid_cost = pairwise_sigmoid_cross_entropy_loss_py(
         mask_logits,
         mask_targets,
         background_index,
         sigmoid_scale,
-        focal_gamma,
-        focal_alpha,
+        mask_focal_gamma,
+        mask_focal_alpha,
     )  # (L,B,C,GT_out)
     dice_cost = pairwise_dice_loss_py(
-        mask_logits, 
-        mask_targets, 
+        mask_logits,
+        mask_targets,
         smooth,
         background_index,
         dice_scale
@@ -103,7 +129,7 @@ def pairwise_mask_loss_py(
         cls_targets,
         background_index=background_index,
         scale=cls_scale,
-        focal_gamma=focal_gamma,
-        focal_alpha=focal_alpha,
+        focal_gamma=cls_fg,
+        focal_alpha=cls_fa,
     ) # (L,B,C,GT_out)
     return torch.stack([sigmoid_cost, dice_cost, cls_cost], dim=0)  # (3,L,B,C,GT_out)

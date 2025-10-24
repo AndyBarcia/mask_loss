@@ -66,8 +66,10 @@ torch::Tensor pairwise_mask_loss_forward(
     const float dice_scale = 1.0,
     const float cls_scale = 1.0f,
     int64_t background_index = -1,
-    const float gamma = 0.0f,
-    const float alpha = -1.0f
+    const float mask_gamma = 0.0f,
+    const float mask_alpha = -1.0f,
+    const float cls_gamma = 0.0f,
+    const float cls_alpha = -1.0f
 );
 
 // Hybrid mask matcher front-end.  Returns ``{pred_to_gt, pred_round,
@@ -88,8 +90,10 @@ std::vector<torch::Tensor> mask_matching(
     bool    force_unmatched_masks_to_empty      = false,
     int64_t topk_matches    = 1,
     int64_t strategy_id     = 0,
-    float   gamma           = 0.0f,
-    float   alpha           = -1.0f,
+    float   mask_gamma      = 0.0f,
+    float   mask_alpha      = -1.0f,
+    float   cls_gamma       = 0.0f,
+    float   cls_alpha       = -1.0f,
     int64_t void_class_index = -1
 );
 
@@ -110,8 +114,10 @@ std::vector<torch::Tensor> mask_matching_backward(
     const double num_masks,
     const bool force_unmatched_class_to_background,
     const bool force_unmatched_masks_to_empty,
-    const float gamma,
-    const float alpha,
+    const float mask_gamma,
+    const float mask_alpha,
+    const float cls_gamma,
+    const float cls_alpha,
     int64_t void_class_index
 );
 
