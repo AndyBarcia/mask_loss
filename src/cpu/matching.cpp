@@ -43,7 +43,8 @@ std::vector<torch::Tensor> mask_matching_forward(
     const int64_t target_W,
     const double num_masks,
     const bool force_unmatched_masks,
-    const bool force_unmatched_class
+    const bool force_unmatched_class,
+    const int64_t void_class_index
 );
 
 enum class MatchingStrategy : int64_t {
@@ -595,7 +596,8 @@ std::vector<torch::Tensor> mask_matching(
     int64_t topk_matches    = 1,
     int64_t strategy_id     = 0,
     float   gamma           = 0.0f,
-    float   alpha           = -1.0f
+    float   alpha           = -1.0f,
+    int64_t void_class_index = -1
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
     const auto device = mask_logits.device();
@@ -701,7 +703,8 @@ std::vector<torch::Tensor> mask_matching(
         mask_targets.size(2),
         num_masks,
         force_unmatched_masks_to_empty,
-        force_unmatched_class_to_background
+        force_unmatched_class_to_background,
+        void_class_index
     );
 
     torch::Tensor layer_mask_mean = losses[0];

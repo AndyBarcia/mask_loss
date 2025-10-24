@@ -534,11 +534,12 @@ def test_mask_matching():
         "assignment_strategy": "global",
         "focal_gamma": 2.0,
         "focal_alpha": 0.25,
+        "void_class_index": None,
     }
-    
+
     arg_order = [
-        "mask_logits", 
-        "mask_targets", 
+        "mask_logits",
+        "mask_targets",
         "cls_logits",
         "cls_targets",
         "smooth", 
@@ -554,6 +555,7 @@ def test_mask_matching():
         "assignment_strategy",
         "focal_gamma",
         "focal_alpha",
+        "void_class_index",
     ]
     
     tester = CUDAKernelTester(
