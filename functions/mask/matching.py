@@ -373,12 +373,7 @@ def mask_matching_py(
         mask_alpha_pos = mask_focal_alpha_val
     mask_use_gamma = mask_focal_gamma_val != 0.0
 
-    if cls_focal_gamma is None:
-        cls_focal_gamma_val = mask_focal_gamma_val
-    else:
-        cls_focal_gamma_val = float(cls_focal_gamma)
-        if cls_focal_gamma_val < 0.0:
-            raise ValueError("focal_gamma must be non-negative")
+    cls_focal_gamma_val = 0.0 if cls_focal_gamma is None else float(cls_focal_gamma)
     cls_use_gamma = cls_focal_gamma_val != 0.0
 
     if cls_focal_alpha is None:
