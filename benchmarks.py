@@ -520,7 +520,7 @@ def test_mask_matching():
         "mask_logits": lambda device, dtype: torch.randn(L, B, Q, H, W, device=device, dtype=dtype),
         "mask_targets": lambda device, dtype: create_gaussian_blob_targets(B, Q, C, H_t, W_t, device)[0],
         "cls_logits": lambda device, dtype: torch.randn(L, B, Q, C, device=device, dtype=dtype),
-        "cls_targets": lambda device, dtype: create_gaussian_blob_targets(B, Q, C, H_t, W_t, device)[1],
+        "cls_targets": lambda device, dtype: create_gaussian_blob_targets(B, Q, C-1, H_t, W_t, device)[1],
         "smooth": 1.0,
         "sigmoid_scale": 1.0,
         "dice_scale": 1.0,
@@ -534,7 +534,7 @@ def test_mask_matching():
         "assignment_strategy": "global",
         "focal_gamma": 2.0,
         "focal_alpha": 0.25,
-        "void_class_index": None,
+        "void_class_index": C-1,
     }
 
     arg_order = [
