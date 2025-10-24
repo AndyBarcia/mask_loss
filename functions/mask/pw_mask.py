@@ -9,7 +9,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ..sigmoid.pw_sigmoid_ce import pairwise_sigmoid_cross_entropy_loss_py
 from ..dice.pw_dice_loss import pairwise_dice_loss_py
-from ..label.pw_label_loss import pairwise_label_loss_py
+from ..label.pw_sigmoid_label_loss import pairwise_label_loss_py
 
 try:
     import mask_loss

@@ -35,7 +35,7 @@ class PairwiseLabelLossFunction(Function):
             fa = float(focal_alpha)
             if not (0.0 <= fa <= 1.0):
                 raise ValueError("focal_alpha must be in [0, 1]")
-        output = mask_loss.forward_pw_label_loss(
+        output = mask_loss.forward_pw_sigmoid_label_loss(
             logits,
             targets,
             background_index if background_index is not None else -1,
