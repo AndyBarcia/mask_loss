@@ -1,4 +1,6 @@
 import math
+from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -46,8 +48,8 @@ class MaskMatchingFunction(Function):
         force_unmatched_masks_to_empty,
         K,
         assignment_strategy,
-        focal_gamma=None,
-        focal_alpha=None,
+        focal_gamma,
+        focal_alpha,
     ):
         """Run the forward pass of the matching op.
 
@@ -302,6 +304,19 @@ def mask_matching_py(
     if K_val < 0:
         raise ValueError("K must be non-negative")
 
+    focal_gamma_val = 0.0 if focal_gamma is None else float(focal_gamma)
+    if focal_gamma_val < 0.0:
+        raise ValueError("focal_gamma must be non-negative")
+    if focal_alpha is None:
+        focal_alpha_val: Optional[float] = None
+        alpha_neg = 1.0
+    else:
+        focal_alpha_val = float(focal_alpha)
+        if not (0.0 <= focal_alpha_val <= 1.0):
+            raise ValueError("focal_alpha must be in [0, 1]")
+        alpha_neg = 1.0 - focal_alpha_val
+    use_gamma = focal_gamma_val != 0.0
+
     strategy_map = {"global", "round", "greedy", "pseudo_greedy"}
     if assignment_strategy not in strategy_map:
         raise ValueError(
@@ -320,8 +335,8 @@ def mask_matching_py(
         dice_scale,
         cls_scale,
         background_index,
-        focal_gamma=focal_gamma,
-        focal_alpha=focal_alpha,
+        focal_gamma=focal_gamma_val,
+        focal_alpha=focal_alpha_val,
     )
     sigmoid_cost = costs[0]
     dice_cost = costs[1]
@@ -551,11 +566,11 @@ def mask_matching_py(
             probs = logits.sigmoid()
             ce_neg = F.softplus(logits)
             if use_gamma:
-                mod_neg = probs.pow(focal_gamma)
+                mod_neg = probs.pow(focal_gamma_val)
             else:
                 mod_neg = 1.0
             neg_term = ce_neg * mod_neg
-            if focal_alpha is not None:
+            if focal_alpha_val is not None:
                 neg_term = neg_term * alpha_neg
             mask_loss_per = neg_term.mean(dim=(-1, -2)) * sigmoid_scale
             layer_mask_sum += (mask_loss_per * unmatched_mask).sum(dim=(1, 2))
@@ -574,11 +589,11 @@ def mask_matching_py(
             probs = logits.sigmoid()
             ce_neg = F.softplus(logits)
             if use_gamma:
-                mod_neg = probs.pow(focal_gamma)
+                mod_neg = probs.pow(focal_gamma_val)
             else:
                 mod_neg = 1.0
             neg_term = ce_neg * mod_neg
-            if focal_alpha is not None:
+            if focal_alpha_val is not None:
                 neg_term = neg_term * alpha_neg
             cls_loss = neg_term.mean(dim=-1) * cls_scale
             layer_cls_sum += (cls_loss * unmatched_mask).sum(dim=(1, 2))

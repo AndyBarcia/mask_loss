@@ -513,7 +513,7 @@ def test_pw_mask_loss():
 
 def test_mask_matching():
     """Test the CUDA implementation of mask matching"""
-    L, B, Q, C, H, W = 1, 1, 128, 128, 256, 256
+    L, B, Q, C, H, W = 10, 8, 128, 128, 256, 256
     H_t, W_t = 1024, 1024
 
     input_creators = {
@@ -527,9 +527,13 @@ def test_mask_matching():
         "cls_scale": 1.0,
         "background_index": 0,
         "inf_thresh": 1e30,
-        "num_masks": 0,
-        "focal_gamma": 0.0,
-        "focal_alpha": None,
+        "num_masks": 5,
+        "force_unmatched_class_to_background": False,
+        "force_unmatched_masks_to_empty": False,
+        "K": 1,
+        "assignment_strategy": "global",
+        "focal_gamma": 2.0,
+        "focal_alpha": 0.25,
     }
     
     arg_order = [
@@ -544,6 +548,10 @@ def test_mask_matching():
         "background_index",
         "inf_thresh",
         "num_masks",
+        "force_unmatched_class_to_background",
+        "force_unmatched_masks_to_empty",
+        "K",
+        "assignment_strategy",
         "focal_gamma",
         "focal_alpha",
     ]
@@ -558,5 +566,5 @@ def test_mask_matching():
     tester.run()
 
 if __name__ == "__main__":
-    test_pw_mask_loss()
+    test_mask_matching()
     #test_pw_sigmoid_ce_loss()
