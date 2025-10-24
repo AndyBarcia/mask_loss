@@ -37,7 +37,9 @@ __global__ void mask_matching_backward_kernel(
     const float dice_scale,
     const float area_scale,
     const float* __restrict__ inv_denom,
-    const int64_t background_index
+    const int64_t background_index,
+    const float gamma,
+    const float alpha
 ) {
     const int64_t q = blockIdx.x;
     const int64_t b = blockIdx.y;
@@ -89,6 +91,10 @@ __global__ void mask_matching_backward_kernel(
     float local_target_sum = 0.0f;
     float local_inter_sum = 0.0f;
 
+    const bool use_gamma = gamma > 0.0f;
+    const float alpha_pos = (alpha >= 0.0f) ? alpha : 1.0f;
+    const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
+
     for (int64_t idx = threadIdx.x; idx < HW; idx += blockDim.x) {
         const int64_t h = idx / W;
         const int64_t w = idx % W;
@@ -97,7 +103,6 @@ __global__ void mask_matching_backward_kernel(
         const float logit = logits[logits_offset];
         const float prob = 1.0f / (1.0f + expf(-logit));
         const float prob_scaled = prob * area_scale;
-
         float target = 0.0f;
         if (is_matched) {
             target = static_cast<float>(counts_ptr[h * W + w]);
@@ -106,6 +111,7 @@ __global__ void mask_matching_backward_kernel(
         local_mask_sum += prob_scaled;
         local_target_sum += target;
         local_inter_sum += prob * target;
+
     }
 
     // Aggregate the per-thread partial sums for the dice statistics.
@@ -134,16 +140,30 @@ __global__ void mask_matching_backward_kernel(
         const int64_t logits_offset = logits_base + h * W + w;
         const float logit = logits[logits_offset];
         const float prob = 1.0f / (1.0f + expf(-logit));
-        const float prob_scaled = prob * area_scale;
-        const float prob_prime = prob * (1.0f - prob);
+        const float one_minus = 1.0f - prob;
+        const float prob_prime = prob * one_minus;
+        const float abs_logit = fabsf(logit);
+        const float max_logit = fmaxf(logit, 0.0f);
+        const float max_neg_logit = fmaxf(-logit, 0.0f);
+        const float logexp = log1pf(expf(-abs_logit));
+        const float ce_neg = logexp + max_logit;
+        const float ce_pos = logexp + max_neg_logit;
+        const float mod_neg = use_gamma ? powf(prob, gamma) : 1.0f;
+        const float mod_pos = use_gamma ? powf(one_minus, gamma) : 1.0f;
 
         float target = 0.0f;
         if (is_matched) {
             target = static_cast<float>(counts_ptr[h * W + w]);
         }
 
-        // Sigmoid CE gradient and dice gradient for a single pixel.
-        const float grad_sigmoid = (prob_scaled - target) * sigmoid_factor;
+        float neg_count = area_scale - target;
+        if (neg_count < 0.0f) {
+            neg_count = 0.0f;
+        }
+        const float grad_pos = -alpha_pos * target * mod_pos * (gamma * prob * ce_pos + one_minus);
+        const float grad_neg = alpha_neg * neg_count * mod_neg * (gamma * one_minus * ce_neg + prob);
+        const float grad_sigmoid = (grad_pos + grad_neg) * sigmoid_factor;
+
         const float d_inter = prob_prime * target;
         const float d_denom = prob_prime * area_scale;
         const float grad_dice = (numerator * d_denom - two_denom * d_inter) * inv_denom_sq * dice_scale;
@@ -166,7 +186,9 @@ __global__ void cls_matching_backward_kernel(
     const int64_t C,
     const int64_t GT_total,
     const float* __restrict__ coeff_base,
-    const int64_t background_index
+    const int64_t background_index,
+    const float gamma,
+    const float alpha
 ) {
     const int64_t q = blockIdx.x;  // prediction index
     const int64_t b = blockIdx.y;
@@ -194,12 +216,30 @@ __global__ void cls_matching_backward_kernel(
         y = static_cast<int>(y64);
     }
 
+    const bool use_gamma = gamma > 0.0f;
+    const float alpha_pos = (alpha >= 0.0f) ? alpha : 1.0f;
+    const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
+
     for (int c = threadIdx.x; c < C; c += blockDim.x) {
         const float z = cls_logits[base + c];
         const float p = 1.0f / (1.0f + __expf(-z));   // sigmoid
-        const float t = (is_matched && c == y) ? 1.0f : 0.0f;
-        // d/dz BCE(one-hot) averaged over C: (p - t) / C
-        grad_cls_logits[base + c] = coeff * (p - t);
+        const float one_minus = 1.0f - p;
+        const float abs_z = fabsf(z);
+        const float max_z = fmaxf(z, 0.0f);
+        const float max_neg_z = fmaxf(-z, 0.0f);
+        const float logexp = log1pf(__expf(-abs_z));
+        const float ce_pos = logexp + max_neg_z;
+        const float ce_neg = logexp + max_z;
+        const float mod_pos = use_gamma ? powf(one_minus, gamma) : 1.0f;
+        const float mod_neg = use_gamma ? powf(p, gamma) : 1.0f;
+
+        float grad = 0.0f;
+        if (is_matched && c == y) {
+            grad = -alpha_pos * mod_pos * (gamma * p * ce_pos + one_minus);
+        } else {
+            grad = alpha_neg * mod_neg * (gamma * one_minus * ce_neg + p);
+        }
+        grad_cls_logits[base + c] = coeff * grad;
     }
 }
 
@@ -219,7 +259,9 @@ std::vector<torch::Tensor> mask_matching_backward(
     int64_t background_index,
     const double num_masks,
     const bool force_unmatched_class_to_background,
-    const bool force_unmatched_masks_to_empty
+    const bool force_unmatched_masks_to_empty,
+    const float gamma,
+    const float alpha
 ) {
     // Backward pipeline:
     //   1. Materialize downsampled ground-truth masks once for reuse.
@@ -233,6 +275,10 @@ std::vector<torch::Tensor> mask_matching_backward(
     CHECK_INPUT(cls_logits);
     CHECK_INPUT(cls_targets);
     CHECK_INPUT(pred_to_gt);
+
+    TORCH_CHECK(gamma >= 0.0f, "mask_matching_backward: focal_gamma must be non-negative");
+    TORCH_CHECK(alpha < 0.0f || (alpha >= 0.0f && alpha <= 1.0f),
+        "mask_matching_backward: focal_alpha must be in [0,1] or negative to disable");
 
     const auto device = mask_logits.device();
     TORCH_CHECK(mask_targets.device() == device, "mask_targets must be on the same device as mask_logits");
@@ -377,7 +423,9 @@ std::vector<torch::Tensor> mask_matching_backward(
                 dice_scale,
                 area_scale,
                 inv_mask_denom.data_ptr<float>(),
-                background_index
+                background_index,
+                gamma,
+                alpha
             );
             CHECK_CUDA_ERROR(cudaGetLastError());
         }
@@ -396,7 +444,9 @@ std::vector<torch::Tensor> mask_matching_backward(
                 C,
                 GT_total,
                 cls_coeff.data_ptr<float>(),
-                background_index
+                background_index,
+                gamma,
+                alpha
             );
             CHECK_CUDA_ERROR(cudaGetLastError());
         }
@@ -406,4 +456,3 @@ std::vector<torch::Tensor> mask_matching_backward(
 
     return {grad_mask_logits, grad_cls_logits};
 }
-

@@ -39,7 +39,9 @@ __global__ void mask_matching_forward_kernel(
     const float dice_scale,
     const float cls_scale,
     const float area_scale,
-    const int64_t term_stride
+    const int64_t term_stride,
+    const float gamma,
+    const float alpha
 ) {
     const int64_t q = blockIdx.x;
     const int64_t b = blockIdx.y;
@@ -68,42 +70,57 @@ __global__ void mask_matching_forward_kernel(
 
     extern __shared__ float shared[];
     float* cursor = shared;
-    float* sh_softplus_mask = nullptr;
+    float* sh_bce_mask = nullptr;
     float* sh_sigmoid = nullptr;
-    float* sh_softplus_cls = nullptr;
+    float* sh_bce_cls = nullptr;
 
     if (ForceMasks) {
-        sh_softplus_mask = cursor;
+        sh_bce_mask = cursor;
         cursor += blockDim.x;
         sh_sigmoid = cursor;
         cursor += blockDim.x;
     }
     if (ForceClass) {
-        sh_softplus_cls = cursor;
+        sh_bce_cls = cursor;
     }
+
+    const bool use_gamma = gamma > 0.0f;
+    const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
 
     if (ForceMasks) {
         const int64_t HW = H * W;
         const int64_t base = pred_index * HW;
-        float sum_softplus = 0.0f;
+        float sum_bce = 0.0f;
         float sum_sigmoid = 0.0f;
         for (int64_t idx = threadIdx.x; idx < HW; idx += blockDim.x) {
             const float logit = mask_logits[base + idx];
-            sum_softplus += softplusf(logit);
-            sum_sigmoid += 1.0f / (1.0f + expf(-logit));
+            const float prob = 1.0f / (1.0f + expf(-logit));
+            const float abs_logit = fabsf(logit);
+            const float max_logit = fmaxf(logit, 0.0f);
+            const float logexp = log1pf(expf(-abs_logit));
+            const float ce_neg = logexp + max_logit;
+            const float mod_neg = use_gamma ? powf(prob, gamma) : 1.0f;
+            sum_bce += alpha_neg * mod_neg * ce_neg;
+            sum_sigmoid += prob;
         }
-        sh_softplus_mask[threadIdx.x] = sum_softplus;
+        sh_bce_mask[threadIdx.x] = sum_bce;
         sh_sigmoid[threadIdx.x] = sum_sigmoid;
     }
 
     if (ForceClass) {
         const int64_t base_cls = pred_index * C;
-        float sum_softplus = 0.0f;
+        float sum_bce = 0.0f;
         for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
             const float logit = cls_logits[base_cls + c];
-            sum_softplus += softplusf(logit);
+            const float prob = 1.0f / (1.0f + expf(-logit));
+            const float abs_logit = fabsf(logit);
+            const float max_logit = fmaxf(logit, 0.0f);
+            const float logexp = log1pf(expf(-abs_logit));
+            const float ce_neg = logexp + max_logit;
+            const float mod_neg = use_gamma ? powf(prob, gamma) : 1.0f;
+            sum_bce += alpha_neg * mod_neg * ce_neg;
         }
-        sh_softplus_cls[threadIdx.x] = sum_softplus;
+        sh_bce_cls[threadIdx.x] = sum_bce;
     }
 
     __syncthreads();
@@ -111,14 +128,14 @@ __global__ void mask_matching_forward_kernel(
     if (ForceMasks) {
         for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
             if (threadIdx.x < stride) {
-                sh_softplus_mask[threadIdx.x] += sh_softplus_mask[threadIdx.x + stride];
+                sh_bce_mask[threadIdx.x] += sh_bce_mask[threadIdx.x + stride];
                 sh_sigmoid[threadIdx.x] += sh_sigmoid[threadIdx.x + stride];
             }
             __syncthreads();
         }
         if (threadIdx.x == 0) {
             const float HW = static_cast<float>(H * W);
-            const float bce_mean = sh_softplus_mask[0] / HW;
+            const float bce_mean = sh_bce_mask[0] / HW;
             const float prob_sum = sh_sigmoid[0] * area_scale;
             const float dice_loss = dice_scale * (prob_sum / (prob_sum + smooth));
             atomicAdd(layer_mask_sum + l, sigmoid_scale * bce_mean);
@@ -130,13 +147,13 @@ __global__ void mask_matching_forward_kernel(
         __syncthreads();
         for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
             if (threadIdx.x < stride) {
-                sh_softplus_cls[threadIdx.x] += sh_softplus_cls[threadIdx.x + stride];
+                sh_bce_cls[threadIdx.x] += sh_bce_cls[threadIdx.x + stride];
             }
             __syncthreads();
         }
         if (threadIdx.x == 0) {
             const float inv_C = 1.0f / static_cast<float>(C);
-            const float cls_loss = cls_scale * (sh_softplus_cls[0] * inv_C);
+            const float cls_loss = cls_scale * (sh_bce_cls[0] * inv_C);
             atomicAdd(layer_cls_sum + l, cls_loss);
         }
     }
@@ -153,6 +170,8 @@ std::vector<torch::Tensor> mask_matching_forward(
     const float sigmoid_scale,
     const float dice_scale,
     const float cls_scale,
+    const float gamma,
+    const float alpha,
     const int64_t target_H,
     const int64_t target_W,
     const double num_masks,
@@ -242,6 +261,10 @@ std::vector<torch::Tensor> mask_matching_forward(
 
     const int64_t term_stride = L * B * Q * GT_out;
 
+    TORCH_CHECK(gamma >= 0.0f, "focal_gamma must be non-negative");
+    TORCH_CHECK(alpha < 0.0f || (alpha >= 0.0f && alpha <= 1.0f),
+        "focal_alpha must be in [0, 1] or negative to disable");
+
     if (force_unmatched_masks && force_unmatched_class) {
         shared_elems = 3;
         mask_matching_forward_kernel<true, true><<<grid, threads, shared_elems * threads * sizeof(float), stream.stream()>>>(
@@ -264,7 +287,9 @@ std::vector<torch::Tensor> mask_matching_forward(
             dice_scale_val,
             cls_scale_val,
             area_scale_val,
-            term_stride
+            term_stride,
+            gamma,
+            alpha
         );
     } else if (force_unmatched_masks) {
         shared_elems = 2;
@@ -288,7 +313,9 @@ std::vector<torch::Tensor> mask_matching_forward(
             dice_scale_val,
             cls_scale_val,
             area_scale_val,
-            term_stride
+            term_stride,
+            gamma,
+            alpha
         );
     } else if (force_unmatched_class) {
         shared_elems = 1;
@@ -312,7 +339,9 @@ std::vector<torch::Tensor> mask_matching_forward(
             dice_scale_val,
             cls_scale_val,
             area_scale_val,
-            term_stride
+            term_stride,
+            gamma,
+            alpha
         );
     } else {
         shared_elems = 0;
@@ -336,7 +365,9 @@ std::vector<torch::Tensor> mask_matching_forward(
             dice_scale_val,
             cls_scale_val,
             area_scale_val,
-            term_stride
+            term_stride,
+            gamma,
+            alpha
         );
     }
 

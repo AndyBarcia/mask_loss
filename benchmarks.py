@@ -527,7 +527,9 @@ def test_mask_matching():
         "cls_scale": 1.0,
         "background_index": 0,
         "inf_thresh": 1e30,
-        "num_masks": 0
+        "num_masks": 0,
+        "focal_gamma": 0.0,
+        "focal_alpha": None,
     }
     
     arg_order = [
@@ -541,7 +543,9 @@ def test_mask_matching():
         "cls_scale",
         "background_index",
         "inf_thresh",
-        "num_masks"
+        "num_masks",
+        "focal_gamma",
+        "focal_alpha",
     ]
     
     tester = CUDAKernelTester(

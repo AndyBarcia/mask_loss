@@ -37,6 +37,8 @@ std::vector<torch::Tensor> mask_matching_forward(
     const float sigmoid_scale,
     const float dice_scale,
     const float cls_scale,
+    const float gamma,
+    const float alpha,
     const int64_t target_H,
     const int64_t target_W,
     const double num_masks,
@@ -591,13 +593,18 @@ std::vector<torch::Tensor> mask_matching(
     bool    force_unmatched_class_to_background = false,
     bool    force_unmatched_masks_to_empty      = false,
     int64_t topk_matches    = 1,
-    int64_t strategy_id     = 0
+    int64_t strategy_id     = 0,
+    float   gamma           = 0.0f,
+    float   alpha           = -1.0f
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
     const auto device = mask_logits.device();
 
     TORCH_CHECK(topk_matches >= 0, "K must be non-negative");
     TORCH_CHECK(strategy_id >= 0 && strategy_id <= 3, "Invalid matching strategy id");
+    TORCH_CHECK(gamma >= 0.0f, "mask_matching: focal_gamma must be non-negative");
+    TORCH_CHECK(alpha < 0.0f || (alpha >= 0.0f && alpha <= 1.0f),
+        "mask_matching: focal_alpha must be in [0,1] or negative to disable");
     MatchingStrategy strategy = static_cast<MatchingStrategy>(strategy_id);
 
     // Get the mask, dice and cls pairwise costs, shape (3, L, B, C, GT_out)
@@ -610,7 +617,9 @@ std::vector<torch::Tensor> mask_matching(
         sigmoid_scale,
         dice_scale,
         cls_scale,
-        background_index
+        background_index,
+        gamma,
+        alpha
     );
     TORCH_CHECK(
         separate_costs.dim() == 5 && separate_costs.size(0) == 3,
@@ -686,6 +695,8 @@ std::vector<torch::Tensor> mask_matching(
         sigmoid_scale,
         dice_scale,
         cls_scale,
+        gamma,
+        alpha,
         mask_targets.size(1),
         mask_targets.size(2),
         num_masks,

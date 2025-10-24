@@ -46,6 +46,8 @@ class MaskMatchingFunction(Function):
         force_unmatched_masks_to_empty,
         K,
         assignment_strategy,
+        focal_gamma=None,
+        focal_alpha=None,
     ):
         """Run the forward pass of the matching op.
 
@@ -126,6 +128,16 @@ class MaskMatchingFunction(Function):
         if K_val < 0:
             raise ValueError("K must be non-negative")
 
+        focal_gamma_val = 0.0 if focal_gamma is None else float(focal_gamma)
+        if focal_gamma_val < 0.0:
+            raise ValueError("focal_gamma must be non-negative")
+        if focal_alpha is None:
+            focal_alpha_val = -1.0
+        else:
+            focal_alpha_val = float(focal_alpha)
+            if not (0.0 <= focal_alpha_val <= 1.0):
+                raise ValueError("focal_alpha must be in [0, 1]")
+
         pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean = mask_loss.mask_matching(
             mask_logits,
             mask_targets,
@@ -142,6 +154,8 @@ class MaskMatchingFunction(Function):
             force_unmatched_masks,
             K_val,
             strategy_map[assignment_strategy],
+            focal_gamma_val,
+            focal_alpha_val,
         )
 
         ctx.save_for_backward(
@@ -160,6 +174,8 @@ class MaskMatchingFunction(Function):
         ctx.num_masks = num_masks_val
         ctx.force_unmatched_cls = force_unmatched_cls
         ctx.force_unmatched_masks = force_unmatched_masks
+        ctx.focal_gamma = focal_gamma_val
+        ctx.focal_alpha = focal_alpha_val
 
         return pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean
 
@@ -181,6 +197,8 @@ class MaskMatchingFunction(Function):
         num_masks = ctx.num_masks
         force_unmatched_cls = ctx.force_unmatched_cls
         force_unmatched_masks = ctx.force_unmatched_masks
+        focal_gamma = ctx.focal_gamma
+        focal_alpha = ctx.focal_alpha
 
         grad_layer_mask_mean = grad_layer_mask_mean.contiguous()
         grad_layer_dice_mean = grad_layer_dice_mean.contiguous()
@@ -203,12 +221,16 @@ class MaskMatchingFunction(Function):
             num_masks,
             force_unmatched_cls,
             force_unmatched_masks,
+            focal_gamma,
+            focal_alpha,
         )
 
         return (
             grad_mask_logits,
             None,
             grad_cls_logits,
+            None,
+            None,
             None,
             None,
             None,
@@ -239,6 +261,8 @@ def mask_matching_py(
     force_unmatched_masks_to_empty=False,
     K=1,
     assignment_strategy="global",
+    focal_gamma: float = 0.0,
+    focal_alpha: Optional[float] = None,
 ):
     """Reference Python implementation of :func:`mask_matching`.
 
@@ -263,6 +287,9 @@ def mask_matching_py(
             predictions towards empty masks.
         K (int): Maximum number of detections per ground truth.
         assignment_strategy (str): Strategy identifier (see below).
+        focal_gamma (float): Focal loss exponent applied to BCE terms.
+        focal_alpha (Optional[float]): Positive-class prior in ``[0, 1]``. Use
+            ``None`` to disable class re-weighting.
 
     Returns:
         Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: The same values exposed
@@ -293,6 +320,8 @@ def mask_matching_py(
         dice_scale,
         cls_scale,
         background_index,
+        focal_gamma=focal_gamma,
+        focal_alpha=focal_alpha,
     )
     sigmoid_cost = costs[0]
     dice_cost = costs[1]
@@ -518,12 +547,17 @@ def mask_matching_py(
         unmatched_mask = (~assigned_pred).to(mask_logits.dtype)
 
         if force_unmatched_masks_to_empty and unmatched_dts > 0:
-            bce = F.binary_cross_entropy_with_logits(
-                mask_logits,
-                torch.zeros_like(mask_logits),
-                reduction="none",
-            )
-            mask_loss_per = bce.mean(dim=(-1, -2)) * sigmoid_scale
+            logits = mask_logits
+            probs = logits.sigmoid()
+            ce_neg = F.softplus(logits)
+            if use_gamma:
+                mod_neg = probs.pow(focal_gamma)
+            else:
+                mod_neg = 1.0
+            neg_term = ce_neg * mod_neg
+            if focal_alpha is not None:
+                neg_term = neg_term * alpha_neg
+            mask_loss_per = neg_term.mean(dim=(-1, -2)) * sigmoid_scale
             layer_mask_sum += (mask_loss_per * unmatched_mask).sum(dim=(1, 2))
 
             probs = mask_logits.sigmoid()
@@ -536,12 +570,17 @@ def mask_matching_py(
             layer_dice_sum += (dice_loss * unmatched_mask).sum(dim=(1, 2))
 
         if force_unmatched_class_to_background and unmatched_dts > 0:
-            cls_bce = F.binary_cross_entropy_with_logits(
-                cls_logits,
-                torch.zeros_like(cls_logits),
-                reduction="none",
-            )
-            cls_loss = cls_bce.mean(dim=-1) * cls_scale
+            logits = cls_logits
+            probs = logits.sigmoid()
+            ce_neg = F.softplus(logits)
+            if use_gamma:
+                mod_neg = probs.pow(focal_gamma)
+            else:
+                mod_neg = 1.0
+            neg_term = ce_neg * mod_neg
+            if focal_alpha is not None:
+                neg_term = neg_term * alpha_neg
+            cls_loss = neg_term.mean(dim=-1) * cls_scale
             layer_cls_sum += (cls_loss * unmatched_mask).sum(dim=(1, 2))
 
     per_layer_matched = assigned.sum(dim=(1, 2)).to(layer_mask_sum.dtype)
@@ -687,3 +726,15 @@ def mask_matching_sampling_py(
     layer_dice_mean = layer_dice_sum / denom          # (L,)
     matched_tensor = torch.tensor(matched, device=mask_logits.device, dtype=torch.long)
     return gt_to_pred, pred_to_gt, layer_mask_mean, layer_dice_mean, matched_tensor
+    focal_gamma = 0.0 if focal_gamma is None else float(focal_gamma)
+    if focal_gamma < 0.0:
+        raise ValueError("focal_gamma must be non-negative")
+    if focal_alpha is None or (isinstance(focal_alpha, (int, float)) and float(focal_alpha) < 0.0):
+        alpha_neg = 1.0
+    else:
+        alpha = float(focal_alpha)
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError("focal_alpha must be in [0, 1]")
+        alpha_neg = 1.0 - alpha
+    use_gamma = focal_gamma != 0.0
+

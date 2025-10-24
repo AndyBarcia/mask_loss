@@ -87,7 +87,9 @@ std::vector<torch::Tensor> mask_matching(
     bool    force_unmatched_class_to_background = false,
     bool    force_unmatched_masks_to_empty      = false,
     int64_t topk_matches    = 1,
-    int64_t strategy_id     = 0
+    int64_t strategy_id     = 0,
+    float   gamma           = 0.0f,
+    float   alpha           = -1.0f
 );
 
 std::vector<torch::Tensor> mask_matching_backward(
@@ -106,7 +108,9 @@ std::vector<torch::Tensor> mask_matching_backward(
     int64_t background_index,
     const double num_masks,
     const bool force_unmatched_class_to_background,
-    const bool force_unmatched_masks_to_empty
+    const bool force_unmatched_masks_to_empty,
+    const float gamma,
+    const float alpha
 );
 
 torch::Tensor pairwise_label_loss_forward(
