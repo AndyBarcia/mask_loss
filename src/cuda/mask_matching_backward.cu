@@ -188,7 +188,10 @@ __global__ void cls_matching_backward_kernel(
     const float* __restrict__ coeff_base,
     const int64_t background_index,
     const float gamma,
-    const float alpha
+    const float alpha,
+    const bool force_unmatched_class_to_background,
+    const bool has_void_class,
+    const int64_t void_class_index
 ) {
     const int64_t q = blockIdx.x;  // prediction index
     const int64_t b = blockIdx.y;
@@ -203,8 +206,9 @@ __global__ void cls_matching_backward_kernel(
     if (!is_matched && !ForceUnmatchedClass) return;
 
     // Per-layer coefficient: upstream grad * normalization * cls_scale * (1/C)
-    const float coeff = grad_layer_cls[l] * coeff_base[l] / static_cast<float>(C);
-    if (coeff == 0.0f) return;
+    const float base_coeff = grad_layer_cls[l] * coeff_base[l];
+    if (base_coeff == 0.0f) return;
+    const float inv_C = (C > 0) ? (1.0f / static_cast<float>(C)) : 0.0f;
 
     // Write grads for the entire class vector of the matched/unmatched query
     const int64_t base = pred_index * C;
@@ -233,13 +237,31 @@ __global__ void cls_matching_backward_kernel(
         const float mod_pos = use_gamma ? powf(one_minus, gamma) : 1.0f;
         const float mod_neg = use_gamma ? powf(p, gamma) : 1.0f;
 
+        const bool is_void = has_void_class && (c == void_class_index);
         float grad = 0.0f;
-        if (is_matched && c == y) {
-            grad = -alpha_pos * mod_pos * (gamma * p * ce_pos + one_minus);
+        if (is_matched) {
+            if (c == y) {
+                grad = -alpha_pos * mod_pos * (gamma * p * ce_pos + one_minus);
+                grad_cls_logits[base + c] = base_coeff * inv_C * grad;
+            } else {
+                grad = alpha_neg * mod_neg * (gamma * one_minus * ce_neg + p);
+                grad_cls_logits[base + c] = base_coeff * inv_C * grad;
+            }
         } else {
-            grad = alpha_neg * mod_neg * (gamma * one_minus * ce_neg + p);
+            if (force_unmatched_class_to_background) {
+                if (is_void) {
+                    grad = -alpha_pos * mod_pos * (gamma * p * ce_pos + one_minus);
+                } else {
+                    grad = alpha_neg * mod_neg * (gamma * one_minus * ce_neg + p);
+                }
+                grad_cls_logits[base + c] = base_coeff * inv_C * grad;
+            } else if (is_void) {
+                grad = -alpha_pos * mod_pos * (gamma * p * ce_pos + one_minus);
+                grad_cls_logits[base + c] = base_coeff * grad;
+            } else {
+                grad_cls_logits[base + c] = 0.0f;
+            }
         }
-        grad_cls_logits[base + c] = coeff * grad;
     }
 }
 
@@ -261,7 +283,8 @@ std::vector<torch::Tensor> mask_matching_backward(
     const bool force_unmatched_class_to_background,
     const bool force_unmatched_masks_to_empty,
     const float gamma,
-    const float alpha
+    const float alpha,
+    int64_t void_class_index
 ) {
     // Backward pipeline:
     //   1. Materialize downsampled ground-truth masks once for reuse.
@@ -302,6 +325,13 @@ std::vector<torch::Tensor> mask_matching_backward(
     const int64_t C = cls_logits.size(3);
     const int64_t GT_total = cls_targets.size(1);
 
+    int64_t void_index = -1;
+    if (void_class_index >= 0 && void_class_index < C) {
+        void_index = void_class_index;
+    }
+    const bool has_void_class = (void_index >= 0);
+    const bool need_unmatched_class = force_unmatched_class_to_background || has_void_class;
+
     TORCH_CHECK(H > 0 && W > 0, "mask_logits must have positive spatial size");
 
     const int64_t H_t = mask_targets.size(1);
@@ -326,6 +356,8 @@ std::vector<torch::Tensor> mask_matching_backward(
     auto matches_f = matches_bool.to(torch::kFloat32);
     torch::Tensor per_layer_matched = matches_f.sum({1, 2});
     torch::Tensor per_layer_total = torch::full({L}, static_cast<float>(B * Q), mask_logits.options());
+    torch::Tensor unmatched_per_layer = per_layer_total - per_layer_matched;
+    const bool has_unmatched = matched_dts < (L * B * Q);
 
     const bool has_num_masks = num_masks > 0.0;
 
@@ -343,6 +375,8 @@ std::vector<torch::Tensor> mask_matching_backward(
     torch::Tensor cls_denom;
     if (force_unmatched_class_to_background) {
         cls_denom = per_layer_total.clone();
+    } else if (has_void_class && has_unmatched) {
+        cls_denom = per_layer_matched + unmatched_per_layer;
     } else if (has_num_masks) {
         cls_denom = torch::full({L}, static_cast<float>(num_masks), mask_logits.options());
     } else {
@@ -392,7 +426,7 @@ std::vector<torch::Tensor> mask_matching_backward(
 
     const auto runtime_flags = std::make_tuple(
         static_cast<int>(force_unmatched_masks_to_empty),
-        static_cast<int>(force_unmatched_class_to_background)
+        static_cast<int>(need_unmatched_class)
     );
     const auto supported_flags = std::make_tuple(
         std::make_tuple(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{}),
@@ -446,7 +480,10 @@ std::vector<torch::Tensor> mask_matching_backward(
                 cls_coeff.data_ptr<float>(),
                 background_index,
                 gamma,
-                alpha
+                alpha,
+                force_unmatched_class_to_background,
+                has_void_class,
+                void_index
             );
             CHECK_CUDA_ERROR(cudaGetLastError());
         }

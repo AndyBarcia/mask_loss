@@ -50,6 +50,7 @@ class MaskMatchingFunction(Function):
         assignment_strategy,
         focal_gamma,
         focal_alpha,
+        void_class_index=None,
     ):
         """Run the forward pass of the matching op.
 
@@ -79,6 +80,10 @@ class MaskMatchingFunction(Function):
                 predictions should contribute a background classification loss.
             force_unmatched_masks_to_empty (bool): Whether unmatched predictions
                 should be trained towards an empty mask.
+            void_class_index (Optional[int]): Optional index of the "void"
+                class in ``cls_logits``. When provided, unmatched predictions
+                are supervised to activate this channel regardless of the
+                background enforcement flag.
             K (int): Maximum number of detections that can be matched to the
                 same ground truth (hybrid matching "top-k" budget).
             assignment_strategy (str): Name of the matching strategy.  One of
@@ -140,6 +145,17 @@ class MaskMatchingFunction(Function):
             if not (0.0 <= focal_alpha_val <= 1.0):
                 raise ValueError("focal_alpha must be in [0, 1]")
 
+        num_cls_channels = cls_logits.shape[-1]
+        if void_class_index is None:
+            void_index_val = -1
+        else:
+            void_index_val = int(void_class_index)
+            if not (0 <= void_index_val < num_cls_channels):
+                raise ValueError("incorrect void index")
+
+        if void_index_val != -1 and torch.any(cls_targets == void_index_val):
+            raise ValueError("cls_targets must not contain the void class index")
+
         pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean = mask_loss.mask_matching(
             mask_logits,
             mask_targets,
@@ -158,6 +174,7 @@ class MaskMatchingFunction(Function):
             strategy_map[assignment_strategy],
             focal_gamma_val,
             focal_alpha_val,
+            void_index_val,
         )
 
         ctx.save_for_backward(
@@ -178,6 +195,7 @@ class MaskMatchingFunction(Function):
         ctx.force_unmatched_masks = force_unmatched_masks
         ctx.focal_gamma = focal_gamma_val
         ctx.focal_alpha = focal_alpha_val
+        ctx.void_class_index = void_index_val
 
         return pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean
 
@@ -225,12 +243,14 @@ class MaskMatchingFunction(Function):
             force_unmatched_masks,
             focal_gamma,
             focal_alpha,
+            ctx.void_class_index,
         )
 
         return (
             grad_mask_logits,
             None,
             grad_cls_logits,
+            None,
             None,
             None,
             None,
@@ -265,6 +285,7 @@ def mask_matching_py(
     assignment_strategy="global",
     focal_gamma: float = 0.0,
     focal_alpha: Optional[float] = None,
+    void_class_index: Optional[int] = None,
 ):
     """Reference Python implementation of :func:`mask_matching`.
 
@@ -292,6 +313,9 @@ def mask_matching_py(
         focal_gamma (float): Focal loss exponent applied to BCE terms.
         focal_alpha (Optional[float]): Positive-class prior in ``[0, 1]``. Use
             ``None`` to disable class re-weighting.
+        void_class_index (Optional[int]): Index of the "void" class in
+            ``cls_logits``. If set, unmatched detections are trained to predict
+            the void class regardless of ``force_unmatched_class_to_background``.
 
     Returns:
         Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: The same values exposed
@@ -310,12 +334,28 @@ def mask_matching_py(
     if focal_alpha is None:
         focal_alpha_val: Optional[float] = None
         alpha_neg = 1.0
+        alpha_pos = 1.0
     else:
         focal_alpha_val = float(focal_alpha)
         if not (0.0 <= focal_alpha_val <= 1.0):
             raise ValueError("focal_alpha must be in [0, 1]")
         alpha_neg = 1.0 - focal_alpha_val
+        alpha_pos = focal_alpha_val
     use_gamma = focal_gamma_val != 0.0
+
+    num_cls_channels = cls_logits.shape[-1]
+    void_idx: Optional[int]
+    if void_class_index is None:
+        void_idx = None
+    else:
+        vi = int(void_class_index)
+        if not (0 <= vi < num_cls_channels):
+            raise ValueError("incorrect void index")
+        void_idx = vi
+
+    if void_idx is not None and torch.any(cls_targets == void_idx):
+        raise ValueError("cls_targets must not contain the void class index")
+    has_void_class = void_idx is not None
 
     strategy_map = {"global", "round", "greedy", "pseudo_greedy"}
     if assignment_strategy not in strategy_map:
@@ -584,19 +624,36 @@ def mask_matching_py(
             dice_loss = dice_scale * (p_sum_up / (p_sum_up + smooth))
             layer_dice_sum += (dice_loss * unmatched_mask).sum(dim=(1, 2))
 
-        if force_unmatched_class_to_background and unmatched_dts > 0:
+        if unmatched_dts > 0:
             logits = cls_logits
             probs = logits.sigmoid()
             ce_neg = F.softplus(logits)
+            ce_pos = F.softplus(-logits)
             if use_gamma:
                 mod_neg = probs.pow(focal_gamma_val)
+                mod_pos = (1.0 - probs).pow(focal_gamma_val)
             else:
                 mod_neg = 1.0
+                mod_pos = 1.0
             neg_term = ce_neg * mod_neg
+            pos_term = ce_pos * mod_pos
             if focal_alpha_val is not None:
                 neg_term = neg_term * alpha_neg
-            cls_loss = neg_term.mean(dim=-1) * cls_scale
-            layer_cls_sum += (cls_loss * unmatched_mask).sum(dim=(1, 2))
+                pos_term = pos_term * alpha_pos
+
+            cls_loss = None
+            if force_unmatched_class_to_background:
+                cls_loss = neg_term.mean(dim=-1)
+                if has_void_class and num_cls_channels > 0:
+                    void_neg = neg_term[..., void_idx]
+                    void_pos = pos_term[..., void_idx]
+                    cls_loss = cls_loss + (void_pos - void_neg) / float(num_cls_channels)
+            elif has_void_class:
+                cls_loss = pos_term[..., void_idx]
+
+            if cls_loss is not None:
+                cls_loss = cls_loss * cls_scale
+                layer_cls_sum += (cls_loss * unmatched_mask).sum(dim=(1, 2))
 
     per_layer_matched = assigned.sum(dim=(1, 2)).to(layer_mask_sum.dtype)
     queries_per_layer = layer_mask_sum.new_full((L,), float(B * C))
@@ -608,8 +665,11 @@ def mask_matching_py(
     else:
         mask_denom = per_layer_matched
 
+    unmatched_per_layer = queries_per_layer - per_layer_matched
     if force_unmatched_class_to_background:
         cls_denom = queries_per_layer
+    elif has_void_class and unmatched_dts > 0:
+        cls_denom = per_layer_matched + unmatched_per_layer
     elif num_masks is not None and num_masks > 0:
         cls_denom = layer_mask_sum.new_full((L,), float(num_masks))
     else:
