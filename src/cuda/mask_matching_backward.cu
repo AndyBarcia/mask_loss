@@ -356,9 +356,6 @@ std::vector<torch::Tensor> mask_matching_backward(
     auto matches_f = matches_bool.to(torch::kFloat32);
     torch::Tensor per_layer_matched = matches_f.sum({1, 2});
     torch::Tensor per_layer_total = torch::full({L}, static_cast<float>(B * Q), mask_logits.options());
-    torch::Tensor unmatched_per_layer = per_layer_total - per_layer_matched;
-    const bool has_unmatched = matched_dts < (L * B * Q);
-
     const bool has_num_masks = num_masks > 0.0;
 
     torch::Tensor mask_denom;
@@ -373,10 +370,8 @@ std::vector<torch::Tensor> mask_matching_backward(
     torch::Tensor inv_mask_denom = mask_denom.reciprocal().contiguous();
 
     torch::Tensor cls_denom;
-    if (force_unmatched_class_to_background) {
+    if (force_unmatched_class_to_background || has_void_class) {
         cls_denom = per_layer_total.clone();
-    } else if (has_void_class && has_unmatched) {
-        cls_denom = per_layer_matched + unmatched_per_layer;
     } else if (has_num_masks) {
         cls_denom = torch::full({L}, static_cast<float>(num_masks), mask_logits.options());
     } else {

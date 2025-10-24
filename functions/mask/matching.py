@@ -595,7 +595,7 @@ def mask_matching_py(
     total_queries = L * B * C
     unmatched_dts = total_queries - matched_dts
 
-    if (force_unmatched_masks_to_empty or force_unmatched_class_to_background) and total_queries > 0:
+    if (force_unmatched_masks_to_empty or force_unmatched_class_to_background or has_void_class):
         assigned_pred = torch.zeros((L, B, C), device=mask_logits.device, dtype=torch.bool)
         if matched_dts > 0:
             assigned_pred[l_idx, b_idx, p_idx] = True
@@ -665,11 +665,8 @@ def mask_matching_py(
     else:
         mask_denom = per_layer_matched
 
-    unmatched_per_layer = queries_per_layer - per_layer_matched
-    if force_unmatched_class_to_background:
+    if force_unmatched_class_to_background or has_void_class:
         cls_denom = queries_per_layer
-    elif has_void_class and unmatched_dts > 0:
-        cls_denom = per_layer_matched + unmatched_per_layer
     elif num_masks is not None and num_masks > 0:
         cls_denom = layer_mask_sum.new_full((L,), float(num_masks))
     else:
