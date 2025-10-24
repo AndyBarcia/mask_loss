@@ -67,7 +67,10 @@ __global__ void mask_matching_forward_kernel(
         return;
     }
 
-    if (!(ForceMasks || ForceClass)) {
+    const bool process_masks = ForceMasks;
+    const bool process_class = ForceClass || has_void_class;
+
+    if (!(process_masks || process_class)) {
         return;
     }
 
@@ -79,19 +82,20 @@ __global__ void mask_matching_forward_kernel(
     float* sh_void_pos = nullptr;
     float* sh_void_neg = nullptr;
 
-    if (ForceMasks) {
+    if (process_masks) {
         sh_bce_mask = cursor;
         cursor += blockDim.x;
         sh_sigmoid = cursor;
         cursor += blockDim.x;
     }
-    if (ForceClass) {
+    if (process_class) {
         sh_bce_cls = cursor;
         cursor += blockDim.x;
         if (has_void_class) {
             sh_void_pos = cursor;
             cursor += blockDim.x;
             sh_void_neg = cursor;
+            cursor += blockDim.x;
         }
     }
 
@@ -99,7 +103,7 @@ __global__ void mask_matching_forward_kernel(
     const float alpha_pos = (alpha >= 0.0f) ? alpha : 1.0f;
     const float alpha_neg = (alpha >= 0.0f) ? (1.0f - alpha) : 1.0f;
 
-    if (ForceMasks) {
+    if (process_masks) {
         const int64_t HW = H * W;
         const int64_t base = pred_index * HW;
         float sum_bce = 0.0f;
@@ -119,7 +123,7 @@ __global__ void mask_matching_forward_kernel(
         sh_sigmoid[threadIdx.x] = sum_sigmoid;
     }
 
-    if (ForceClass) {
+    if (process_class) {
         const int64_t base_cls = pred_index * C;
         float sum_neg = 0.0f;
         float void_pos = 0.0f;
@@ -150,7 +154,9 @@ __global__ void mask_matching_forward_kernel(
                 void_pos = alpha_pos * mod_pos * ce_pos;
             }
         }
-        sh_bce_cls[threadIdx.x] = sum_neg;
+        if (sh_bce_cls) {
+            sh_bce_cls[threadIdx.x] = sum_neg;
+        }
         if (has_void_class) {
             sh_void_pos[threadIdx.x] = void_pos;
             sh_void_neg[threadIdx.x] = void_neg;
@@ -159,7 +165,7 @@ __global__ void mask_matching_forward_kernel(
 
     __syncthreads();
 
-    if (ForceMasks) {
+    if (process_masks) {
         for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
             if (threadIdx.x < stride) {
                 sh_bce_mask[threadIdx.x] += sh_bce_mask[threadIdx.x + stride];
@@ -177,11 +183,13 @@ __global__ void mask_matching_forward_kernel(
         }
     }
 
-    if (ForceClass) {
+    if (process_class) {
         __syncthreads();
         for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
             if (threadIdx.x < stride) {
-                sh_bce_cls[threadIdx.x] += sh_bce_cls[threadIdx.x + stride];
+                if (sh_bce_cls) {
+                    sh_bce_cls[threadIdx.x] += sh_bce_cls[threadIdx.x + stride];
+                }
                 if (has_void_class) {
                     sh_void_pos[threadIdx.x] += sh_void_pos[threadIdx.x + stride];
                     sh_void_neg[threadIdx.x] += sh_void_neg[threadIdx.x + stride];
@@ -193,7 +201,7 @@ __global__ void mask_matching_forward_kernel(
             float cls_loss = 0.0f;
             if (force_unmatched_class_to_background) {
                 const float inv_C = (C > 0) ? (1.0f / static_cast<float>(C)) : 0.0f;
-                cls_loss = sh_bce_cls[0] * inv_C;
+                cls_loss = sh_bce_cls ? (sh_bce_cls[0] * inv_C) : 0.0f;
                 if (has_void_class && C > 0) {
                     cls_loss += (sh_void_pos[0] - sh_void_neg[0]) * inv_C;
                 }
@@ -451,12 +459,6 @@ std::vector<torch::Tensor> mask_matching_forward(
     auto matches_f = matches.to(layer_mask_sum.dtype());
     torch::Tensor per_layer_matched = matches_f.sum({1, 2});
     torch::Tensor per_layer_total = torch::full({L}, static_cast<float>(B * Q), layer_mask_sum.options());
-    auto matches_long = matches.to(torch::kLong);
-    const int64_t matched_total = matches_long.sum().item<int64_t>();
-    const int64_t total_queries = L * B * Q;
-    const bool has_unmatched = matched_total < total_queries;
-    torch::Tensor unmatched_per_layer = per_layer_total - per_layer_matched;
-
     const bool has_num_masks = num_masks > 0.0;
 
     torch::Tensor mask_denom;
@@ -469,10 +471,8 @@ std::vector<torch::Tensor> mask_matching_forward(
     }
 
     torch::Tensor cls_denom;
-    if (force_unmatched_class) {
+    if (force_unmatched_class || has_void_class) {
         cls_denom = per_layer_total.clone();
-    } else if (has_void_class && has_unmatched) {
-        cls_denom = per_layer_matched + unmatched_per_layer;
     } else if (has_num_masks) {
         cls_denom = torch::full({L}, static_cast<float>(num_masks), layer_mask_sum.options());
     } else {
