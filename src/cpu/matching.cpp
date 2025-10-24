@@ -22,8 +22,10 @@ torch::Tensor pairwise_mask_loss_forward(
     const float dice_scale = 1.0,
     const float cls_scale = 1.0f,
     int64_t background_index = -1,
-    const float gamma = 0.0f,
-    const float alpha = -1.0f
+    const float mask_gamma = 0.0f,
+    const float mask_alpha = -1.0f,
+    const float cls_gamma = 0.0f,
+    const float cls_alpha = -1.0f
 );
 
 // Computes matched and unmatched query losses on CUDA and returns the per-layer
@@ -37,8 +39,10 @@ std::vector<torch::Tensor> mask_matching_forward(
     const float sigmoid_scale,
     const float dice_scale,
     const float cls_scale,
-    const float gamma,
-    const float alpha,
+    const float mask_gamma,
+    const float mask_alpha,
+    const float cls_gamma,
+    const float cls_alpha,
     const int64_t target_H,
     const int64_t target_W,
     const double num_masks,
