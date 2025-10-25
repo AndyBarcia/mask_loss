@@ -31,12 +31,12 @@ class PairwiseMaskLossFunction(Function):
         dice_scale,
         cls_scale,
         background_index,
-        mask_focal_gamma=None,
-        mask_focal_alpha=None,
-        cls_focal_gamma=None,
-        cls_focal_alpha=None,
-        uncertainty_gamma=None,
-        uncertainty_gamma_min=None,
+        uncertainty_gamma,
+        uncertainty_gamma_min,
+        mask_focal_gamma,
+        mask_focal_alpha,
+        cls_focal_gamma,
+        cls_focal_alpha,
         label_loss: str = "sigmoid",
     ):
         L, B, C, h, w = mask_logits.shape

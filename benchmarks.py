@@ -497,7 +497,7 @@ def test_pw_softmax_label_loss():
 
 def test_pw_mask_loss():
     """Test the CUDA implementation of pairwise mask loss"""
-    L, B, Q, C, H, W = 1, 2, 128, 128, 256, 256
+    L, B, Q, C, H, W = 10, 4, 128, 128, 256, 256
     H_t, W_t = 1024, 1024
 
     input_creators = {
@@ -509,7 +509,14 @@ def test_pw_mask_loss():
         "sigmoid_scale": 1.0,
         "dice_scale": 1.0,
         "cls_scale": 1.0,
-        "background_index": 0
+        "background_index": 0,
+        "uncertainty_gamma": 1.0,
+        "uncertainty_gamma_min": 0.05,
+        "mask_focal_gamma": 2.0,
+        "mask_focal_alpha": None,
+        "cls_focal_gamma": 2.0,
+        "cls_focal_alpha": None,
+        "label_loss": "softmax",
     }
     
     arg_order = [
@@ -521,7 +528,14 @@ def test_pw_mask_loss():
         "sigmoid_scale", 
         "dice_scale", 
         "cls_scale",
-        "background_index"
+        "background_index",
+        "uncertainty_gamma",
+        "uncertainty_gamma_min",
+        "mask_focal_gamma",
+        "mask_focal_alpha",
+        "cls_focal_gamma",
+        "cls_focal_alpha",
+        "label_loss",
     ]
     
     tester = CUDAKernelTester(
@@ -552,7 +566,7 @@ def test_mask_matching():
         "uncertainty_gamma_min": 0.05,
         "inf_thresh": 1e30,
         "num_masks": 5,
-        "force_unmatched_class_to_background": False,
+        "force_unmatched_class_to_background": True,
         "force_unmatched_masks_to_empty": False,
         "K": 1,
         "assignment_strategy": "global",
@@ -561,6 +575,7 @@ def test_mask_matching():
         "cls_focal_gamma": 0.0,
         "cls_focal_alpha": None,
         "void_class_index": C-1,
+        "label_loss": "softmax"
     }
 
     arg_order = [
@@ -586,6 +601,7 @@ def test_mask_matching():
         "cls_focal_gamma",
         "cls_focal_alpha",
         "void_class_index",
+        "label_loss"
     ]
     
     tester = CUDAKernelTester(
@@ -598,5 +614,5 @@ def test_mask_matching():
     tester.run()
 
 if __name__ == "__main__":
-    test_pw_softmax_label_loss()
+    test_mask_matching()
     #test_pw_sigmoid_ce_loss()
