@@ -24,6 +24,8 @@ class PairwiseSigmoidCELossFunction(Function):
         scale,
         focal_gamma,
         focal_alpha,
+        uncertainty_gamma=None,
+        uncertainty_gamma_min=None,
     ):
         L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
@@ -40,6 +42,18 @@ class PairwiseSigmoidCELossFunction(Function):
             fa = float(focal_alpha)
             if not (0.0 <= fa <= 1.0):
                 raise ValueError("focal_alpha must be in [0, 1]")
+        if uncertainty_gamma is None:
+            ug = 1.0
+        else:
+            ug = float(uncertainty_gamma)
+            if ug < 0.0:
+                raise ValueError("uncertainty_gamma must be non-negative")
+        if uncertainty_gamma_min is None:
+            ug_min = 0.05
+        else:
+            ug_min = float(uncertainty_gamma_min)
+            if not (0.0 <= ug_min <= 1.0):
+                raise ValueError("uncertainty_gamma_min must be in [0, 1]")
         output = mask_loss.forward_pw_sigmoid_ce_loss(
             logits,
             targets,
@@ -47,12 +61,14 @@ class PairwiseSigmoidCELossFunction(Function):
             scale if scale is not None else 1.0,
             fg,
             fa,
+            ug,
+            ug_min,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
 
 def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
     logits,

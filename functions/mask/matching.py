@@ -42,6 +42,8 @@ class MaskMatchingFunction(Function):
         dice_scale,
         cls_scale,
         background_index,
+        uncertainty_gamma,
+        uncertainty_gamma_min,
         inf_thresh,
         num_masks,
         force_unmatched_class_to_background,
@@ -109,6 +111,12 @@ class MaskMatchingFunction(Function):
         dice_scale_val = float(dice_scale if dice_scale is not None else 1.0)
         cls_scale = float(cls_scale if cls_scale is not None else 1.0)
         background_index_val = int(background_index if background_index is not None else -1)
+        uncertainty_gamma_val = float(uncertainty_gamma if uncertainty_gamma is not None else 1.0)
+        if uncertainty_gamma_val < 0.0:
+            raise ValueError("uncertainty_gamma must be non-negative")
+        uncertainty_gamma_min_val = float(uncertainty_gamma_min if uncertainty_gamma_min is not None else 0.05)
+        if not (0.0 <= uncertainty_gamma_min_val <= 1.0):
+            raise ValueError("uncertainty_gamma_min must be in [0, 1]")
         inf_thresh_val = float(inf_thresh if inf_thresh is not None else 1e30)
         num_masks_val = float(num_masks if num_masks is not None else -1.0)
         force_unmatched_cls = bool(
@@ -180,6 +188,8 @@ class MaskMatchingFunction(Function):
             dice_scale_val,
             cls_scale,
             background_index_val,
+            uncertainty_gamma_val,
+            uncertainty_gamma_min_val,
             inf_thresh_val,
             num_masks_val,
             force_unmatched_cls,
@@ -206,6 +216,8 @@ class MaskMatchingFunction(Function):
         ctx.dice_scale = dice_scale_val
         ctx.cls_scale = cls_scale
         ctx.background_index = background_index_val
+        ctx.uncertainty_gamma = uncertainty_gamma_val
+        ctx.uncertainty_gamma_min = uncertainty_gamma_min_val
         ctx.num_masks = num_masks_val
         ctx.force_unmatched_cls = force_unmatched_cls
         ctx.force_unmatched_masks = force_unmatched_masks
@@ -258,6 +270,8 @@ class MaskMatchingFunction(Function):
             dice_scale,
             cls_scale,
             background_index,
+            ctx.uncertainty_gamma,
+            ctx.uncertainty_gamma_min,
             num_masks,
             force_unmatched_cls,
             force_unmatched_masks,
@@ -272,6 +286,8 @@ class MaskMatchingFunction(Function):
             grad_mask_logits,
             None,
             grad_cls_logits,
+            None,
+            None,
             None,
             None,
             None,

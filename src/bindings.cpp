@@ -25,7 +25,9 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     int64_t background_index = -1,
     const float scale = 1.0f,
     const float gamma = 0.0f,
-    const float alpha = -1.0f
+    const float alpha = -1.0f,
+    const float uncertainty_gamma = 1.0f,
+    const float uncertainty_gamma_min = 0.05f
 );
 
 std::vector<torch::Tensor> dice_loss_forward(
@@ -53,7 +55,9 @@ torch::Tensor pairwise_dice_loss_forward(
     const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float smooth,
     int64_t background_index = -1,
-    const float scale = 1.0f
+    const float scale = 1.0f,
+    const float uncertainty_gamma = 1.0f,
+    const float uncertainty_gamma_min = 0.05f
 );
 
 torch::Tensor pairwise_mask_loss_forward(
@@ -66,6 +70,8 @@ torch::Tensor pairwise_mask_loss_forward(
     const float dice_scale = 1.0,
     const float cls_scale = 1.0f,
     int64_t background_index = -1,
+    const float uncertainty_gamma = 1.0f,
+    const float uncertainty_gamma_min = 0.05f,
     const float mask_gamma = 0.0f,
     const float mask_alpha = -1.0f,
     const float cls_gamma = 0.0f,
@@ -84,6 +90,8 @@ std::vector<torch::Tensor> mask_matching(
     float   dice_scale      = 1.0f,
     float   cls_scale       = 1.0f,
     int64_t background_index= -1,
+    float   uncertainty_gamma = 1.0f,
+    float   uncertainty_gamma_min = 0.05f,
     double  inf_thresh      = 1e30,
     double  num_masks       = -1.0,
     bool    force_unmatched_class_to_background = false,
@@ -111,6 +119,8 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float dice_scale,
     const float cls_scale,
     int64_t background_index,
+    const float uncertainty_gamma,
+    const float uncertainty_gamma_min,
     const double num_masks,
     const bool force_unmatched_class_to_background,
     const bool force_unmatched_masks_to_empty,

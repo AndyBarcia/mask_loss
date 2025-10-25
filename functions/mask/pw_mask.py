@@ -34,6 +34,8 @@ class PairwiseMaskLossFunction(Function):
         mask_focal_alpha=None,
         cls_focal_gamma=None,
         cls_focal_alpha=None,
+        uncertainty_gamma=None,
+        uncertainty_gamma_min=None,
     ):
         L, B, C, h, w = mask_logits.shape
         B_t, H_t, W_t = mask_targets.shape
@@ -64,6 +66,18 @@ class PairwiseMaskLossFunction(Function):
             cls_fa = float(cls_focal_alpha)
             if not (0.0 <= cls_fa <= 1.0):
                 raise ValueError("focal_alpha must be in [0, 1]")
+        if uncertainty_gamma is None:
+            ug = 1.0
+        else:
+            ug = float(uncertainty_gamma)
+            if ug < 0.0:
+                raise ValueError("uncertainty_gamma must be non-negative")
+        if uncertainty_gamma_min is None:
+            ug_min = 0.05
+        else:
+            ug_min = float(uncertainty_gamma_min)
+            if not (0.0 <= ug_min <= 1.0):
+                raise ValueError("uncertainty_gamma_min must be in [0, 1]")
         output = mask_loss.pairwise_mask_loss_forward(
             mask_logits,
             mask_targets,
@@ -74,6 +88,8 @@ class PairwiseMaskLossFunction(Function):
             dice_scale if dice_scale is not None else 1.0,
             cls_scale if cls_scale is not None else 1.0,
             background_index if background_index is not None else -1,
+            ug,
+            ug_min,
             mask_fg,
             mask_fa,
             cls_fg,
@@ -83,7 +99,7 @@ class PairwiseMaskLossFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        return (None,) * 13
+        return (None,) * 15
 
 
 def pairwise_mask_loss_py(

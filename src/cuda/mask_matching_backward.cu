@@ -39,7 +39,9 @@ __global__ void mask_matching_backward_kernel(
     const float* __restrict__ inv_denom,
     const int64_t background_index,
     const float mask_gamma,
-    const float mask_alpha
+    const float mask_alpha,
+    const float uncertainty_gamma,
+    const float uncertainty_gamma_min
 ) {
     const int64_t q = blockIdx.x;
     const int64_t b = blockIdx.y;
@@ -80,20 +82,28 @@ __global__ void mask_matching_backward_kernel(
     __shared__ float sh_mask_sum;
     __shared__ float sh_target_sum;
     __shared__ float sh_inter_sum;
+    __shared__ float sh_weight_sum;
     if (threadIdx.x == 0) {
         sh_mask_sum = 0.0f;
         sh_target_sum = 0.0f;
         sh_inter_sum = 0.0f;
+        sh_weight_sum = 0.0f;
     }
     __syncthreads();
 
     float local_mask_sum = 0.0f;
     float local_target_sum = 0.0f;
     float local_inter_sum = 0.0f;
+    float local_weight_sum = 0.0f;
 
     const bool use_gamma = mask_gamma > 0.0f;
     const float alpha_pos = (mask_alpha >= 0.0f) ? mask_alpha : 1.0f;
     const float alpha_neg = (mask_alpha >= 0.0f) ? (1.0f - mask_alpha) : 1.0f;
+    const bool use_uncertainty = uncertainty_gamma != 0.0f;
+    const float inv_log2 = 1.4426950408889634f;
+    const float weight_eps = 1e-12f;
+    const float spatial_elements = static_cast<float>(H * W);
+    const float sigmoid_scale_total = sigmoid_factor * spatial_elements * area_scale;
 
     for (int64_t idx = threadIdx.x; idx < HW; idx += blockDim.x) {
         const int64_t h = idx / W;
@@ -103,14 +113,25 @@ __global__ void mask_matching_backward_kernel(
         const float logit = logits[logits_offset];
         const float prob = 1.0f / (1.0f + expf(-logit));
         const float prob_scaled = prob * area_scale;
+        float weight = 1.0f;
+        if (use_uncertainty) {
+            const float prob_clamped = fminf(fmaxf(prob, weight_eps), 1.0f - weight_eps);
+            float entropy = -(prob_clamped * logf(prob_clamped)
+                + (1.0f - prob_clamped) * logf(1.0f - prob_clamped));
+            entropy *= inv_log2;
+            weight = powf(entropy, uncertainty_gamma);
+        }
+        weight = fminf(1.0f, fmaxf(weight, uncertainty_gamma_min));
+        const float weight_area = weight * area_scale;
         float target = 0.0f;
         if (is_matched) {
             target = static_cast<float>(counts_ptr[h * W + w]);
         }
 
-        local_mask_sum += prob_scaled;
-        local_target_sum += target;
-        local_inter_sum += prob * target;
+        local_mask_sum += weight * prob_scaled;
+        local_target_sum += weight * target;
+        local_inter_sum += weight * prob * target;
+        local_weight_sum += weight_area;
 
     }
 
@@ -118,11 +139,18 @@ __global__ void mask_matching_backward_kernel(
     atomicAdd(&sh_mask_sum, local_mask_sum);
     atomicAdd(&sh_target_sum, local_target_sum);
     atomicAdd(&sh_inter_sum, local_inter_sum);
+    atomicAdd(&sh_weight_sum, local_weight_sum);
     __syncthreads();
 
     const float mask_sum = sh_mask_sum;
     const float target_sum = sh_target_sum;
     const float inter_sum = sh_inter_sum;
+    float weight_total = sh_weight_sum;
+    if (weight_total < weight_eps) {
+        weight_total = weight_eps;
+    }
+    const float inv_weight_total = 1.0f / weight_total;
+    const float sigmoid_factor_mask = sigmoid_scale_total * inv_weight_total;
 
     const float denom = mask_sum + target_sum + smooth;
     const float numerator = inter_sum * 2.0f + smooth;
@@ -150,6 +178,15 @@ __global__ void mask_matching_backward_kernel(
         const float ce_pos = logexp + max_neg_logit;
         const float mod_neg = use_gamma ? powf(prob, mask_gamma) : 1.0f;
         const float mod_pos = use_gamma ? powf(one_minus, mask_gamma) : 1.0f;
+        float weight = 1.0f;
+        if (use_uncertainty) {
+            const float prob_clamped = fminf(fmaxf(prob, weight_eps), 1.0f - weight_eps);
+            float entropy = -(prob_clamped * logf(prob_clamped)
+                + (1.0f - prob_clamped) * logf(1.0f - prob_clamped));
+            entropy *= inv_log2;
+            weight = powf(entropy, uncertainty_gamma);
+        }
+        weight = fminf(1.0f, fmaxf(weight, uncertainty_gamma_min));
 
         float target = 0.0f;
         if (is_matched) {
@@ -160,12 +197,12 @@ __global__ void mask_matching_backward_kernel(
         if (neg_count < 0.0f) {
             neg_count = 0.0f;
         }
-        const float grad_pos = -alpha_pos * target * mod_pos * (mask_gamma * prob * ce_pos + one_minus);
-        const float grad_neg = alpha_neg * neg_count * mod_neg * (mask_gamma * one_minus * ce_neg + prob);
-        const float grad_sigmoid = (grad_pos + grad_neg) * sigmoid_factor;
+        const float grad_pos = -weight * alpha_pos * target * mod_pos * (mask_gamma * prob * ce_pos + one_minus);
+        const float grad_neg = weight * alpha_neg * neg_count * mod_neg * (mask_gamma * one_minus * ce_neg + prob);
+        const float grad_sigmoid = (grad_pos + grad_neg) * sigmoid_factor_mask;
 
-        const float d_inter = prob_prime * target;
-        const float d_denom = prob_prime * area_scale;
+        const float d_inter = weight * prob_prime * target;
+        const float d_denom = weight * prob_prime * area_scale;
         const float grad_dice = (numerator * d_denom - two_denom * d_inter) * inv_denom_sq * dice_scale;
 
         const float grad = mask_coeff * grad_sigmoid + dice_coeff * grad_dice;
@@ -279,6 +316,8 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float dice_scale,
     const float cls_scale,
     int64_t background_index,
+    const float uncertainty_gamma,
+    const float uncertainty_gamma_min,
     const double num_masks,
     const bool force_unmatched_class_to_background,
     const bool force_unmatched_masks_to_empty,
@@ -307,6 +346,10 @@ std::vector<torch::Tensor> mask_matching_backward(
     TORCH_CHECK(cls_gamma >= 0.0f, "mask_matching_backward: cls focal_gamma must be non-negative");
     TORCH_CHECK(cls_alpha < 0.0f || (cls_alpha >= 0.0f && cls_alpha <= 1.0f),
         "mask_matching_backward: cls focal_alpha must be in [0,1] or negative to disable");
+    TORCH_CHECK(uncertainty_gamma >= 0.0f,
+        "mask_matching_backward: uncertainty_gamma must be non-negative");
+    TORCH_CHECK(uncertainty_gamma_min >= 0.0f && uncertainty_gamma_min <= 1.0f,
+        "mask_matching_backward: uncertainty_gamma_min must be in [0,1]");
 
     const auto device = mask_logits.device();
     TORCH_CHECK(mask_targets.device() == device, "mask_targets must be on the same device as mask_logits");
@@ -459,7 +502,9 @@ std::vector<torch::Tensor> mask_matching_backward(
                 inv_mask_denom.data_ptr<float>(),
                 background_index,
                 mask_gamma,
-                mask_alpha
+                mask_alpha,
+                uncertainty_gamma,
+                uncertainty_gamma_min
             );
             CHECK_CUDA_ERROR(cudaGetLastError());
         }

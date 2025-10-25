@@ -21,7 +21,9 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_d
     const int L,
     const float smooth,
     const int background_index,
-    const float scale
+    const float scale,
+    const float uncertainty_gamma,
+    const float uncertainty_gamma_min
 ) {
     // Shared memory for performing the reduction of the three Dice components
     __shared__ float s_intersection[REDUCTION_THREADS_PER_BLOCK];
@@ -50,6 +52,10 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_d
     const int s = H_t / H;
     const float N2 = static_cast<float>(s * s);
 
+    const float eps = 1e-12f;
+    const float inv_log2 = 1.4426950408889634f;
+    const bool use_gamma = uncertainty_gamma != 0.0f;
+
     float thread_intersection_sum = 0.0f;
     float thread_p_sum = 0.0f;
     float thread_t_sum = 0.0f;
@@ -61,11 +67,18 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_d
 
         float L = logits[((l * B + b) * C + ci) * H * W + i * W + j];
         float p = 1.0f / (1.0f + expf(-L));
+        float p_clamped = fminf(fmaxf(p, eps), 1.0f - eps);
+        float entropy = -(p_clamped * logf(p_clamped)
+            + (1.0f - p_clamped) * logf(1.0f - p_clamped));
+        entropy *= inv_log2;
+        float weight = use_gamma ? powf(entropy, uncertainty_gamma) : 1.0f;
+        weight = fminf(1.0f, fmaxf(weight, uncertainty_gamma_min));
+
         float n = static_cast<float>(counts[((b * GT_total + gt_actual) * H + i) * W + j]);
 
-        thread_intersection_sum += p * n;
-        thread_p_sum += N2 * p;
-        thread_t_sum += n;
+        thread_intersection_sum += weight * p * n;
+        thread_p_sum += N2 * weight * p;
+        thread_t_sum += weight * n;
     }
 
     // Store each thread's accumulated sums into shared memory
@@ -100,7 +113,9 @@ torch::Tensor pairwise_dice_loss_forward(
     const torch::Tensor& targets,  // (B,H_t,W_t), int64
     const float smooth,
     int64_t background_index = -1,
-    const float scale = 1.0f
+    const float scale = 1.0f,
+    const float uncertainty_gamma = 1.0f,
+    const float uncertainty_gamma_min = 0.05f
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -183,7 +198,9 @@ torch::Tensor pairwise_dice_loss_forward(
                     GT_out,
                     B, L, smooth,
                     background_index,
-                    scale
+                    scale,
+                    uncertainty_gamma,
+                    uncertainty_gamma_min
                 );
         };
 

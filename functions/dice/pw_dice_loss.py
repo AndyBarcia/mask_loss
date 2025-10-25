@@ -14,7 +14,16 @@ except ImportError:
 
 class PairwiseDiceLossFunction(Function):
     @staticmethod
-    def forward(ctx, logits, targets, smooth, background_index, scale):
+    def forward(
+        ctx,
+        logits,
+        targets,
+        smooth,
+        background_index,
+        scale,
+        uncertainty_gamma=None,
+        uncertainty_gamma_min=None,
+    ):
         L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
         assert B == B_t, "Batch size mismatch between logits and targets"
@@ -22,18 +31,30 @@ class PairwiseDiceLossFunction(Function):
         logits = logits.contiguous().float()
         targets = targets.contiguous()
 
+        ug = 1.0 if uncertainty_gamma is None else float(uncertainty_gamma)
+        if ug < 0.0:
+            raise ValueError("uncertainty_gamma must be non-negative")
+        if uncertainty_gamma_min is None:
+            ug_min = 0.05
+        else:
+            ug_min = float(uncertainty_gamma_min)
+            if not (0.0 <= ug_min <= 1.0):
+                raise ValueError("uncertainty_gamma_min must be in [0, 1]")
+
         output = mask_loss.forward_pw_dice_loss(
-            logits, 
-            targets, 
+            logits,
+            targets,
             smooth if smooth is not None else 1.0,
             background_index if background_index is not None else -1,
-            scale if scale is not None else 1.0
+            scale if scale is not None else 1.0,
+            ug,
+            ug_min,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
 def pairwise_dice_loss_py(
     logits: torch.Tensor,

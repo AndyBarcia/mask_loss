@@ -50,7 +50,9 @@ reduce_pairwise_sigmoid_dice_kernel(
     const float sigmoid_scale,
     const float dice_scale,
     const float mask_gamma,
-    const float mask_alpha
+    const float mask_alpha,
+    const float uncertainty_gamma,
+    const float uncertainty_gamma_min
 ) {
     constexpr int TILE_H = 32;
     constexpr int TILE_W = 32;
@@ -59,6 +61,7 @@ reduce_pairwise_sigmoid_dice_kernel(
     __shared__ float s_logits[TILE_H * TILE_W];
     __shared__ float s_warp_a[NUM_WARPS];
     __shared__ float s_warp_b[NUM_WARPS];
+    __shared__ float s_warp_c[NUM_WARPS];
 
     const int l  = blockIdx.x;
     const int b  = blockIdx.y;
@@ -72,13 +75,16 @@ reduce_pairwise_sigmoid_dice_kernel(
 
     const int s = H_t / H;
     const float N2 = static_cast<float>(s * s);
-    const float denom = static_cast<float>(H_t * W_t);
     const float alpha_pos = (mask_alpha >= 0.0f) ? mask_alpha : 1.0f;
     const float alpha_neg = (mask_alpha >= 0.0f) ? (1.0f - mask_alpha) : 1.0f;
     const bool use_gamma = (mask_gamma > 0.0f);
+    const bool use_uncertainty = (uncertainty_gamma != 0.0f);
+    const float inv_log2 = 1.4426950408889634f;
+    const float eps = 1e-12f;
 
     float thread_base = 0.f;
     float thread_p_total = 0.f;
+    float thread_weight_sum = 0.f;
 
     // Stage 1: iterate over the low-resolution logits to compute BCE terms that
     // do not depend on the ground-truth masks.  We also accumulate the total
@@ -105,10 +111,17 @@ reduce_pairwise_sigmoid_dice_kernel(
                 const float logexp = log1pf(__expf(-absL));
                 const float ce_neg = logexp + maxL;
                 const float p = 1.f / (1.f + __expf(-Lij));
+                const float p_clamped = fminf(fmaxf(p, eps), 1.0f - eps);
+                float entropy = -(p_clamped * logf(p_clamped)
+                    + (1.0f - p_clamped) * logf(1.0f - p_clamped));
+                entropy *= inv_log2;
+                float weight = use_uncertainty ? powf(entropy, uncertainty_gamma) : 1.0f;
+                weight = fminf(1.0f, fmaxf(weight, uncertainty_gamma_min));
                 const float mod_neg = use_gamma ? powf(p, mask_gamma) : 1.0f;
                 const float coeff_neg = alpha_neg * mod_neg * ce_neg;
-                thread_base += N2 * coeff_neg;
-                thread_p_total += N2 * p;
+                thread_base += N2 * weight * coeff_neg;
+                thread_p_total += N2 * weight * p;
+                thread_weight_sum += N2 * weight;
             }
             __syncthreads();
         }
@@ -150,6 +163,25 @@ reduce_pairwise_sigmoid_dice_kernel(
     p_total = (tid == 0) ? s_warp_a[0] : 0.f;
     p_total = __shfl_sync(0xffffffff, p_total, 0);
 
+    float weight_total = thread_weight_sum;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        weight_total += __shfl_down_sync(0xffffffff, weight_total, off);
+    }
+    if ((tid & 31) == 0) {
+        s_warp_a[tid >> 5] = weight_total;
+    }
+    __syncthreads();
+    for (int sred = NUM_WARPS >> 1; sred > 0; sred >>= 1) {
+        if (tid < sred) {
+            s_warp_a[tid] += s_warp_a[tid + sred];
+        }
+        __syncthreads();
+    }
+    weight_total = (tid == 0) ? s_warp_a[0] : 0.f;
+    weight_total = __shfl_sync(0xffffffff, weight_total, 0);
+    weight_total = fmaxf(weight_total, eps);
+
     // Stage 2: iterate over each ground-truth mask, reusing the cached logits
     // and shared sigmoid mass to finish the BCE and Dice computations.
     for (int out_gt_idx = 0; out_gt_idx < GT_out; ++out_gt_idx) {
@@ -166,6 +198,7 @@ reduce_pairwise_sigmoid_dice_kernel(
 
         float thread_ce = 0.f;
         float thread_intersection = 0.f;
+        float thread_weighted_target = 0.f;
 
         // Pointer to the spatial counts for the current ground-truth mask at
         // the down-sampled (H, W) resolution.
@@ -202,13 +235,20 @@ reduce_pairwise_sigmoid_dice_kernel(
                         const float ce_pos = logexp + maxNegL;
                         const float p = 1.f / (1.f + __expf(-Lij));
                         const float one_minus = 1.f - p;
+                        const float p_clamped = fminf(fmaxf(p, eps), 1.0f - eps);
+                        float entropy = -(p_clamped * logf(p_clamped)
+                            + (1.0f - p_clamped) * logf(1.0f - p_clamped));
+                        entropy *= inv_log2;
+                        float weight = use_uncertainty ? powf(entropy, uncertainty_gamma) : 1.0f;
+                        weight = fminf(1.0f, fmaxf(weight, uncertainty_gamma_min));
                         const float mod_neg = use_gamma ? powf(p, mask_gamma) : 1.0f;
                         const float mod_pos = use_gamma ? powf(one_minus, mask_gamma) : 1.0f;
                         const float coeff_neg = alpha_neg * mod_neg * ce_neg;
                         const float coeff_pos = alpha_pos * mod_pos * ce_pos;
-                        const float coeff_delta = coeff_pos - coeff_neg;
+                        const float coeff_delta = weight * (coeff_pos - coeff_neg);
                         thread_ce += coeff_delta * fn;
-                        thread_intersection += p * fn;
+                        thread_intersection += weight * p * fn;
+                        thread_weighted_target += weight * fn;
                     }
                 }
                 __syncthreads();
@@ -219,24 +259,27 @@ reduce_pairwise_sigmoid_dice_kernel(
         for (int off = 16; off > 0; off >>= 1) {
             thread_ce += __shfl_down_sync(0xffffffff, thread_ce, off);
             thread_intersection += __shfl_down_sync(0xffffffff, thread_intersection, off);
+            thread_weighted_target += __shfl_down_sync(0xffffffff, thread_weighted_target, off);
         }
         if ((tid & 31) == 0) {
             s_warp_a[tid >> 5] = thread_ce;
             s_warp_b[tid >> 5] = thread_intersection;
+            s_warp_c[tid >> 5] = thread_weighted_target;
         }
         __syncthreads();
         for (int sred = NUM_WARPS >> 1; sred > 0; sred >>= 1) {
             if (tid < sred) {
                 s_warp_a[tid] += s_warp_a[tid + sred];
                 s_warp_b[tid] += s_warp_b[tid + sred];
+                s_warp_c[tid] += s_warp_c[tid + sred];
             }
             __syncthreads();
         }
 
         if (tid == 0) {
-            const float ce_val = (base_sum + s_warp_a[0]) / denom * sigmoid_scale;
-            const float total_t = static_cast<float>(total_count);
-            const float dice = 1.f - (2.f * s_warp_b[0] + smooth) / (p_total + total_t + smooth);
+            const float ce_val = (base_sum + s_warp_a[0]) / weight_total * sigmoid_scale;
+            const float weighted_target = s_warp_c[0];
+            const float dice = 1.f - (2.f * s_warp_b[0] + smooth) / (p_total + weighted_target + smooth);
             out_bce[out_gt_idx] = ce_val;
             out_dice[out_gt_idx] = dice * dice_scale;
         }
@@ -258,6 +301,8 @@ torch::Tensor pairwise_mask_loss_forward(
     const float dice_scale = 1.0,
     const float cls_scale = 1.0f,
     int64_t background_index = -1,
+    const float uncertainty_gamma = 1.0f,
+    const float uncertainty_gamma_min = 0.05f,
     const float mask_gamma = 0.0f,
     const float mask_alpha = -1.0f,
     const float cls_gamma = 0.0f,
@@ -359,7 +404,9 @@ torch::Tensor pairwise_mask_loss_forward(
                     sigmoid_scale,
                     dice_scale,
                     mask_gamma,
-                    mask_alpha
+                    mask_alpha,
+                    uncertainty_gamma,
+                    uncertainty_gamma_min
                 );
         };
 
