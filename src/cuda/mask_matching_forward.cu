@@ -46,7 +46,8 @@ __global__ void mask_matching_forward_kernel(
     const float cls_alpha,
     const bool force_unmatched_class_to_background,
     const bool has_void_class,
-    const int64_t void_class_index
+    const int64_t void_class_index,
+    const bool use_softmax_label_loss
 ) {
     const int64_t q = blockIdx.x;
     const int64_t b = blockIdx.y;
@@ -83,6 +84,9 @@ __global__ void mask_matching_forward_kernel(
     float* sh_bce_cls = nullptr;
     float* sh_void_pos = nullptr;
     float* sh_void_neg = nullptr;
+    float* sh_softmax_max = nullptr;
+    float* sh_softmax_sum = nullptr;
+    float* sh_softmax_void = nullptr;
 
     if (process_masks) {
         sh_bce_mask = cursor;
@@ -90,23 +94,33 @@ __global__ void mask_matching_forward_kernel(
         sh_sigmoid = cursor;
         cursor += blockDim.x;
     }
+    const bool softmax_background = use_softmax_label_loss && force_unmatched_class_to_background && has_void_class;
     if (process_class) {
-        sh_bce_cls = cursor;
-        cursor += blockDim.x;
-        if (has_void_class) {
-            sh_void_pos = cursor;
+        if (softmax_background) {
+            sh_softmax_max = cursor;
             cursor += blockDim.x;
-            sh_void_neg = cursor;
+            sh_softmax_sum = cursor;
             cursor += blockDim.x;
+            sh_softmax_void = cursor;
+            cursor += blockDim.x;
+        } else {
+            sh_bce_cls = cursor;
+            cursor += blockDim.x;
+            if (has_void_class) {
+                sh_void_pos = cursor;
+                cursor += blockDim.x;
+                sh_void_neg = cursor;
+                cursor += blockDim.x;
+            }
         }
     }
 
     const bool use_mask_gamma = mask_gamma > 0.0f;
     const float mask_alpha_pos = (mask_alpha >= 0.0f) ? mask_alpha : 1.0f;
     const float mask_alpha_neg = (mask_alpha >= 0.0f) ? (1.0f - mask_alpha) : 1.0f;
-    const bool use_cls_gamma = cls_gamma > 0.0f;
-    const float cls_alpha_pos = (cls_alpha >= 0.0f) ? cls_alpha : 1.0f;
-    const float cls_alpha_neg = (cls_alpha >= 0.0f) ? (1.0f - cls_alpha) : 1.0f;
+    const bool use_cls_gamma = (!use_softmax_label_loss) && (cls_gamma > 0.0f);
+    const float cls_alpha_pos = (!use_softmax_label_loss && cls_alpha >= 0.0f) ? cls_alpha : 1.0f;
+    const float cls_alpha_neg = (!use_softmax_label_loss && cls_alpha >= 0.0f) ? (1.0f - cls_alpha) : 1.0f;
 
     if (process_masks) {
         const int64_t HW = H * W;
@@ -130,41 +144,86 @@ __global__ void mask_matching_forward_kernel(
 
     if (process_class) {
         const int64_t base_cls = pred_index * C;
-        float sum_neg = 0.0f;
-        float void_pos = 0.0f;
-        float void_neg = 0.0f;
-        for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
-            const float logit = cls_logits[base_cls + c];
-            const float prob = 1.0f / (1.0f + expf(-logit));
-            const float abs_logit = fabsf(logit);
-            const float max_logit = fmaxf(logit, 0.0f);
-            const float logexp = log1pf(expf(-abs_logit));
-            const float ce_neg = logexp + max_logit;
-            const float mod_neg = use_cls_gamma ? powf(prob, cls_gamma) : 1.0f;
-            const float neg_term = cls_alpha_neg * mod_neg * ce_neg;
-            const bool is_void = has_void_class && (c == void_class_index);
-            if (force_unmatched_class_to_background) {
-                sum_neg += neg_term;
-                if (is_void) {
+        if (softmax_background) {
+            float thread_max = -INFINITY;
+            float thread_void = -INFINITY;
+            for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
+                const float logit = cls_logits[base_cls + c];
+                thread_max = fmaxf(thread_max, logit);
+                if (has_void_class && c == void_class_index) {
+                    thread_void = logit;
+                }
+            }
+            sh_softmax_max[threadIdx.x] = thread_max;
+            sh_softmax_void[threadIdx.x] = thread_void;
+            __syncthreads();
+            for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (threadIdx.x < stride) {
+                    sh_softmax_max[threadIdx.x] = fmaxf(sh_softmax_max[threadIdx.x], sh_softmax_max[threadIdx.x + stride]);
+                    sh_softmax_void[threadIdx.x] = fmaxf(sh_softmax_void[threadIdx.x], sh_softmax_void[threadIdx.x + stride]);
+                }
+                __syncthreads();
+            }
+            const float max_val = sh_softmax_max[0];
+            const float void_logit = sh_softmax_void[0];
+            __syncthreads();
+            float thread_sum = 0.0f;
+            for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
+                const float logit = cls_logits[base_cls + c];
+                thread_sum += __expf(logit - max_val);
+            }
+            sh_softmax_sum[threadIdx.x] = thread_sum;
+            __syncthreads();
+            for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+                if (threadIdx.x < stride) {
+                    sh_softmax_sum[threadIdx.x] += sh_softmax_sum[threadIdx.x + stride];
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) {
+                const float sum_val = sh_softmax_sum[0];
+                const float safe_sum = fmaxf(sum_val, 1e-20f);
+                const float log_denom = logf(safe_sum) + max_val;
+                const float loss = (log_denom - void_logit) * cls_scale;
+                atomicAdd(layer_cls_sum + l, loss);
+            }
+        } else {
+            float sum_neg = 0.0f;
+            float void_pos = 0.0f;
+            float void_neg = 0.0f;
+            for (int64_t c = threadIdx.x; c < C; c += blockDim.x) {
+                const float logit = cls_logits[base_cls + c];
+                const float prob = 1.0f / (1.0f + expf(-logit));
+                const float abs_logit = fabsf(logit);
+                const float max_logit = fmaxf(logit, 0.0f);
+                const float logexp = log1pf(expf(-abs_logit));
+                const float ce_neg = logexp + max_logit;
+                const float mod_neg = use_cls_gamma ? powf(prob, cls_gamma) : 1.0f;
+                const float neg_term = cls_alpha_neg * mod_neg * ce_neg;
+                const bool is_void = has_void_class && (c == void_class_index);
+                if (force_unmatched_class_to_background) {
+                    sum_neg += neg_term;
+                    if (is_void) {
+                        const float one_minus = 1.0f - prob;
+                        const float ce_pos = logexp + fmaxf(-logit, 0.0f);
+                        const float mod_pos = use_cls_gamma ? powf(one_minus, cls_gamma) : 1.0f;
+                        void_pos = cls_alpha_pos * mod_pos * ce_pos;
+                        void_neg = neg_term;
+                    }
+                } else if (is_void) {
                     const float one_minus = 1.0f - prob;
                     const float ce_pos = logexp + fmaxf(-logit, 0.0f);
                     const float mod_pos = use_cls_gamma ? powf(one_minus, cls_gamma) : 1.0f;
                     void_pos = cls_alpha_pos * mod_pos * ce_pos;
-                    void_neg = neg_term;
                 }
-            } else if (is_void) {
-                const float one_minus = 1.0f - prob;
-                const float ce_pos = logexp + fmaxf(-logit, 0.0f);
-                const float mod_pos = use_cls_gamma ? powf(one_minus, cls_gamma) : 1.0f;
-                void_pos = cls_alpha_pos * mod_pos * ce_pos;
             }
-        }
-        if (sh_bce_cls) {
-            sh_bce_cls[threadIdx.x] = sum_neg;
-        }
-        if (has_void_class) {
-            sh_void_pos[threadIdx.x] = void_pos;
-            sh_void_neg[threadIdx.x] = void_neg;
+            if (sh_bce_cls) {
+                sh_bce_cls[threadIdx.x] = sum_neg;
+            }
+            if (has_void_class) {
+                sh_void_pos[threadIdx.x] = void_pos;
+                sh_void_neg[threadIdx.x] = void_neg;
+            }
         }
     }
 
@@ -188,7 +247,7 @@ __global__ void mask_matching_forward_kernel(
         }
     }
 
-    if (process_class) {
+    if (process_class && !softmax_background) {
         __syncthreads();
         for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
             if (threadIdx.x < stride) {
@@ -239,7 +298,8 @@ std::vector<torch::Tensor> mask_matching_forward(
     const double num_masks,
     const bool force_unmatched_masks,
     const bool force_unmatched_class,
-    const int64_t void_class_index
+    const int64_t void_class_index,
+    const bool use_softmax_label_loss
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
     TORCH_CHECK(separate_costs.is_cuda(), "separate_costs must be CUDA");
@@ -305,6 +365,10 @@ std::vector<torch::Tensor> mask_matching_forward(
         void_index = void_class_index;
     }
     bool has_void_class = (void_index >= 0);
+    if (use_softmax_label_loss && force_unmatched_class) {
+        TORCH_CHECK(has_void_class,
+            "void_class_index must be provided when using softmax label loss and forcing unmatched class logits");
+    }
     bool need_unmatched_class = force_unmatched_class || has_void_class;
 
     if (force_unmatched_masks) {
@@ -333,7 +397,10 @@ std::vector<torch::Tensor> mask_matching_forward(
     }
 
     const int mask_shared = force_unmatched_masks ? 2 : 0;
-    const int class_shared = need_unmatched_class ? (1 + (has_void_class ? 2 : 0)) : 0;
+    const bool softmax_background = use_softmax_label_loss && force_unmatched_class && has_void_class;
+    const int class_shared = need_unmatched_class
+        ? (softmax_background ? 3 : (1 + (has_void_class ? 2 : 0)))
+        : 0;
     shared_elems = mask_shared + class_shared;
 
     const int64_t term_stride = L * B * Q * GT_out;
@@ -377,7 +444,8 @@ std::vector<torch::Tensor> mask_matching_forward(
             cls_alpha,
             force_unmatched_class,
             has_void_class,
-            void_index
+            void_index,
+            use_softmax_label_loss
         );
     } else if (force_unmatched_masks) {
         mask_matching_forward_kernel<true, false><<<grid, threads, mask_shared_bytes, stream.stream()>>>(
@@ -407,7 +475,8 @@ std::vector<torch::Tensor> mask_matching_forward(
             cls_alpha,
             false,
             false,
-            -1
+            -1,
+            use_softmax_label_loss
         );
     } else if (need_unmatched_class) {
         mask_matching_forward_kernel<false, true><<<grid, threads, class_shared_bytes, stream.stream()>>>(
@@ -437,7 +506,8 @@ std::vector<torch::Tensor> mask_matching_forward(
             cls_alpha,
             force_unmatched_class,
             has_void_class,
-            void_index
+            void_index,
+            use_softmax_label_loss
         );
     } else {
         mask_matching_forward_kernel<false, false><<<grid, threads, 0, stream.stream()>>>(
@@ -467,7 +537,8 @@ std::vector<torch::Tensor> mask_matching_forward(
             cls_alpha,
             false,
             false,
-            -1
+            -1,
+            use_softmax_label_loss
         );
     }
 

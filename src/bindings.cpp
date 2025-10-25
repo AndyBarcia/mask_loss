@@ -75,7 +75,8 @@ torch::Tensor pairwise_mask_loss_forward(
     const float mask_gamma = 0.0f,
     const float mask_alpha = -1.0f,
     const float cls_gamma = 0.0f,
-    const float cls_alpha = -1.0f
+    const float cls_alpha = -1.0f,
+    bool use_softmax_label_loss = false
 );
 
 // Hybrid mask matcher front-end.  Returns ``{pred_to_gt, pred_round,
@@ -102,7 +103,8 @@ std::vector<torch::Tensor> mask_matching(
     float   mask_alpha      = -1.0f,
     float   cls_gamma       = 0.0f,
     float   cls_alpha       = -1.0f,
-    int64_t void_class_index = -1
+    int64_t void_class_index = -1,
+    bool    use_softmax_label_loss = false
 );
 
 std::vector<torch::Tensor> mask_matching_backward(
@@ -128,7 +130,8 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float mask_alpha,
     const float cls_gamma,
     const float cls_alpha,
-    int64_t void_class_index
+    int64_t void_class_index,
+    const bool use_softmax_label_loss = false
 );
 
 torch::Tensor pairwise_sigmoid_label_loss_forward(

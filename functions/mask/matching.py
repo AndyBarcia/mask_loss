@@ -55,6 +55,7 @@ class MaskMatchingFunction(Function):
         cls_focal_gamma,
         cls_focal_alpha,
         void_class_index=None,
+        label_loss: str = "sigmoid",
     ):
         """Run the forward pass of the matching op.
 
@@ -178,6 +179,17 @@ class MaskMatchingFunction(Function):
         if void_index_val != -1 and torch.any(cls_targets == void_index_val):
             raise ValueError("cls_targets must not contain the void class index")
 
+        loss_kind = (label_loss or "sigmoid").lower()
+        if loss_kind not in {"sigmoid", "softmax"}:
+            raise ValueError("label_loss must be either 'sigmoid' or 'softmax'")
+        use_softmax_label_loss = loss_kind == "softmax"
+
+        if use_softmax_label_loss and force_unmatched_cls and void_index_val == -1:
+            raise ValueError(
+                "void_class_index must be provided when using softmax label loss "
+                "and forcing unmatched predictions to background"
+            )
+
         pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean = mask_loss.mask_matching(
             mask_logits,
             mask_targets,
@@ -201,6 +213,7 @@ class MaskMatchingFunction(Function):
             cls_focal_gamma_val,
             cls_focal_alpha_val,
             void_index_val,
+            use_softmax_label_loss,
         )
 
         ctx.save_for_backward(
@@ -226,6 +239,7 @@ class MaskMatchingFunction(Function):
         ctx.cls_focal_gamma = cls_focal_gamma_val
         ctx.cls_focal_alpha = cls_focal_alpha_val
         ctx.void_class_index = void_index_val
+        ctx.use_softmax_label_loss = use_softmax_label_loss
 
         return pred_to_gt, pred_round, layer_mask_mean, layer_dice_mean, layer_cls_mean
 
@@ -280,12 +294,14 @@ class MaskMatchingFunction(Function):
             cls_focal_gamma,
             cls_focal_alpha,
             ctx.void_class_index,
+            ctx.use_softmax_label_loss,
         )
 
         return (
             grad_mask_logits,
             None,
             grad_cls_logits,
+            None,
             None,
             None,
             None,
@@ -330,6 +346,7 @@ def mask_matching_py(
     cls_focal_gamma: Optional[float] = None,
     cls_focal_alpha: Optional[float] = None,
     void_class_index: Optional[int] = None,
+    label_loss: str = "sigmoid",
 ):
     """Reference Python implementation of :func:`mask_matching`.
 
@@ -366,6 +383,11 @@ def mask_matching_py(
         void_class_index (Optional[int]): Index of the "void" class in
             ``cls_logits``. If set, unmatched detections are trained to predict
             the void class regardless of ``force_unmatched_class_to_background``.
+        label_loss (str): Classification loss type, ``"sigmoid"`` (default)
+            for binary cross entropy or ``"softmax"`` for categorical cross
+            entropy. When ``"softmax"`` is selected the ``cls_focal_*``
+            arguments are ignored and ``void_class_index`` must be provided if
+            ``force_unmatched_class_to_background`` is ``True``.
 
     Returns:
         Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]: The same values exposed
@@ -393,23 +415,35 @@ def mask_matching_py(
         mask_alpha_pos = mask_focal_alpha_val
     mask_use_gamma = mask_focal_gamma_val != 0.0
 
-    cls_focal_gamma_val = 0.0 if cls_focal_gamma is None else float(cls_focal_gamma)
-    cls_use_gamma = cls_focal_gamma_val != 0.0
+    loss_kind = (label_loss or "sigmoid").lower()
+    if loss_kind not in {"sigmoid", "softmax"}:
+        raise ValueError("label_loss must be either 'sigmoid' or 'softmax'")
+    use_softmax_label_loss = loss_kind == "softmax"
 
-    if cls_focal_alpha is None:
-        cls_focal_alpha_val = mask_focal_alpha_val
-        if cls_focal_alpha_val is None:
-            cls_alpha_neg = 1.0
-            cls_alpha_pos = 1.0
+    if use_softmax_label_loss:
+        cls_focal_gamma_val = 0.0
+        cls_use_gamma = False
+        cls_focal_alpha_val: Optional[float] = None
+        cls_alpha_neg = 1.0
+        cls_alpha_pos = 1.0
+    else:
+        cls_focal_gamma_val = 0.0 if cls_focal_gamma is None else float(cls_focal_gamma)
+        cls_use_gamma = cls_focal_gamma_val != 0.0
+
+        if cls_focal_alpha is None:
+            cls_focal_alpha_val = mask_focal_alpha_val
+            if cls_focal_alpha_val is None:
+                cls_alpha_neg = 1.0
+                cls_alpha_pos = 1.0
+            else:
+                cls_alpha_neg = 1.0 - cls_focal_alpha_val
+                cls_alpha_pos = cls_focal_alpha_val
         else:
+            cls_focal_alpha_val = float(cls_focal_alpha)
+            if not (0.0 <= cls_focal_alpha_val <= 1.0):
+                raise ValueError("focal_alpha must be in [0, 1]")
             cls_alpha_neg = 1.0 - cls_focal_alpha_val
             cls_alpha_pos = cls_focal_alpha_val
-    else:
-        cls_focal_alpha_val = float(cls_focal_alpha)
-        if not (0.0 <= cls_focal_alpha_val <= 1.0):
-            raise ValueError("focal_alpha must be in [0, 1]")
-        cls_alpha_neg = 1.0 - cls_focal_alpha_val
-        cls_alpha_pos = cls_focal_alpha_val
 
     num_cls_channels = cls_logits.shape[-1]
     void_idx: Optional[int]
@@ -424,6 +458,12 @@ def mask_matching_py(
     if void_idx is not None and torch.any(cls_targets == void_idx):
         raise ValueError("cls_targets must not contain the void class index")
     has_void_class = void_idx is not None
+
+    if use_softmax_label_loss and force_unmatched_class_to_background and not has_void_class:
+        raise ValueError(
+            "void_class_index must be provided when using softmax label loss "
+            "and forcing unmatched predictions to background"
+        )
 
     strategy_map = {"global", "round", "greedy", "pseudo_greedy"}
     if assignment_strategy not in strategy_map:
@@ -449,6 +489,7 @@ def mask_matching_py(
         mask_focal_alpha=mask_focal_alpha_val,
         cls_focal_gamma=cls_focal_gamma_val,
         cls_focal_alpha=cls_focal_alpha_val,
+        label_loss=loss_kind,
     )
     sigmoid_cost = costs[0]
     dice_cost = costs[1]
@@ -697,31 +738,35 @@ def mask_matching_py(
             layer_dice_sum += (dice_loss * unmatched_mask).sum(dim=(1, 2))
 
         if unmatched_dts > 0:
-            logits = cls_logits
-            probs = logits.sigmoid()
-            ce_neg = F.softplus(logits)
-            ce_pos = F.softplus(-logits)
-            if cls_use_gamma:
-                mod_neg = probs.pow(cls_focal_gamma_val)
-                mod_pos = (1.0 - probs).pow(cls_focal_gamma_val)
-            else:
-                mod_neg = 1.0
-                mod_pos = 1.0
-            neg_term = ce_neg * mod_neg
-            pos_term = ce_pos * mod_pos
-            if cls_focal_alpha_val is not None:
-                neg_term = neg_term * cls_alpha_neg
-                pos_term = pos_term * cls_alpha_pos
-
             cls_loss = None
-            if force_unmatched_class_to_background:
-                cls_loss = neg_term.mean(dim=-1)
-                if has_void_class and num_cls_channels > 0:
-                    void_neg = neg_term[..., void_idx]
-                    void_pos = pos_term[..., void_idx]
-                    cls_loss = cls_loss + (void_pos - void_neg) / float(num_cls_channels)
-            elif has_void_class:
-                cls_loss = pos_term[..., void_idx]
+            if use_softmax_label_loss and force_unmatched_class_to_background:
+                log_probs = F.log_softmax(cls_logits, dim=-1)
+                cls_loss = -log_probs[..., void_idx]
+            else:
+                logits = cls_logits
+                probs = logits.sigmoid()
+                ce_neg = F.softplus(logits)
+                ce_pos = F.softplus(-logits)
+                if cls_use_gamma:
+                    mod_neg = probs.pow(cls_focal_gamma_val)
+                    mod_pos = (1.0 - probs).pow(cls_focal_gamma_val)
+                else:
+                    mod_neg = 1.0
+                    mod_pos = 1.0
+                neg_term = ce_neg * mod_neg
+                pos_term = ce_pos * mod_pos
+                if cls_focal_alpha_val is not None:
+                    neg_term = neg_term * cls_alpha_neg
+                    pos_term = pos_term * cls_alpha_pos
+
+                if force_unmatched_class_to_background:
+                    cls_loss = neg_term.mean(dim=-1)
+                    if has_void_class and num_cls_channels > 0:
+                        void_neg = neg_term[..., void_idx]
+                        void_pos = pos_term[..., void_idx]
+                        cls_loss = cls_loss + (void_pos - void_neg) / float(num_cls_channels)
+                elif has_void_class:
+                    cls_loss = pos_term[..., void_idx]
 
             if cls_loss is not None:
                 cls_loss = cls_loss * cls_scale
@@ -765,6 +810,7 @@ def mask_matching_sampling_py(
     background_index= -1,
     inf_thresh      = 1e30,
     num_masks       = None,
+    label_loss: str = "sigmoid",
 ):
     L, B, C, H, W = mask_logits.shape
 
@@ -779,6 +825,7 @@ def mask_matching_sampling_py(
         dice_scale,
         cls_scale,
         background_index,
+        label_loss=label_loss,
     )
     sigmoid_cost = costs[0]
     dice_cost = costs[1]

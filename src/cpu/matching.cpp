@@ -27,7 +27,8 @@ torch::Tensor pairwise_mask_loss_forward(
     const float mask_gamma = 0.0f,
     const float mask_alpha = -1.0f,
     const float cls_gamma = 0.0f,
-    const float cls_alpha = -1.0f
+    const float cls_alpha = -1.0f,
+    bool use_softmax_label_loss = false
 );
 
 // Computes matched and unmatched query losses on CUDA and returns the per-layer
@@ -50,7 +51,8 @@ std::vector<torch::Tensor> mask_matching_forward(
     const double num_masks,
     const bool force_unmatched_masks,
     const bool force_unmatched_class,
-    const int64_t void_class_index
+    const int64_t void_class_index,
+    const bool use_softmax_label_loss = false
 );
 
 enum class MatchingStrategy : int64_t {
@@ -607,7 +609,8 @@ std::vector<torch::Tensor> mask_matching(
     float   mask_alpha      = -1.0f,
     float   cls_gamma       = 0.0f,
     float   cls_alpha       = -1.0f,
-    int64_t void_class_index = -1
+    int64_t void_class_index = -1,
+    bool    use_softmax_label_loss = false
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
     const auto device = mask_logits.device();
@@ -624,6 +627,10 @@ std::vector<torch::Tensor> mask_matching(
         "mask_matching: uncertainty_gamma must be non-negative");
     TORCH_CHECK(uncertainty_gamma_min >= 0.0f && uncertainty_gamma_min <= 1.0f,
         "mask_matching: uncertainty_gamma_min must be in [0,1]");
+    if (use_softmax_label_loss && force_unmatched_class_to_background) {
+        TORCH_CHECK(void_class_index >= 0 && void_class_index < cls_logits.size(3),
+            "void_class_index must be provided when using softmax label loss and forcing unmatched class logits");
+    }
     MatchingStrategy strategy = static_cast<MatchingStrategy>(strategy_id);
 
     // Get the mask, dice and cls pairwise costs, shape (3, L, B, C, GT_out)
@@ -642,7 +649,8 @@ std::vector<torch::Tensor> mask_matching(
         mask_gamma,
         mask_alpha,
         cls_gamma,
-        cls_alpha
+        cls_alpha,
+        use_softmax_label_loss
     );
     TORCH_CHECK(
         separate_costs.dim() == 5 && separate_costs.size(0) == 3,
@@ -727,7 +735,8 @@ std::vector<torch::Tensor> mask_matching(
         num_masks,
         force_unmatched_masks_to_empty,
         force_unmatched_class_to_background,
-        void_class_index
+        void_class_index,
+        use_softmax_label_loss
     );
 
     torch::Tensor layer_mask_mean = losses[0];

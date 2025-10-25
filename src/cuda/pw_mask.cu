@@ -27,6 +27,21 @@ reduce_pairwise_sigmoid_label_kernel(
     const float alpha
 );
 
+template <int C>
+__global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK)
+reduce_pairwise_softmax_label_kernel(
+    const float* __restrict__ logits,      // (L, B, Q, C)
+    const int64_t* __restrict__ targets,   // (B, GT_total)
+    float* __restrict__ out,               // (L, B, Q, GT_out)
+    const int32_t background_index,
+    const int32_t GT_total,
+    const int32_t GT_out,
+    const int32_t B,
+    const int32_t Q,
+    const int32_t L,
+    const float scale
+);
+
 // This kernel fuses the pairwise sigmoid cross-entropy (BCE) and Dice reductions.
 // Computing both losses in a single pass avoids re-loading logits from global
 // memory and lets us share expensive intermediate values such as the sigmoid
@@ -306,7 +321,8 @@ torch::Tensor pairwise_mask_loss_forward(
     const float mask_gamma = 0.0f,
     const float mask_alpha = -1.0f,
     const float cls_gamma = 0.0f,
-    const float cls_alpha = -1.0f
+    const float cls_alpha = -1.0f,
+    const bool use_softmax_label_loss = false
 ) {
     CHECK_INPUT(mask_logits);
     CHECK_INPUT(mask_targets);
@@ -428,7 +444,7 @@ torch::Tensor pairwise_mask_loss_forward(
         auto cls_out = out_accum.data_ptr<float>() + (2 * L * B * Q * GT_out);
         dim3 grid(L, B, Q);
 
-        auto static_launcher = [&](auto C_val) {
+        auto static_sigmoid = [&](auto C_val) {
             reduce_pairwise_sigmoid_label_kernel<decltype(C_val)::value>
                 <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
                     cls_logits.data_ptr<float>(),
@@ -445,11 +461,31 @@ torch::Tensor pairwise_mask_loss_forward(
                     cls_alpha
                 );
         };
+        auto static_softmax = [&](auto C_val) {
+            reduce_pairwise_softmax_label_kernel<decltype(C_val)::value>
+                <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
+                    cls_logits.data_ptr<float>(),
+                    cls_targets.data_ptr<int64_t>(),
+                    cls_out,
+                    static_cast<int32_t>(background_index),
+                    GT_total,
+                    GT_out,
+                    B,
+                    Q,
+                    L,
+                    cls_scale
+                );
+        };
+
         const auto supported_dims = std::make_tuple(
             std::make_tuple(std::integral_constant<int, 128>{}) // C
         );
         const auto runtime_dims = std::make_tuple(C);
-        dispatch_kernel(static_launcher, runtime_dims, supported_dims);
+        if (use_softmax_label_loss) {
+            dispatch_kernel(static_softmax, runtime_dims, supported_dims);
+        } else {
+            dispatch_kernel(static_sigmoid, runtime_dims, supported_dims);
+        }
     }
     err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "CUDA error after class reduce kernel: ", cudaGetErrorString(err));

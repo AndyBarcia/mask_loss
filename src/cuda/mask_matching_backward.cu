@@ -228,7 +228,8 @@ __global__ void cls_matching_backward_kernel(
     const float cls_alpha,
     const bool force_unmatched_class_to_background,
     const bool has_void_class,
-    const int64_t void_class_index
+    const int64_t void_class_index,
+    const bool use_softmax_label_loss
 ) {
     const int64_t q = blockIdx.x;  // prediction index
     const int64_t b = blockIdx.y;
@@ -250,11 +251,78 @@ __global__ void cls_matching_backward_kernel(
     // Write grads for the entire class vector of the matched/unmatched query
     const int64_t base = pred_index * C;
 
+    __shared__ float sh_softmax_buffer[GRAD_THREADS];
+
     int y = -1;
     if (is_matched) {
         const int64_t y64 = cls_targets[b * GT_total + actual_gt];
         if (y64 < 0 || y64 >= C) return; // invalid label (padding or OOR)
         y = static_cast<int>(y64);
+    }
+
+    if (use_softmax_label_loss) {
+        if (is_matched || (force_unmatched_class_to_background && has_void_class)) {
+            const int target_index = is_matched ? y : static_cast<int>(void_class_index);
+            float thread_max = -INFINITY;
+            for (int c = threadIdx.x; c < C; c += blockDim.x) {
+                const float z = cls_logits[base + c];
+                thread_max = fmaxf(thread_max, z);
+            }
+            sh_softmax_buffer[threadIdx.x] = thread_max;
+            __syncthreads();
+            for (int stride = GRAD_THREADS >> 1; stride > 0; stride >>= 1) {
+                if (threadIdx.x < stride) {
+                    sh_softmax_buffer[threadIdx.x] = fmaxf(sh_softmax_buffer[threadIdx.x], sh_softmax_buffer[threadIdx.x + stride]);
+                }
+                __syncthreads();
+            }
+            const float max_val = sh_softmax_buffer[0];
+            __syncthreads();
+
+            float thread_sum = 0.0f;
+            for (int c = threadIdx.x; c < C; c += blockDim.x) {
+                const float z = cls_logits[base + c];
+                thread_sum += __expf(z - max_val);
+            }
+            sh_softmax_buffer[threadIdx.x] = thread_sum;
+            __syncthreads();
+            for (int stride = GRAD_THREADS >> 1; stride > 0; stride >>= 1) {
+                if (threadIdx.x < stride) {
+                    sh_softmax_buffer[threadIdx.x] += sh_softmax_buffer[threadIdx.x + stride];
+                }
+                __syncthreads();
+            }
+            const float denom = sh_softmax_buffer[0];
+            const float inv_denom = (denom > 0.0f) ? 1.0f / denom : 0.0f;
+            __syncthreads();
+
+            for (int c = threadIdx.x; c < C; c += blockDim.x) {
+                const float z = cls_logits[base + c];
+                const float p = __expf(z - max_val) * inv_denom;
+                float grad = p;
+                if (c == target_index) {
+                    grad -= 1.0f;
+                }
+                grad_cls_logits[base + c] = base_coeff * grad;
+            }
+            return;
+        } else if (has_void_class) {
+            for (int c = threadIdx.x; c < C; c += blockDim.x) {
+                if (c == void_class_index) {
+                    const float z = cls_logits[base + c];
+                    const float p = 1.0f / (1.0f + __expf(-z));
+                    grad_cls_logits[base + c] = base_coeff * (p - 1.0f);
+                } else {
+                    grad_cls_logits[base + c] = 0.0f;
+                }
+            }
+            return;
+        } else {
+            for (int c = threadIdx.x; c < C; c += blockDim.x) {
+                grad_cls_logits[base + c] = 0.0f;
+            }
+            return;
+        }
     }
 
     const bool use_gamma = cls_gamma > 0.0f;
@@ -325,7 +393,8 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float mask_alpha,
     const float cls_gamma,
     const float cls_alpha,
-    int64_t void_class_index
+    int64_t void_class_index,
+    const bool use_softmax_label_loss
 ) {
     // Backward pipeline:
     //   1. Materialize downsampled ground-truth masks once for reuse.
@@ -378,6 +447,10 @@ std::vector<torch::Tensor> mask_matching_backward(
         void_index = void_class_index;
     }
     const bool has_void_class = (void_index >= 0);
+    if (use_softmax_label_loss && force_unmatched_class_to_background) {
+        TORCH_CHECK(has_void_class,
+            "void_class_index must be provided when using softmax label loss and forcing unmatched class logits");
+    }
     const bool need_unmatched_class = force_unmatched_class_to_background || has_void_class;
 
     TORCH_CHECK(H > 0 && W > 0, "mask_logits must have positive spatial size");
@@ -528,7 +601,8 @@ std::vector<torch::Tensor> mask_matching_backward(
                 cls_alpha,
                 force_unmatched_class_to_background,
                 has_void_class,
-                void_index
+                void_index,
+                use_softmax_label_loss
             );
             CHECK_CUDA_ERROR(cudaGetLastError());
         }

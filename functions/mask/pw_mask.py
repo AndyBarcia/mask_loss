@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 from ..sigmoid.pw_sigmoid_ce import pairwise_sigmoid_cross_entropy_loss_py
 from ..dice.pw_dice_loss import pairwise_dice_loss_py
 from ..label.pw_sigmoid_label_loss import pairwise_sigmoid_label_loss_py
+from ..label.pw_softmax_label_loss import pairwise_softmax_label_loss_py
 
 try:
     import mask_loss
@@ -36,6 +37,7 @@ class PairwiseMaskLossFunction(Function):
         cls_focal_alpha=None,
         uncertainty_gamma=None,
         uncertainty_gamma_min=None,
+        label_loss: str = "sigmoid",
     ):
         L, B, C, h, w = mask_logits.shape
         B_t, H_t, W_t = mask_targets.shape
@@ -78,6 +80,11 @@ class PairwiseMaskLossFunction(Function):
             ug_min = float(uncertainty_gamma_min)
             if not (0.0 <= ug_min <= 1.0):
                 raise ValueError("uncertainty_gamma_min must be in [0, 1]")
+        loss_kind = (label_loss or "sigmoid").lower()
+        if loss_kind not in {"sigmoid", "softmax"}:
+            raise ValueError("label_loss must be either 'sigmoid' or 'softmax'")
+        use_softmax_label_loss = loss_kind == "softmax"
+
         output = mask_loss.pairwise_mask_loss_forward(
             mask_logits,
             mask_targets,
@@ -94,12 +101,13 @@ class PairwiseMaskLossFunction(Function):
             mask_fa,
             cls_fg,
             cls_fa,
+            use_softmax_label_loss,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return (None,) * 15
+        return (None,) * 16
 
 
 def pairwise_mask_loss_py(
@@ -118,6 +126,7 @@ def pairwise_mask_loss_py(
     mask_focal_alpha: Optional[float] = None,
     cls_focal_gamma: Optional[float] = None,
     cls_focal_alpha: Optional[float] = None,
+    label_loss: str = "sigmoid",
 ):
     if cls_focal_gamma is None:
         cls_fg = mask_focal_gamma
@@ -146,12 +155,24 @@ def pairwise_mask_loss_py(
         uncertainty_gamma,
         uncertainty_gamma_min,
     )  # (L,B,C,GT_out)
-    cls_cost = pairwise_sigmoid_label_loss_py(
-        cls_logits,
-        cls_targets,
-        background_index=background_index,
-        scale=cls_scale,
-        focal_gamma=cls_fg,
-        focal_alpha=cls_fa,
-    ) # (L,B,C,GT_out)
+    loss_kind = (label_loss or "sigmoid").lower()
+    if loss_kind not in {"sigmoid", "softmax"}:
+        raise ValueError("label_loss must be either 'sigmoid' or 'softmax'")
+
+    if loss_kind == "softmax":
+        cls_cost = pairwise_softmax_label_loss_py(
+            cls_logits,
+            cls_targets,
+            background_index=background_index,
+            scale=cls_scale,
+        )
+    else:
+        cls_cost = pairwise_sigmoid_label_loss_py(
+            cls_logits,
+            cls_targets,
+            background_index=background_index,
+            scale=cls_scale,
+            focal_gamma=cls_fg,
+            focal_alpha=cls_fa,
+        )
     return torch.stack([sigmoid_cost, dice_cost, cls_cost], dim=0)  # (3,L,B,C,GT_out)
