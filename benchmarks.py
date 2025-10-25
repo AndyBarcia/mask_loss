@@ -534,8 +534,10 @@ def test_mask_matching():
         "force_unmatched_masks_to_empty": False,
         "K": 1,
         "assignment_strategy": "global",
-        "focal_gamma": 2.0,
-        "focal_alpha": 0.25,
+        "mask_focal_gamma": 0.0,
+        "mask_focal_alpha": None,
+        "cls_focal_gamma": 0.0,
+        "cls_focal_alpha": None,
         "void_class_index": C-1,
     }
 
@@ -557,8 +559,10 @@ def test_mask_matching():
         "force_unmatched_masks_to_empty",
         "K",
         "assignment_strategy",
-        "focal_gamma",
-        "focal_alpha",
+        "mask_focal_gamma",
+        "mask_focal_alpha",
+        "cls_focal_gamma",
+        "cls_focal_alpha",
         "void_class_index",
     ]
     
