@@ -451,7 +451,7 @@ def test_pw_dice_loss():
     
     tester.run()
 
-def test_pw_label_loss():
+def test_pw_sigmoid_label_loss():
     """Test the CUDA implementation of sigmoid cross-entropy loss"""
     L, B, Q, C = 10, 16, 300, 128
 
@@ -466,7 +466,29 @@ def test_pw_label_loss():
     
     tester = CUDAKernelTester(
         cuda_function=PairwiseSigmoidCELossFunction.apply,
-        python_function=pairwise_label_loss_py,
+        python_function=pairwise_sigmoid_label_loss_py,
+        input_creators=input_creators,
+        arg_order=arg_order
+    )
+    
+    tester.run() 
+
+def test_pw_softmax_label_loss():
+    """Test the CUDA implementation of sigmoid cross-entropy loss"""
+    L, B, Q, C = 10, 16, 300, 128
+
+    input_creators = {
+        "logits": lambda device, dtype: torch.randn(L, B, Q, C, device=device, dtype=dtype),
+        "targets": lambda device, dtype: create_label_targets(B, C, device),
+        "background_index": 2,
+        "scale": 1.0
+    }
+    
+    arg_order = ["logits", "targets", "background_index", "scale"]
+    
+    tester = CUDAKernelTester(
+        cuda_function=PairwiseSoftmaxLabelLossFunction.apply,
+        python_function=pairwise_softmax_label_loss_py,
         input_creators=input_creators,
         arg_order=arg_order
     )
@@ -568,5 +590,5 @@ def test_mask_matching():
     tester.run()
 
 if __name__ == "__main__":
-    test_mask_matching()
+    test_pw_softmax_label_loss()
     #test_pw_sigmoid_ce_loss()

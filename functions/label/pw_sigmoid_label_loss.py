@@ -9,7 +9,7 @@ except ImportError:
     print("CUDA extension pos_mlp_bias not found. Please compile it first.")
     print("Run: pip3 install --no-build-isolation .")
 
-class PairwiseLabelLossFunction(Function):
+class PairwiseSigmoidLabelLossFunction(Function):
     @staticmethod
     def forward(
         ctx,
@@ -49,7 +49,7 @@ class PairwiseLabelLossFunction(Function):
     def backward(ctx, grad_output):
         return None, None, None, None, None, None
 
-def pairwise_label_loss_py(
+def pairwise_sigmoid_label_loss_py(
     logits,
     targets,
     background_index=None,
