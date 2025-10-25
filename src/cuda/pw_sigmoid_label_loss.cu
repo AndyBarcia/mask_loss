@@ -15,7 +15,7 @@
 // neg(z) = max(z,0) + log1p(exp(-|z|))
 template <int C>
 __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK)
-reduce_pairwise_label_kernel(
+reduce_pairwise_sigmoid_label_kernel(
     const float* __restrict__ logits,      // (L, B, Q, C)
     const int64_t* __restrict__ targets,   // (B, GT_total)
     float* __restrict__ out,               // (L, B, Q, GT_out)
@@ -105,7 +105,7 @@ reduce_pairwise_label_kernel(
     }
 }
 
-torch::Tensor pairwise_label_loss_forward(
+torch::Tensor pairwise_sigmoid_label_loss_forward(
     const torch::Tensor& logits,   // (L,B,Q,C), float
     const torch::Tensor& targets,  // (B,GT), int64 with -1 padding
     int64_t background_index = -1, // drop column targets[:, background_index]
@@ -116,11 +116,11 @@ torch::Tensor pairwise_label_loss_forward(
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
 
-    TORCH_CHECK(logits.dim() == 4, "pairwise_label_loss_forward: logits must be (L,B,Q,C)");
-    TORCH_CHECK(targets.dim() == 2, "pairwise_label_loss_forward: targets must be (B,GT)");
-    TORCH_CHECK(gamma >= 0.0f, "pairwise_label_loss_forward: focal_gamma must be non-negative");
+    TORCH_CHECK(logits.dim() == 4, "pairwise_sigmoid_label_loss_forward: logits must be (L,B,Q,C)");
+    TORCH_CHECK(targets.dim() == 2, "pairwise_sigmoid_label_loss_forward: targets must be (B,GT)");
+    TORCH_CHECK(gamma >= 0.0f, "pairwise_sigmoid_label_loss_forward: focal_gamma must be non-negative");
     TORCH_CHECK(alpha < 0.0f || (alpha >= 0.0f && alpha <= 1.0f),
-                "pairwise_label_loss_forward: focal_alpha must be in [0,1] or negative to disable");
+                "pairwise_sigmoid_label_loss_forward: focal_alpha must be in [0,1] or negative to disable");
 
     const int L  = static_cast<int>(logits.size(0));
     const int B  = static_cast<int>(logits.size(1));
@@ -128,7 +128,7 @@ torch::Tensor pairwise_label_loss_forward(
     const int C  = static_cast<int>(logits.size(3));
     const int GT_total = static_cast<int>(targets.size(1));
 
-    TORCH_CHECK(B == targets.size(0), "pairwise_label_loss_forward: batch size mismatch between logits and targets");
+    TORCH_CHECK(B == targets.size(0), "pairwise_sigmoid_label_loss_forward: batch size mismatch between logits and targets");
 
     // Determine whether to drop a fixed GT column across the batch
     const bool drop_bg_col = (background_index >= 0 && background_index < GT_total);
@@ -154,7 +154,7 @@ torch::Tensor pairwise_label_loss_forward(
     dim3 grid(L, B, Q);
 
     auto static_launcher = [&](auto C_val) {
-        reduce_pairwise_label_kernel<decltype(C_val)::value>
+        reduce_pairwise_sigmoid_label_kernel<decltype(C_val)::value>
             <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
                 logits_f.data_ptr<float>(),
                 targets_i64.data_ptr<int64_t>(),
@@ -180,7 +180,7 @@ torch::Tensor pairwise_label_loss_forward(
 
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess,
-                "CUDA error in pairwise_label_loss_forward kernel: ",
+                "CUDA error in pairwise_sigmoid_label_loss_forward kernel: ",
                 cudaGetErrorString(err));
 
     return out;

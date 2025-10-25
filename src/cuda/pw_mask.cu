@@ -12,7 +12,7 @@
 
 template <int C>
 __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK)
-reduce_pairwise_label_kernel(
+reduce_pairwise_sigmoid_label_kernel(
     const float* __restrict__ logits,      // (L, B, Q, C)
     const int64_t* __restrict__ targets,   // (B, GT_total)
     float* __restrict__ out,               // (L, B, Q, GT_out)
@@ -429,7 +429,7 @@ torch::Tensor pairwise_mask_loss_forward(
         dim3 grid(L, B, Q);
 
         auto static_launcher = [&](auto C_val) {
-            reduce_pairwise_label_kernel<decltype(C_val)::value>
+            reduce_pairwise_sigmoid_label_kernel<decltype(C_val)::value>
                 <<<grid, REDUCTION_THREADS_PER_BLOCK>>>(
                     cls_logits.data_ptr<float>(),
                     cls_targets.data_ptr<int64_t>(),

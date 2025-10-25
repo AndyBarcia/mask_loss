@@ -9,7 +9,7 @@ except ImportError:
     print("CUDA extension pos_mlp_bias not found. Please compile it first.")
     print("Run: pip3 install --no-build-isolation .")
 
-class PairwiseLabelLossFunction(Function):
+class PairwiseSigmoidLabelLossFunction(Function):
     @staticmethod
     def forward(
         ctx,
@@ -35,7 +35,7 @@ class PairwiseLabelLossFunction(Function):
             fa = float(focal_alpha)
             if not (0.0 <= fa <= 1.0):
                 raise ValueError("focal_alpha must be in [0, 1]")
-        output = mask_loss.forward_pw_label_loss(
+        output = mask_loss.forward_pw_sigmoid_label_loss(
             logits,
             targets,
             background_index if background_index is not None else -1,
@@ -49,7 +49,7 @@ class PairwiseLabelLossFunction(Function):
     def backward(ctx, grad_output):
         return None, None, None, None, None, None
 
-def pairwise_label_loss_py(
+def pairwise_sigmoid_label_loss_py(
     logits,
     targets,
     background_index=None,

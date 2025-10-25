@@ -9,7 +9,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ..sigmoid.pw_sigmoid_ce import pairwise_sigmoid_cross_entropy_loss_py
 from ..dice.pw_dice_loss import pairwise_dice_loss_py
-from ..label.pw_label_loss import pairwise_label_loss_py
+from ..label.pw_sigmoid_label_loss import pairwise_sigmoid_label_loss_py
 
 try:
     import mask_loss
@@ -146,7 +146,7 @@ def pairwise_mask_loss_py(
         uncertainty_gamma,
         uncertainty_gamma_min,
     )  # (L,B,C,GT_out)
-    cls_cost = pairwise_label_loss_py(
+    cls_cost = pairwise_sigmoid_label_loss_py(
         cls_logits,
         cls_targets,
         background_index=background_index,

@@ -131,13 +131,20 @@ std::vector<torch::Tensor> mask_matching_backward(
     int64_t void_class_index
 );
 
-torch::Tensor pairwise_label_loss_forward(
+torch::Tensor pairwise_sigmoid_label_loss_forward(
     const torch::Tensor& logits,   // (L,B,Q,C), float
     const torch::Tensor& targets,  // (B,GT_total), int64 with -1 padding
     int64_t background_index = -1,
     const float scale = 1.0f,
     const float gamma = 0.0f,
     const float alpha = -1.0f
+);
+
+torch::Tensor pairwise_softmax_label_loss_forward(
+    const torch::Tensor& logits,   // (L,B,Q,C), float
+    const torch::Tensor& targets,  // (B,GT_total), int64 with -1 padding
+    int64_t background_index = -1,
+    const float scale = 1.0f
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -150,6 +157,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("pairwise_mask_loss_forward", &pairwise_mask_loss_forward, "Dice+Sigmoid loss forward (CUDA)");
     m.def("mask_matching", &mask_matching, "Mask matching using OR-Tools (CUDA)");
     m.def("mask_matching_backward", &mask_matching_backward, "Mask matching backward (CUDA)");
-    m.def("forward_pw_label_loss", &pairwise_label_loss_forward, "Sigmoid Cross Entropy label forward (CUDA)");
+    m.def("forward_pw_sigmoid_label_loss", &pairwise_sigmoid_label_loss_forward, "Sigmoid Cross Entropy label forward (CUDA)");
+    m.def("forward_pw_softmax_label_loss", &pairwise_softmax_label_loss_forward, "Softmax Cross Entropy label forward (CUDA)");
 }
 
