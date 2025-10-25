@@ -301,6 +301,8 @@ def mask_matching_py(
     dice_scale      = 1.0,
     cls_scale       = 1.0,
     background_index= -1,
+    uncertainty_gamma: float = 1.0,
+    uncertainty_gamma_min: float = 0.05,
     inf_thresh      = 1e30,
     num_masks       = None,
     force_unmatched_class_to_background=False,
@@ -328,6 +330,8 @@ def mask_matching_py(
         dice_scale (float): Weight applied to the dice cost.
         cls_scale (float): Weight applied to the classification cost.
         background_index (int): Background class index or ``-1`` to disable.
+        uncertainty_gamma (float): Entropy weighting exponent for mask losses.
+        uncertainty_gamma_min (float): Lower bound for the entropy weights.
         inf_thresh (float): Costs equal/above this value are ignored.
         num_masks (Optional[float]): Optional denominator for loss averaging.
         force_unmatched_class_to_background (bool): If ``True`` enforce
@@ -423,6 +427,8 @@ def mask_matching_py(
         dice_scale,
         cls_scale,
         background_index,
+        uncertainty_gamma=uncertainty_gamma,
+        uncertainty_gamma_min=uncertainty_gamma_min,
         mask_focal_gamma=mask_focal_gamma_val,
         mask_focal_alpha=mask_focal_alpha_val,
         cls_focal_gamma=cls_focal_gamma_val,

@@ -96,6 +96,8 @@ def pairwise_mask_loss_py(
     dice_scale      = 1.0,
     cls_scale       = 1.0,
     background_index= -1,
+    uncertainty_gamma: float = 1.0,
+    uncertainty_gamma_min: float = 0.05,
     mask_focal_gamma: float = 0.0,
     mask_focal_alpha: Optional[float] = None,
     cls_focal_gamma: Optional[float] = None,
@@ -116,13 +118,17 @@ def pairwise_mask_loss_py(
         sigmoid_scale,
         mask_focal_gamma,
         mask_focal_alpha,
+        uncertainty_gamma,
+        uncertainty_gamma_min,
     )  # (L,B,C,GT_out)
     dice_cost = pairwise_dice_loss_py(
         mask_logits,
         mask_targets,
         smooth,
         background_index,
-        dice_scale
+        dice_scale,
+        uncertainty_gamma,
+        uncertainty_gamma_min,
     )  # (L,B,C,GT_out)
     cls_cost = pairwise_label_loss_py(
         cls_logits,

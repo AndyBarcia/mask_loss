@@ -61,6 +61,8 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
     scale=1.0,
     focal_gamma: float = 0.0,
     focal_alpha: Optional[float] = None,
+    uncertainty_gamma: float = 1.0,
+    uncertainty_gamma_min: float = 0.05,
 ):
     """
     Computes pairwise sigmoid cross-entropy loss.
@@ -72,8 +74,8 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
 
     Args:
         logits (torch.Tensor): A tensor of shape (L, B, C, h, w) representing the
-                            predicted logits for each class. L is the number of 
-                            layers, B is the batch size, C is the number of classes, 
+                            predicted logits for each class. L is the number of
+                            layers, B is the batch size, C is the number of classes,
                             and h, w are the spatial dimensions of the logits.
         targets (torch.Tensor): A tensor of shape (B, H_t, W_t) with integer
                             labels for the ground truth. H_t and W_t are the
@@ -85,6 +87,10 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
         focal_gamma (float): Focal loss exponent. Use 0.0 for vanilla BCE.
         focal_alpha (Optional[float]): Weight for positives in [0, 1]. If ``None``
                             the standard BCE weighting is used.
+        uncertainty_gamma (float): Exponent applied to normalized Bernoulli entropy
+                            to focus training on uncertain pixels.
+        uncertainty_gamma_min (float): Lower bound for the uncertainty weights to
+                            keep confident pixels from having zero influence.
 
     Returns:
         torch.Tensor: A tensor of shape (L, B, C, max_GT) where max_GT is the maximum value
@@ -137,6 +143,36 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
 
     GT = len(gt_classes)
 
+    if uncertainty_gamma < 0.0:
+        raise ValueError("uncertainty_gamma must be non-negative")
+    if not (0.0 <= uncertainty_gamma_min <= 1.0):
+        raise ValueError("uncertainty_gamma_min must be in [0, 1]")
+
+    ce_pos = F.softplus(-logits_up)
+    ce_neg = F.softplus(logits_up)
+    probs = torch.sigmoid(logits_up)
+
+    eps = 1e-12
+    probs_detached = probs.detach()
+    probs_clamped = probs_detached.clamp(min=eps, max=1.0 - eps)
+    entropy = -(
+        probs_clamped * torch.log(probs_clamped)
+        + (1.0 - probs_clamped) * torch.log(1.0 - probs_clamped)
+    ) / math.log(2.0)
+    weights = torch.clamp(
+        entropy.pow(uncertainty_gamma),
+        min=uncertainty_gamma_min,
+        max=1.0,
+    ).detach()  # (L, B, C, H_t, W_t)
+    weight_norm = weights.sum(dim=(3, 4)).clamp(min=eps)
+
+    if focal_gamma == 0.0:
+        mod_pos = torch.ones_like(probs)
+        mod_neg = mod_pos
+    else:
+        mod_pos = (1.0 - probs).pow(focal_gamma)
+        mod_neg = probs.pow(focal_gamma)
+
     # Initialize output with +inf
     pairwise_loss = torch.full((L, B, C, GT), torch.inf, device=device, dtype=dtype)
 
@@ -157,25 +193,13 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
         # First shape to (1, B, 1, H_t, W_t) and let broadcasting do the rest
         y_b = y_mask.unsqueeze(0).unsqueeze(2)  # (1, B, 1, H_t, W_t)
 
-        # Stable BCE-with-logits (broadcasts y_b over L and C)
-        ce_pos = F.softplus(-logits_up)
-        ce_neg = F.softplus(logits_up)
-        probs = torch.sigmoid(logits_up)
-
-        if focal_gamma == 0.0:
-            mod_pos = torch.ones_like(probs)
-            mod_neg = mod_pos
-        else:
-            mod_pos = (1.0 - probs).pow(focal_gamma)
-            mod_neg = probs.pow(focal_gamma)
-
         loss_tensor = (
             alpha_pos * y_b * mod_pos * ce_pos
             + alpha_neg * (1.0 - y_b) * mod_neg * ce_neg
         )
 
-        # Sum spatially and normalize by area
-        loss_per_class = loss_tensor.sum(dim=(3, 4)) / (H_t * W_t)  # (L, B, C)
+        weighted_loss = (weights * loss_tensor).sum(dim=(3, 4))  # (L, B, C)
+        loss_per_class = weighted_loss / weight_norm
 
         # Build mask to select where to write loss (expand has_class to (L,B,C))
         has_class_expand = has_class.unsqueeze(0).unsqueeze(-1).expand(L, B, C)  # (L,B,C)
@@ -198,6 +222,8 @@ def pairwise_sigmoid_cross_entropy_loss_py(
     scale=1.0,
     focal_gamma: float = 0.0,
     focal_alpha: Optional[float] = None,
+    uncertainty_gamma: float = 1.0,
+    uncertainty_gamma_min: float = 0.05,
 ):
     """
     Computes pairwise sigmoid cross-entropy loss in an efficient way.
@@ -261,12 +287,30 @@ def pairwise_sigmoid_cross_entropy_loss_py(
         alpha_pos = logits.new_tensor(focal_alpha)
         alpha_neg = logits.new_tensor(1.0 - focal_alpha)
 
+    if uncertainty_gamma < 0.0:
+        raise ValueError("uncertainty_gamma must be non-negative")
+    if not (0.0 <= uncertainty_gamma_min <= 1.0):
+        raise ValueError("uncertainty_gamma_min must be in [0, 1]")
+
     # Prepare logits (L,B,C,J) and stable BCE pieces
     z = logits.reshape(L, B, C, J)
 
     ce_pos = F.softplus(-z)
     ce_neg = F.softplus(z)
     probs = torch.sigmoid(z)
+
+    eps = 1e-12
+    probs_detached = probs.detach()
+    probs_clamped = probs_detached.clamp(min=eps, max=1.0 - eps)
+    entropy = -(
+        probs_clamped * torch.log(probs_clamped)
+        + (1.0 - probs_clamped) * torch.log(1.0 - probs_clamped)
+    ) / math.log(2.0)
+    weights = torch.clamp(
+        entropy.pow(uncertainty_gamma),
+        min=uncertainty_gamma_min,
+        max=1.0,
+    ).detach()  # (L,B,C,J)
 
     if focal_gamma == 0.0:
         mod_pos = torch.ones_like(probs)
@@ -305,9 +349,14 @@ def pairwise_sigmoid_cross_entropy_loss_py(
     coeff_pos = ce_pos * mod_pos
     coeff_neg = ce_neg * mod_neg
 
-    loss_pos = torch.einsum('lbcj,bjg->lbcg', coeff_pos, counts_f)
-    loss_neg = torch.einsum('lbcj,bjg->lbcg', coeff_neg, neg_counts)
-    loss = (alpha_pos * loss_pos + alpha_neg * loss_neg) / (H_t * W_t)
+    weighted_coeff_pos = coeff_pos * weights
+    weighted_coeff_neg = coeff_neg * weights
+
+    loss_pos = torch.einsum('lbcj,bjg->lbcg', weighted_coeff_pos, counts_f)
+    loss_neg = torch.einsum('lbcj,bjg->lbcg', weighted_coeff_neg, neg_counts)
+
+    weight_sum = (weights.sum(dim=3) * float(N2))[..., None].clamp(min=eps)
+    loss = (alpha_pos * loss_pos + alpha_neg * loss_neg) / weight_sum
 
     # Set +inf where the GT class doesn't appear in that image
     present = (counts.sum(dim=1) > 0) # (B,G) bool

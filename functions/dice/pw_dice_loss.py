@@ -1,9 +1,7 @@
 import math
 import torch
-import torch.nn.functional as F
 from torch.autograd import Function
 from einops import rearrange, einsum
-from torch.autograd import Function
 from torch.utils.checkpoint import checkpoint
 
 from ..utils import point_sample, counts_per_cell_per_class
@@ -43,6 +41,8 @@ def pairwise_dice_loss_py(
     smooth: float = 1.0,
     background_index: int = None,
     scale: float = 1.0,
+    uncertainty_gamma: float = 1.0,
+    uncertainty_gamma_min: float = 0.05,
 ):
     """
     Pairwise Dice loss without upsampling or per-class loops.
@@ -54,6 +54,12 @@ def pairwise_dice_loss_py(
     Returns:
       (L, B, C, G) where G = #classes considered (optionally excluding background).
       Entries are +inf where that class is absent in the image.
+
+    Args:
+      uncertainty_gamma: Exponent applied to the normalized Bernoulli entropy to
+        build per-pixel weights (higher -> sharper focus on uncertain pixels).
+      uncertainty_gamma_min: Minimum allowed weight to avoid zeroing confident
+        regions entirely.
     """
     assert logits.dim() == 5, "logits must have shape (L, B, C, h, w)"
     L, B, C, h, w = logits.shape
@@ -70,9 +76,31 @@ def pairwise_dice_loss_py(
     device = logits.device
     dtype  = logits.dtype
 
+    if uncertainty_gamma < 0.0:
+        raise ValueError("uncertainty_gamma must be non-negative")
+    if not (0.0 <= uncertainty_gamma_min <= 1.0):
+        raise ValueError("uncertainty_gamma_min must be in [0, 1]")
+
     # Flatten spatial and get probabilities at coarse grid
     z = logits.reshape(L, B, C, J)
     p = torch.sigmoid(z)                                     # (L,B,C,J)
+
+    # Bernoulli entropy based weights (treated as constants during backward)
+    eps = 1e-12
+    probs_detached = p.detach()
+    probs_clamped = probs_detached.clamp(min=eps, max=1.0 - eps)
+    entropy = -(
+        probs_clamped * torch.log(probs_clamped)
+        + (1.0 - probs_clamped) * torch.log(1.0 - probs_clamped)
+    )
+    entropy = entropy / math.log(2.0)
+    weights = torch.clamp(
+        entropy.pow(uncertainty_gamma),
+        min=uncertainty_gamma_min,
+        max=1.0,
+    ).detach()                                              # (L,B,C,J)
+
+    weighted_p = weights * p
 
     targets_long = targets.to(device=device, dtype=torch.long, non_blocking=True)
     gt_max = int(targets_long.max().item()) if targets_long.numel() else -1
@@ -96,19 +124,20 @@ def pairwise_dice_loss_py(
 
     counts = counts_all.index_select(2, idxs)                # (B, J, G)
     counts_f = counts.to(dtype)                              # float for einsum
+    t_sum = counts.sum(dim=1)                                # (B, G) for presence mask
 
     # Dice pieces:
     # intersection = sum_j p_{lbcj} * k_{bjg}
-    inter = torch.einsum('lbcj,bjg->lbcg', p, counts_f)     # (L,B,C,G)
+    inter = torch.einsum('lbcj,bjg->lbcg', weighted_p, counts_f)  # (L,B,C,G)
 
     # p_sum over full-resolution = sum_j N2 * p_{lbcj}
-    p_sum = (N2 * p).sum(dim=3)                              # (L,B,C)
+    p_sum = (N2 * weighted_p).sum(dim=3)                     # (L,B,C)
 
     # t_sum over full-resolution = sum_j k_{bjg}
-    t_sum = counts.sum(dim=1)                                # (B,G)
+    weighted_targets = torch.einsum('lbcj,bjg->lbcg', weights, counts_f)
 
     # Dice score and loss
-    denom = p_sum[..., None] + t_sum[None, :, None, :] + smooth
+    denom = p_sum[..., None] + weighted_targets + smooth
     dice_score = (2.0 * inter + smooth) / denom
     dice_loss  = 1.0 - dice_score                            # (L,B,C,G)
 
