@@ -299,8 +299,10 @@ std::vector<torch::Tensor> mask_matching_forward(
     const bool force_unmatched_masks,
     const bool force_unmatched_class,
     const int64_t void_class_index,
-    const bool use_softmax_label_loss
+    const bool use_softmax_label_loss,
+    const bool normalize_uncertainty
 ) {
+    (void)normalize_uncertainty; // weights are pre-computed in separate_costs
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
     TORCH_CHECK(separate_costs.is_cuda(), "separate_costs must be CUDA");
     TORCH_CHECK(pred_to_gt.is_cuda(), "pred_to_gt must be CUDA");

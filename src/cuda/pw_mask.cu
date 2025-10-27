@@ -67,7 +67,8 @@ reduce_pairwise_sigmoid_dice_kernel(
     const float mask_gamma,
     const float mask_alpha,
     const float uncertainty_gamma,
-    const float uncertainty_gamma_min
+    const float uncertainty_gamma_min,
+    const bool normalize_uncertainty
 ) {
     constexpr int TILE_H = 32;
     constexpr int TILE_W = 32;
@@ -96,6 +97,7 @@ reduce_pairwise_sigmoid_dice_kernel(
     const bool use_uncertainty = (uncertainty_gamma != 0.0f);
     const float inv_log2 = 1.4426950408889634f;
     const float eps = 1e-12f;
+    const float num_pixels = static_cast<float>(H_t * W_t);
 
     float thread_base = 0.f;
     float thread_p_total = 0.f;
@@ -195,6 +197,9 @@ reduce_pairwise_sigmoid_dice_kernel(
     }
     weight_total = (tid == 0) ? s_warp_a[0] : 0.f;
     weight_total = __shfl_sync(0xffffffff, weight_total, 0);
+    if (!normalize_uncertainty) {
+        weight_total = num_pixels;
+    }
     weight_total = fmaxf(weight_total, eps);
 
     // Stage 2: iterate over each ground-truth mask, reusing the cached logits
@@ -322,7 +327,8 @@ torch::Tensor pairwise_mask_loss_forward(
     const float mask_alpha = -1.0f,
     const float cls_gamma = 0.0f,
     const float cls_alpha = -1.0f,
-    const bool use_softmax_label_loss = false
+    const bool use_softmax_label_loss = false,
+    const bool normalize_uncertainty = true
 ) {
     CHECK_INPUT(mask_logits);
     CHECK_INPUT(mask_targets);
@@ -422,7 +428,8 @@ torch::Tensor pairwise_mask_loss_forward(
                     mask_gamma,
                     mask_alpha,
                     uncertainty_gamma,
-                    uncertainty_gamma_min
+                    uncertainty_gamma_min,
+                    normalize_uncertainty
                 );
         };
 

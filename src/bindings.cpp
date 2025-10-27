@@ -27,7 +27,8 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const float gamma = 0.0f,
     const float alpha = -1.0f,
     const float uncertainty_gamma = 1.0f,
-    const float uncertainty_gamma_min = 0.05f
+    const float uncertainty_gamma_min = 0.05f,
+    const bool normalize_uncertainty = true
 );
 
 std::vector<torch::Tensor> dice_loss_forward(
@@ -76,7 +77,8 @@ torch::Tensor pairwise_mask_loss_forward(
     const float mask_alpha = -1.0f,
     const float cls_gamma = 0.0f,
     const float cls_alpha = -1.0f,
-    bool use_softmax_label_loss = false
+    bool use_softmax_label_loss = false,
+    const bool normalize_uncertainty = true
 );
 
 // Hybrid mask matcher front-end.  Returns ``{pred_to_gt, pred_round,
@@ -104,7 +106,8 @@ std::vector<torch::Tensor> mask_matching(
     float   cls_gamma       = 0.0f,
     float   cls_alpha       = -1.0f,
     int64_t void_class_index = -1,
-    bool    use_softmax_label_loss = false
+    bool    use_softmax_label_loss = false,
+    const bool normalize_uncertainty = true
 );
 
 std::vector<torch::Tensor> mask_matching_backward(
@@ -131,7 +134,8 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float cls_gamma,
     const float cls_alpha,
     int64_t void_class_index,
-    const bool use_softmax_label_loss = false
+    const bool use_softmax_label_loss = false,
+    const bool normalize_uncertainty = true
 );
 
 torch::Tensor pairwise_sigmoid_label_loss_forward(

@@ -41,7 +41,8 @@ __global__ void mask_matching_backward_kernel(
     const float mask_gamma,
     const float mask_alpha,
     const float uncertainty_gamma,
-    const float uncertainty_gamma_min
+    const float uncertainty_gamma_min,
+    const bool normalize_uncertainty
 ) {
     const int64_t q = blockIdx.x;
     const int64_t b = blockIdx.y;
@@ -104,6 +105,7 @@ __global__ void mask_matching_backward_kernel(
     const float weight_eps = 1e-12f;
     const float spatial_elements = static_cast<float>(H * W);
     const float sigmoid_scale_total = sigmoid_factor * spatial_elements * area_scale;
+    const float num_pixels = area_scale * spatial_elements;
 
     for (int64_t idx = threadIdx.x; idx < HW; idx += blockDim.x) {
         const int64_t h = idx / W;
@@ -146,6 +148,9 @@ __global__ void mask_matching_backward_kernel(
     const float target_sum = sh_target_sum;
     const float inter_sum = sh_inter_sum;
     float weight_total = sh_weight_sum;
+    if (!normalize_uncertainty) {
+        weight_total = num_pixels;
+    }
     if (weight_total < weight_eps) {
         weight_total = weight_eps;
     }
@@ -394,7 +399,8 @@ std::vector<torch::Tensor> mask_matching_backward(
     const float cls_gamma,
     const float cls_alpha,
     int64_t void_class_index,
-    const bool use_softmax_label_loss
+    const bool use_softmax_label_loss,
+    const bool normalize_uncertainty
 ) {
     // Backward pipeline:
     //   1. Materialize downsampled ground-truth masks once for reuse.
@@ -577,7 +583,8 @@ std::vector<torch::Tensor> mask_matching_backward(
                 mask_gamma,
                 mask_alpha,
                 uncertainty_gamma,
-                uncertainty_gamma_min
+                uncertainty_gamma_min,
+                normalize_uncertainty
             );
             CHECK_CUDA_ERROR(cudaGetLastError());
         }

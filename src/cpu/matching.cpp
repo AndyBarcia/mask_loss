@@ -28,7 +28,8 @@ torch::Tensor pairwise_mask_loss_forward(
     const float mask_alpha = -1.0f,
     const float cls_gamma = 0.0f,
     const float cls_alpha = -1.0f,
-    bool use_softmax_label_loss = false
+    bool use_softmax_label_loss = false,
+    bool normalize_uncertainty = true
 );
 
 // Computes matched and unmatched query losses on CUDA and returns the per-layer
@@ -52,7 +53,8 @@ std::vector<torch::Tensor> mask_matching_forward(
     const bool force_unmatched_masks,
     const bool force_unmatched_class,
     const int64_t void_class_index,
-    const bool use_softmax_label_loss = false
+    const bool use_softmax_label_loss = false,
+    const bool normalize_uncertainty = true
 );
 
 enum class MatchingStrategy : int64_t {
@@ -610,7 +612,8 @@ std::vector<torch::Tensor> mask_matching(
     float   cls_gamma       = 0.0f,
     float   cls_alpha       = -1.0f,
     int64_t void_class_index = -1,
-    bool    use_softmax_label_loss = false
+    bool    use_softmax_label_loss = false,
+    bool    normalize_uncertainty = true
 ) {
     TORCH_CHECK(mask_logits.is_cuda(), "mask_logits must be CUDA");
     const auto device = mask_logits.device();
@@ -650,7 +653,8 @@ std::vector<torch::Tensor> mask_matching(
         mask_alpha,
         cls_gamma,
         cls_alpha,
-        use_softmax_label_loss
+        use_softmax_label_loss,
+        normalize_uncertainty
     );
     TORCH_CHECK(
         separate_costs.dim() == 5 && separate_costs.size(0) == 3,
@@ -736,7 +740,8 @@ std::vector<torch::Tensor> mask_matching(
         force_unmatched_masks_to_empty,
         force_unmatched_class_to_background,
         void_class_index,
-        use_softmax_label_loss
+        use_softmax_label_loss,
+        normalize_uncertainty
     );
 
     torch::Tensor layer_mask_mean = losses[0];

@@ -44,6 +44,7 @@ class MaskMatchingFunction(Function):
         background_index,
         uncertainty_gamma,
         uncertainty_gamma_min,
+        normalize_uncertainty,
         inf_thresh,
         num_masks,
         force_unmatched_class_to_background,
@@ -76,6 +77,9 @@ class MaskMatchingFunction(Function):
             cls_scale (float): Scalar multiplier applied to the class cost.
             background_index (int): Index in ``cls_targets`` that represents
                 the background class. ``-1`` disables background forcing.
+            normalize_uncertainty (bool): When ``True`` (default) entropy
+                weights normalise the sigmoid losses. When ``False`` the
+                sigmoid losses are divided by ``H_t * W_t`` instead.
             inf_thresh (float): Threshold above which costs are treated as
                 ``+inf`` and therefore ignored by the assignment step.
             num_masks (float): Optional normalisation denominator for the mask
@@ -118,6 +122,7 @@ class MaskMatchingFunction(Function):
         uncertainty_gamma_min_val = float(uncertainty_gamma_min if uncertainty_gamma_min is not None else 0.05)
         if not (0.0 <= uncertainty_gamma_min_val <= 1.0):
             raise ValueError("uncertainty_gamma_min must be in [0, 1]")
+        normalize_uncertainty_val = bool(normalize_uncertainty if normalize_uncertainty is not None else True)
         inf_thresh_val = float(inf_thresh if inf_thresh is not None else 1e30)
         num_masks_val = float(num_masks if num_masks is not None else -1.0)
         force_unmatched_cls = bool(
@@ -202,6 +207,7 @@ class MaskMatchingFunction(Function):
             background_index_val,
             uncertainty_gamma_val,
             uncertainty_gamma_min_val,
+            normalize_uncertainty_val,
             inf_thresh_val,
             num_masks_val,
             force_unmatched_cls,
@@ -214,6 +220,7 @@ class MaskMatchingFunction(Function):
             cls_focal_alpha_val,
             void_index_val,
             use_softmax_label_loss,
+            normalize_uncertainty_val,
         )
 
         ctx.save_for_backward(
@@ -231,6 +238,7 @@ class MaskMatchingFunction(Function):
         ctx.background_index = background_index_val
         ctx.uncertainty_gamma = uncertainty_gamma_val
         ctx.uncertainty_gamma_min = uncertainty_gamma_min_val
+        ctx.normalize_uncertainty = normalize_uncertainty_val
         ctx.num_masks = num_masks_val
         ctx.force_unmatched_cls = force_unmatched_cls
         ctx.force_unmatched_masks = force_unmatched_masks
@@ -295,12 +303,14 @@ class MaskMatchingFunction(Function):
             cls_focal_alpha,
             ctx.void_class_index,
             ctx.use_softmax_label_loss,
+            ctx.normalize_uncertainty,
         )
 
         return (
             grad_mask_logits,
             None,
             grad_cls_logits,
+            None,
             None,
             None,
             None,
@@ -335,6 +345,7 @@ def mask_matching_py(
     background_index= -1,
     uncertainty_gamma: float = 1.0,
     uncertainty_gamma_min: float = 0.05,
+    normalize_uncertainty: bool = True,
     inf_thresh      = 1e30,
     num_masks       = None,
     force_unmatched_class_to_background=False,
@@ -365,6 +376,9 @@ def mask_matching_py(
         background_index (int): Background class index or ``-1`` to disable.
         uncertainty_gamma (float): Entropy weighting exponent for mask losses.
         uncertainty_gamma_min (float): Lower bound for the entropy weights.
+        normalize_uncertainty (bool): When ``True`` (default) entropy weights
+            are used to normalise the mask losses. When ``False`` the losses
+            are normalised by ``H_t * W_t`` instead.
         inf_thresh (float): Costs equal/above this value are ignored.
         num_masks (Optional[float]): Optional denominator for loss averaging.
         force_unmatched_class_to_background (bool): If ``True`` enforce
@@ -395,6 +409,7 @@ def mask_matching_py(
         averaged losses.
     """
     L, B, C, H, W = mask_logits.shape
+    normalize_uncertainty = bool(normalize_uncertainty)
     inf_thresh_val = float(inf_thresh if inf_thresh is not None else 1e30)
     K_val = int(K if K is not None else 1)
     if K_val < 0:
@@ -485,6 +500,7 @@ def mask_matching_py(
         background_index,
         uncertainty_gamma=uncertainty_gamma,
         uncertainty_gamma_min=uncertainty_gamma_min,
+        normalize_uncertainty=normalize_uncertainty,
         mask_focal_gamma=mask_focal_gamma_val,
         mask_focal_alpha=mask_focal_alpha_val,
         cls_focal_gamma=cls_focal_gamma_val,
@@ -808,11 +824,13 @@ def mask_matching_sampling_py(
     dice_scale      = 1.0,
     cls_scale       = 1.0,
     background_index= -1,
+    normalize_uncertainty: bool = True,
     inf_thresh      = 1e30,
     num_masks       = None,
     label_loss: str = "sigmoid",
 ):
     L, B, C, H, W = mask_logits.shape
+    normalize_uncertainty = bool(normalize_uncertainty)
 
     # Pairwise costs: (3,L,B,C,GT_out)
     costs = pairwise_mask_loss_py(
@@ -825,6 +843,7 @@ def mask_matching_sampling_py(
         dice_scale,
         cls_scale,
         background_index,
+        normalize_uncertainty=normalize_uncertainty,
         label_loss=label_loss,
     )
     sigmoid_cost = costs[0]
