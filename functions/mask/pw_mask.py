@@ -33,6 +33,7 @@ class PairwiseMaskLossFunction(Function):
         background_index,
         uncertainty_gamma,
         uncertainty_gamma_min,
+        normalize_uncertainty,
         mask_focal_gamma,
         mask_focal_alpha,
         cls_focal_gamma,
@@ -80,6 +81,9 @@ class PairwiseMaskLossFunction(Function):
             ug_min = float(uncertainty_gamma_min)
             if not (0.0 <= ug_min <= 1.0):
                 raise ValueError("uncertainty_gamma_min must be in [0, 1]")
+        if normalize_uncertainty is None:
+            normalize_uncertainty = True
+        normalize_uncertainty = bool(normalize_uncertainty)
         loss_kind = (label_loss or "sigmoid").lower()
         if loss_kind not in {"sigmoid", "softmax"}:
             raise ValueError("label_loss must be either 'sigmoid' or 'softmax'")
@@ -102,12 +106,13 @@ class PairwiseMaskLossFunction(Function):
             cls_fg,
             cls_fa,
             use_softmax_label_loss,
+            normalize_uncertainty,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return (None,) * 16
+        return (None,) * 17
 
 
 def pairwise_mask_loss_py(
@@ -122,12 +127,14 @@ def pairwise_mask_loss_py(
     background_index= -1,
     uncertainty_gamma: float = 1.0,
     uncertainty_gamma_min: float = 0.05,
+    normalize_uncertainty: bool = True,
     mask_focal_gamma: float = 0.0,
     mask_focal_alpha: Optional[float] = None,
     cls_focal_gamma: Optional[float] = None,
     cls_focal_alpha: Optional[float] = None,
     label_loss: str = "sigmoid",
 ):
+    normalize_uncertainty = bool(normalize_uncertainty)
     if cls_focal_gamma is None:
         cls_fg = mask_focal_gamma
     else:
@@ -145,6 +152,7 @@ def pairwise_mask_loss_py(
         mask_focal_alpha,
         uncertainty_gamma,
         uncertainty_gamma_min,
+        normalize_uncertainty,
     )  # (L,B,C,GT_out)
     dice_cost = pairwise_dice_loss_py(
         mask_logits,

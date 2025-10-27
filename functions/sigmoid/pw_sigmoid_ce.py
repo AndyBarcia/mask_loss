@@ -26,6 +26,7 @@ class PairwiseSigmoidCELossFunction(Function):
         focal_alpha,
         uncertainty_gamma=None,
         uncertainty_gamma_min=None,
+        normalize_uncertainty=True,
     ):
         L, B, C, h, w = logits.shape
         B_t, H_t, W_t = targets.shape
@@ -63,12 +64,13 @@ class PairwiseSigmoidCELossFunction(Function):
             fa,
             ug,
             ug_min,
+            bool(normalize_uncertainty) if normalize_uncertainty is not None else True,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        return None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None
 
 def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
     logits,
@@ -79,6 +81,7 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
     focal_alpha: Optional[float] = None,
     uncertainty_gamma: float = 1.0,
     uncertainty_gamma_min: float = 0.05,
+    normalize_uncertainty: bool = True,
 ):
     """
     Computes pairwise sigmoid cross-entropy loss.
@@ -107,6 +110,10 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
                             to focus training on uncertain pixels.
         uncertainty_gamma_min (float): Lower bound for the uncertainty weights to
                             keep confident pixels from having zero influence.
+        normalize_uncertainty (bool): If ``True`` (default) the loss of each
+                            pixel is normalized by the sum of the uncertainty
+                            weights. If ``False`` the loss is normalized by the
+                            total number of target pixels ``H_t * W_t``.
 
     Returns:
         torch.Tensor: A tensor of shape (L, B, C, max_GT) where max_GT is the maximum value
@@ -163,6 +170,7 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
         raise ValueError("uncertainty_gamma must be non-negative")
     if not (0.0 <= uncertainty_gamma_min <= 1.0):
         raise ValueError("uncertainty_gamma_min must be in [0, 1]")
+    normalize_uncertainty = bool(normalize_uncertainty)
 
     ce_pos = F.softplus(-logits_up)
     ce_neg = F.softplus(logits_up)
@@ -180,7 +188,11 @@ def pairwise_sigmoid_cross_entropy_loss_inneficient_py(
         min=uncertainty_gamma_min,
         max=1.0,
     ).detach()  # (L, B, C, H_t, W_t)
-    weight_norm = weights.sum(dim=(3, 4)).clamp(min=eps)
+    if normalize_uncertainty:
+        weight_norm = weights.sum(dim=(3, 4)).clamp(min=eps)  # (L, B, C)
+    else:
+        num_pixels = float(H_t * W_t)
+        weight_norm = weights.new_full(weights.shape[:3], num_pixels)  # (L, B, C)
 
     if focal_gamma == 0.0:
         mod_pos = torch.ones_like(probs)
@@ -240,6 +252,7 @@ def pairwise_sigmoid_cross_entropy_loss_py(
     focal_alpha: Optional[float] = None,
     uncertainty_gamma: float = 1.0,
     uncertainty_gamma_min: float = 0.05,
+    normalize_uncertainty: bool = True,
 ):
     """
     Computes pairwise sigmoid cross-entropy loss in an efficient way.
@@ -264,6 +277,10 @@ def pairwise_sigmoid_cross_entropy_loss_py(
         focal_gamma (float): Focal loss exponent. Use 0.0 for vanilla BCE.
         focal_alpha (Optional[float]): Weight for positives in [0, 1]. If ``None``
                             the standard BCE weighting is used.
+        normalize_uncertainty (bool): When ``True`` (default) the loss of each
+                            pixel is normalized by the sum of the uncertainty
+                            weights. When ``False`` the loss is normalized by
+                            the number of target pixels ``H_t * W_t``.
 
     Returns:
         torch.Tensor: A tensor of shape (L, B, C, max_GT) where max_GT is the maximum value
@@ -307,6 +324,7 @@ def pairwise_sigmoid_cross_entropy_loss_py(
         raise ValueError("uncertainty_gamma must be non-negative")
     if not (0.0 <= uncertainty_gamma_min <= 1.0):
         raise ValueError("uncertainty_gamma_min must be in [0, 1]")
+    normalize_uncertainty = bool(normalize_uncertainty)
 
     # Prepare logits (L,B,C,J) and stable BCE pieces
     z = logits.reshape(L, B, C, J)
@@ -371,7 +389,11 @@ def pairwise_sigmoid_cross_entropy_loss_py(
     loss_pos = torch.einsum('lbcj,bjg->lbcg', weighted_coeff_pos, counts_f)
     loss_neg = torch.einsum('lbcj,bjg->lbcg', weighted_coeff_neg, neg_counts)
 
-    weight_sum = (weights.sum(dim=3) * float(N2))[..., None].clamp(min=eps)
+    if normalize_uncertainty:
+        weight_sum = (weights.sum(dim=3) * float(N2))[..., None].clamp(min=eps)
+    else:
+        num_pixels = float(Ht * Wt)
+        weight_sum = weights.new_full((L, B, C, 1), num_pixels)
     loss = (alpha_pos * loss_pos + alpha_neg * loss_neg) / weight_sum
 
     # Set +inf where the GT class doesn't appear in that image

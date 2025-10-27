@@ -24,7 +24,8 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_s
     const float gamma,
     const float alpha,
     const float uncertainty_gamma,
-    const float uncertainty_gamma_min
+    const float uncertainty_gamma_min,
+    const bool normalize_uncertainty
 ) {
     constexpr int TILE_H = 32;
     constexpr int TILE_W = 32;
@@ -44,6 +45,7 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_s
     const bool use_uncertainty = uncertainty_gamma != 0.0f;
     const float inv_log2 = 1.4426950408889634f;
     const float eps = 1e-12f;
+    const float num_pixels = static_cast<float>(H_t * W_t);
 
     // Compute base loss, independent of GT label
     float thread_base = 0.f;
@@ -113,6 +115,9 @@ __global__ void __launch_bounds__(REDUCTION_THREADS_PER_BLOCK) reduce_pairwise_s
     }
     weight_total = (tid == 0) ? s_warp[0] : 0.f;
     weight_total = __shfl_sync(0xffffffff, weight_total, 0);
+    if (!normalize_uncertainty) {
+        weight_total = num_pixels;
+    }
     weight_total = fmaxf(weight_total, eps);
 
     // Compute GT-dependent terms
@@ -199,7 +204,8 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
     const float gamma = 0.0f,
     const float alpha = -1.0f,
     const float uncertainty_gamma = 1.0f,
-    const float uncertainty_gamma_min = 0.05f
+    const float uncertainty_gamma_min = 0.05f,
+    const bool normalize_uncertainty = true
 ) {
     CHECK_INPUT(logits);
     CHECK_INPUT(targets);
@@ -286,7 +292,8 @@ torch::Tensor pairwise_sigmoid_cross_entropy_forward(
                     gamma,
                     alpha,
                     uncertainty_gamma,
-                    uncertainty_gamma_min
+                    uncertainty_gamma_min,
+                    normalize_uncertainty
                 );
         };
 
